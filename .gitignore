@@ -1,0 +1,31 @@
+### Python ###
+.venv/
+__pycache__/ 
+*.pyc
+*.pt
+*.pth
+
+### VS Code ###
+.vscode/
+
+### PyCharm / IntelliJ / JetBrains ###
+.idea/
+
+### MacOS ###
+.DS_Store
+.AppleDouble
+.LSOverride
+
+### Windows ###
+Thumbs.db
+Ehthumbs.db
+Desktop.ini
+
+### Reference Data ###
+data/
+
+### Support Files ###
+docs/
+support_files/
+CLAUDE.md
+PROJECT_BRIEF.md
