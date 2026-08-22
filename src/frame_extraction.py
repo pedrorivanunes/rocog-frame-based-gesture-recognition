@@ -97,8 +97,3 @@ def extract_frames(video_path: Path, num_frames: int, rng: np.random.Generator |
     video.release()
     assert len(frames) == num_frames, f"{video_path.name}: {len(frames)} frames, expected {num_frames}"
     return frames
-
-
-if __name__ == "__main__":
-    video_path = Path("data/syn/ground/Rally/Scene77_220_Rally_9_2_2022_3_8_30.mp4")
-    extract_frames(video_path, 10)
