@@ -52,12 +52,22 @@ def gesture_window(video_path: Path, total_frames: float, frames_per_second: flo
     return int(gesture_start_frame), int(gesture_end_frame)
 
 
-def extract_frames(video_path: Path, num_frames: int) -> list[tuple[int, np.ndarray]]:
-    """Sample frames evenly across the gesture window of a single video.
+def extract_frames(video_path: Path, num_frames: int, rng: np.random.Generator | None = None) -> list[tuple[int, np.ndarray]]:
+    """Sample frames across the gesture window of a single video.
+
+    The window is split into ``num_frames`` equal segments and one frame is drawn
+    at random from within each. Drawing within each segment keeps full coverage
+    of the window while decoupling the sampled phases from the gesture period.
+    This is the sampling scheme of Temporal Segment Networks.
+
+    Sampling is random but reproducible: pass a seeded ``rng`` and the same video
+    always yields the same frames.
 
     Args:
         video_path: Path to the ``.mp4`` to sample.
         num_frames: How many frames to return. Always honored exactly.
+        rng: Generator used to place a frame inside each segment. Defaults to an
+            unseeded generator; pass a seeded one for reproducible extraction.
 
     Returns:
         A list of ``(frame_number, image)`` pairs, of length ``num_frames``.
@@ -67,13 +77,16 @@ def extract_frames(video_path: Path, num_frames: int) -> list[tuple[int, np.ndar
     Raises:
         RuntimeError: If the video cannot be opened, or a frame cannot be read.
     """
+    if rng is None:
+        rng = np.random.default_rng()
     video = cv2.VideoCapture(video_path)
     if not video.isOpened():
         raise RuntimeError(f"could not open video file: {video_path}")
     total_frames = video.get(cv2.CAP_PROP_FRAME_COUNT)
     frames_per_second = video.get(cv2.CAP_PROP_FPS)
     gesture_start_frame, gesture_end_frame = gesture_window(video_path, total_frames, frames_per_second)
-    frame_indices = np.linspace(gesture_start_frame, gesture_end_frame, num_frames).round().astype(int)
+    edges = np.linspace(gesture_start_frame, gesture_end_frame, num_frames + 1)
+    frame_indices = rng.uniform(edges[:-1], edges[1:]).round().astype(int)
     frames = []
     for frame_number in frame_indices:
         video.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
