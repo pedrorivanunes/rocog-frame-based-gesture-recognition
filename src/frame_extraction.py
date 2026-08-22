@@ -2,6 +2,13 @@ import cv2
 import numpy as np
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import NamedTuple
+
+
+class SampledFrame(NamedTuple):
+    frame_number: int
+    position: float
+    frame: np.ndarray
 
 
 def read_metadata(xml_path: Path) -> ET.Element:
@@ -17,8 +24,10 @@ def read_metadata(xml_path: Path) -> ET.Element:
     Returns:
         The root ``<GestureVideo>`` element.
     """
+
     data = xml_path.read_bytes()
     data = data.replace(b"utf-16", b"utf-8", 1)
+
     return ET.fromstring(data)
 
 
@@ -38,7 +47,9 @@ def gesture_window(video_path: Path, total_frames: float, frames_per_second: flo
     Returns:
         ``(start_frame, end_frame)``, both valid frame indices into the video.
     """
+
     xml_path = video_path.with_suffix(".xml")
+
     if xml_path.exists():
         root = read_metadata(xml_path)
         gesture_start_time = root.findtext("startTime")
@@ -49,10 +60,11 @@ def gesture_window(video_path: Path, total_frames: float, frames_per_second: flo
     else:
         gesture_start_frame = 0
         gesture_end_frame = total_frames - 1
+
     return int(gesture_start_frame), int(gesture_end_frame)
 
 
-def extract_frames(video_path: Path, num_frames: int, rng: np.random.Generator | None = None) -> list[tuple[int, np.ndarray]]:
+def extract_frames(video_path: Path, num_frames: int, rng: np.random.Generator | None = None) -> list[SampledFrame]:
     """Sample frames across the gesture window of a single video.
 
     The window is split into ``num_frames`` equal segments and one frame is drawn
@@ -70,30 +82,40 @@ def extract_frames(video_path: Path, num_frames: int, rng: np.random.Generator |
             unseeded generator; pass a seeded one for reproducible extraction.
 
     Returns:
-        A list of ``(frame_number, image)`` pairs, of length ``num_frames``.
-        Images are BGR arrays of shape ``(height, width, 3)``, as produced by
-        OpenCV.
+        A list of ``num_frames`` ``SampledFrame`` records, in increasing frame
+        order. ``position`` is the frame's normalized location in the gesture
+        window, 0.0 at the start and 1.0 at the end. ``frame`` is a BGR array
+        of shape ``(height, width, 3)``, as produced by OpenCV.
 
     Raises:
         RuntimeError: If the video cannot be opened, or a frame cannot be read.
     """
+
     if rng is None:
         rng = np.random.default_rng()
+
     video = cv2.VideoCapture(video_path)
     if not video.isOpened():
         raise RuntimeError(f"could not open video file: {video_path}")
     total_frames = video.get(cv2.CAP_PROP_FRAME_COUNT)
     frames_per_second = video.get(cv2.CAP_PROP_FPS)
+
     gesture_start_frame, gesture_end_frame = gesture_window(video_path, total_frames, frames_per_second)
+    if gesture_end_frame - gesture_start_frame == 0:
+        raise RuntimeError(f"{video_path.name}: has length zero")
     edges = np.linspace(gesture_start_frame, gesture_end_frame, num_frames + 1)
     frame_indices = rng.uniform(edges[:-1], edges[1:]).round().astype(int)
     frames = []
+
     for frame_number in frame_indices:
         video.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
         ok, frame = video.read()
         if not ok:
             raise RuntimeError(f"{video_path.name}: failure when reading frame {frame_number}")
-        frames.append((frame_number, frame))
+        position = (frame_number - gesture_start_frame) / (gesture_end_frame - gesture_start_frame)
+        frames.append(SampledFrame(frame_number, position, frame))
+
     video.release()
     assert len(frames) == num_frames, f"{video_path.name}: {len(frames)} frames, expected {num_frames}"
+
     return frames
