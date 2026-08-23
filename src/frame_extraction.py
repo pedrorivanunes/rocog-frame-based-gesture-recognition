@@ -6,6 +6,17 @@ from typing import NamedTuple
 
 
 class SampledFrame(NamedTuple):
+    """One frame drawn from a video's gesture window.
+
+    Attributes:
+        frame_number: Index of the frame within the video.
+        position: Where the frame sits in the gesture window — 0.0 at the start,
+            1.0 at the end. Normalized so that frames from clips of different
+            length and frame rate remain comparable across domains.
+        frame: The image itself, a BGR array of shape ``(height, width, 3)`` as
+            produced by OpenCV — not RGB, which is what most other libraries
+            expect.
+    """
     frame_number: int
     position: float
     frame: np.ndarray
@@ -31,7 +42,11 @@ def read_metadata(xml_path: Path) -> ET.Element:
     return ET.fromstring(data)
 
 
-def gesture_window(video_path: Path, total_frames: float, frames_per_second: float) -> tuple[int, int]:
+def gesture_window(
+    video_path: Path,
+    total_frames: float,
+    frames_per_second: float,
+) -> tuple[int, int]:
     """Return the frame range spanned by the gesture in a video.
 
     Synthetic videos ship an XML file with exact gesture boundaries in seconds.
@@ -64,7 +79,11 @@ def gesture_window(video_path: Path, total_frames: float, frames_per_second: flo
     return int(gesture_start_frame), int(gesture_end_frame)
 
 
-def extract_frames(video_path: Path, num_frames: int, rng: np.random.Generator | None = None) -> list[SampledFrame]:
+def extract_frames(
+    video_path: Path,
+    num_frames: int,
+    rng: np.random.Generator | None = None,
+) -> list[SampledFrame]:
     """Sample frames across the gesture window of a single video.
 
     The window is split into ``num_frames`` equal segments and one frame is drawn
