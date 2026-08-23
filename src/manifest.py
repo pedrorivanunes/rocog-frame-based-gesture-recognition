@@ -7,6 +7,7 @@ was shot from, and where in the gesture it sits. Frames live on disk as plain
 images; this table is the single source of truth about them.
 """
 
+import json
 from pathlib import Path
 from typing import NamedTuple
 
@@ -81,3 +82,10 @@ def video_metadata(video_path: Path, domain: str) -> VideoMetadata:
         raise ValueError(f"unknown domain: {domain!r}")
 
     return VideoMetadata(video_id, group_id, view, is_frontal)
+
+
+def load_class_names(path: Path) -> dict[int, str]:
+    """Load the label-to-name mapping ..."""
+    text = path.read_text(encoding="utf-8")
+    raw_mapping = json.loads(text)
+    return {int(label): name for label, name in raw_mapping.items()}
