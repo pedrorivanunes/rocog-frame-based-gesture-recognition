@@ -1,8 +1,16 @@
-import cv2
-import numpy as np
+"""Sample frames from RoCoG-v2 videos.
+
+Reads the gesture boundaries a video declares in its metadata, splits that
+window into equal segments, and draws one frame from each. Real videos carry
+no metadata and are treated as a single gesture spanning the whole clip.
+"""
+
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import NamedTuple
+
+import cv2
+import numpy as np
 
 
 class SampledFrame(NamedTuple):
@@ -17,6 +25,7 @@ class SampledFrame(NamedTuple):
             produced by OpenCV — not RGB, which is what most other libraries
             expect.
     """
+
     frame_number: int
     position: float
     frame: np.ndarray
@@ -35,7 +44,6 @@ def read_metadata(xml_path: Path) -> ET.Element:
     Returns:
         The root ``<GestureVideo>`` element.
     """
-
     data = xml_path.read_bytes()
     data = data.replace(b"utf-16", b"utf-8", 1)
 
@@ -62,7 +70,6 @@ def gesture_window(
     Returns:
         ``(start_frame, end_frame)``, both valid frame indices into the video.
     """
-
     xml_path = video_path.with_suffix(".xml")
 
     if xml_path.exists():
@@ -109,7 +116,6 @@ def extract_frames(
     Raises:
         RuntimeError: If the video cannot be opened, or a frame cannot be read.
     """
-
     if rng is None:
         rng = np.random.default_rng()
 
@@ -119,7 +125,9 @@ def extract_frames(
     total_frames = video.get(cv2.CAP_PROP_FRAME_COUNT)
     frames_per_second = video.get(cv2.CAP_PROP_FPS)
 
-    gesture_start_frame, gesture_end_frame = gesture_window(video_path, total_frames, frames_per_second)
+    gesture_start_frame, gesture_end_frame = gesture_window(
+        video_path, total_frames, frames_per_second
+    )
     if gesture_end_frame - gesture_start_frame == 0:
         raise RuntimeError(f"{video_path.name}: has length zero")
     edges = np.linspace(gesture_start_frame, gesture_end_frame, num_frames + 1)
@@ -130,11 +138,17 @@ def extract_frames(
         video.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
         ok, frame = video.read()
         if not ok:
-            raise RuntimeError(f"{video_path.name}: failure when reading frame {frame_number}")
-        position = (frame_number - gesture_start_frame) / (gesture_end_frame - gesture_start_frame)
+            raise RuntimeError(
+                f"{video_path.name}: failure when reading frame {frame_number}"
+            )
+        position = (frame_number - gesture_start_frame) / (
+            gesture_end_frame - gesture_start_frame
+        )
         frames.append(SampledFrame(frame_number, position, frame))
 
     video.release()
-    assert len(frames) == num_frames, f"{video_path.name}: {len(frames)} frames, expected {num_frames}"
+    assert len(frames) == num_frames, (
+        f"{video_path.name}: {len(frames)} frames, expected {num_frames}"
+    )
 
     return frames

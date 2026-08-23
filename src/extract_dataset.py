@@ -26,18 +26,19 @@ working directory:
     python src/extract_dataset.py
 """
 
-from frame_extraction import SampledFrame
-from frame_extraction import extract_frames
-from manifest import video_metadata
-from manifest import load_class_names
-from pathlib import Path
-import pandas as pd
 import time
+from pathlib import Path
+
 import cv2
+import pandas as pd
+
+from frame_extraction import SampledFrame, extract_frames
+from manifest import load_class_names, video_metadata
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FILE_PATH = PROJECT_ROOT / "data/annotations/real_ground_test.txt"
 NUM_FRAMES = 10
+
 
 def save_frames(
     frames: list[SampledFrame],
@@ -58,7 +59,6 @@ def save_frames(
     Returns:
         The paths written, in the same order as ``frames``.
     """
-
     output_dir.mkdir(parents=True, exist_ok=True)
 
     written = []
@@ -71,6 +71,7 @@ def save_frames(
         written.append(path)
 
     return written
+
 
 if __name__ == "__main__":
     start_time = time.perf_counter()
@@ -91,9 +92,14 @@ if __name__ == "__main__":
             gesture_class = class_names[label]
 
             if gesture_class != video_path.parent.name:
-                raise RuntimeError(f"label {label} maps to {gesture_class} but the video is in folder {video_path.parent.name}")
-            
-            output_dir = PROJECT_ROOT / "data" / "frames" / domain / video_path.parent.name
+                raise RuntimeError(
+                    f"label {label} maps to {gesture_class} "
+                    f"but the video is in folder {video_path.parent.name}"
+                )
+
+            output_dir = (
+                PROJECT_ROOT / "data" / "frames" / domain / video_path.parent.name
+            )
 
             try:
                 frames = extract_frames(PROJECT_ROOT / "data" / video_path, NUM_FRAMES)
@@ -101,7 +107,7 @@ if __name__ == "__main__":
                 frame_paths = save_frames(frames, output_dir, metadata.video_id)
 
                 for sampled, frame_path in zip(frames, frame_paths, strict=True):
-                    row = { 
+                    row = {
                         "domain": domain,
                         "perspective": perspective,
                         "split": split,
@@ -113,18 +119,20 @@ if __name__ == "__main__":
                         "is_frontal": metadata.is_frontal,
                         "frame_number": sampled.frame_number,
                         "position": sampled.position,
-                        "path": frame_path.relative_to(PROJECT_ROOT)
+                        "path": frame_path.relative_to(PROJECT_ROOT),
                     }
                     manifest_rows.append(row)
 
                 success_counter += 1
             except Exception as e:
                 failures.append((video_path, f"{type(e).__name__}: {e}"))
-                
+
     manifests_folder = PROJECT_ROOT / "data" / "manifests"
     manifests_folder.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame(manifest_rows).to_csv(manifests_folder / f"{FILE_PATH.stem}.csv", index=False)            
-    
+    pd.DataFrame(manifest_rows).to_csv(
+        manifests_folder / f"{FILE_PATH.stem}.csv", index=False
+    )
+
     end_time = time.perf_counter()
     time_taken = end_time - start_time
     time_per_video = time_taken / video_counter

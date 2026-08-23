@@ -66,7 +66,6 @@ def video_metadata(video_path: Path, domain: str) -> VideoMetadata:
     Raises:
         ValueError: If ``domain`` is neither ``"syn"`` nor ``"real"``.
     """
-
     video_id = video_path.stem
     group_id = video_id.split("_")[0]
 
