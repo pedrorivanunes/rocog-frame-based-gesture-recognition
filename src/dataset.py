@@ -63,6 +63,7 @@ class FrameDataset(Dataset):
     need different pipelines — a random crop against a fixed central one — and
     both should come from the same class.
     """
+
     def __init__(self, manifest_path: Path, data_root: Path, transform: v2.Transform):
         """Load a manifest and prepare to serve the frames it lists.
 
