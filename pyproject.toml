@@ -11,4 +11,6 @@ select = ["E", "W", "F", "I", "B", "D"]
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D100", "D103"]
+# Test names carry the documentation; fixtures keep their class docstring but
+# not boilerplate on every method.
+"tests/**" = ["D100", "D102", "D103", "D105", "D107"]

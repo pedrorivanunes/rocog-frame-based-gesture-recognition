@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 from torchvision.models import ResNet18_Weights, resnet18
 
 from dataset import FrameDataset, SegmentSampler, eval_transform, train_transform
+from evaluation import frame_metrics, predict
 from splits import split_by_scene
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -140,7 +141,20 @@ if __name__ == "__main__":
     checkpoint_dir = PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    best_loss = float("inf")
+
     for epoch in range(EPOCHS):
         loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-        print(f"epoch {epoch + 1}/{EPOCHS}  loss {loss:.4f}")
-        torch.save(model.state_dict(), checkpoint_dir / "syn_ground_train.pt")
+
+        logits, labels, _ = predict(model, eval_loader, device)
+        eval_loss, eval_accuracy = frame_metrics(logits, labels, criterion)
+
+        print(
+            f"epoch {epoch + 1}/{EPOCHS}  train loss {loss:.4f}  "
+            f"validation loss {eval_loss:.4f}  frame accuracy {eval_accuracy:.1%}"
+        )
+
+        if eval_loss < best_loss:
+            best_loss = eval_loss
+            torch.save(model.state_dict(), checkpoint_dir / "syn_ground_train.pt")
+            print("  best so far, checkpoint written")
