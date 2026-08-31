@@ -62,18 +62,29 @@ class FrameDataset(Dataset):
     The transform is injected rather than fixed, because training and evaluation
     need different pipelines — a random crop against a fixed central one — and
     both should come from the same class.
+
+    The rows are injected for the same reason: a run trains on one selection of
+    the manifest and validates on another, and neither is a file on disk.
     """
 
-    def __init__(self, manifest_path: Path, data_root: Path, transform: v2.Transform):
-        """Load a manifest and prepare to serve the frames it lists.
+    def __init__(
+        self,
+        manifest: pd.DataFrame,
+        data_root: Path,
+        transform: v2.Transform,
+    ):
+        """Prepare to serve the frames a manifest lists.
 
         Args:
-            manifest_path: CSV written by the extraction run.
+            manifest: The rows to serve, already selected. A frame of rows
+                rather than a path to one: choosing the data is the caller's
+                job, and every experiment here is a different choice — see
+                ``splits``.
             data_root: Directory the manifest's ``path`` column is relative to.
             transform: Pipeline applied to every frame. Required rather than
                 optional, so a missing one fails here instead of on the first read.
         """
-        self.data_frame = pd.read_csv(manifest_path)
+        self.data_frame = manifest.reset_index(drop=True)
         self.data_root = data_root
         self.transform = transform
 
