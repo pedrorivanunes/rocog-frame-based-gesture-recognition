@@ -9,14 +9,16 @@ the manifest is how a run picks a domain, a split, a viewpoint or a subset.
 from pathlib import Path
 
 import cv2
+import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import v2
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 CROP_SIZE = 224
+SAMPLER_SEED = 13
 
 
 def train_transform() -> v2.Transform:
@@ -109,3 +111,78 @@ class FrameDataset(Dataset):
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = self.transform(frame)
         return frame, row["label"], row["video_id"]
+
+
+class SegmentSampler(Sampler[int]):
+    """Draw a few frames per video each epoch, one from every temporal block.
+
+    Extraction stored more frames per video than a single epoch needs, precisely
+    so a run could draw a subset and draw it differently every time. An epoch
+    over all 24 takes about 20 minutes on this machine; over 8 it takes under
+    seven, and the model still meets the whole gesture window because the draw
+    moves between epochs. It buys time, not information.
+
+    The frames of a video sit consecutively in the manifest and in frame order,
+    so the draw splits them into equal blocks and takes one frame from each.
+    That is the reasoning extraction already applies to the gesture window:
+    drawing without the constraint lets the chosen frames cluster in one part of
+    the gesture, leaving a stretch of it unseen for that epoch. Solving the
+    aliasing during extraction and reintroducing it here would undo the work.
+    """
+
+    def __init__(
+        self,
+        manifest: pd.DataFrame,
+        frames_per_video: int,
+        seed: int = SAMPLER_SEED,
+    ):
+        """Group the manifest rows into the blocks each epoch draws from.
+
+        Args:
+            manifest: The rows the dataset serves. It has to be the same frame,
+                because what this yields are positions into it.
+            frames_per_video: Frames drawn per video per epoch, and therefore
+                how many blocks each video is cut into.
+            seed: Draws the frames. Its own generator, so that a run stays
+                reproducible whatever else consumes randomness alongside it.
+
+        Raises:
+            RuntimeError: If videos hold differing numbers of frames, or if the
+                stored count does not divide into equal blocks.
+        """
+        rows = manifest.reset_index(drop=True)
+        positions = rows.groupby("video_id", sort=False).indices
+
+        stored = {len(indices) for indices in positions.values()}
+        if len(stored) != 1:
+            raise RuntimeError(f"videos hold {sorted(stored)} frames, need one count")
+
+        frames_stored = stored.pop()
+        if frames_stored % frames_per_video:
+            raise RuntimeError(
+                f"{frames_stored} frames per video split unevenly into "
+                f"{frames_per_video} blocks"
+            )
+
+        self.blocks = [
+            indices.reshape(frames_per_video, -1) for indices in positions.values()
+        ]
+        self.frames_per_video = frames_per_video
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self) -> int:
+        """Count the frames one epoch draws, which is the length the loader reports."""
+        return len(self.blocks) * self.frames_per_video
+
+    def __iter__(self):
+        """Draw one frame from every block of every video, in shuffled order.
+
+        The order is shuffled because the blocks are built video by video, and
+        batches drawn in that order would hold one gesture at a time.
+        """
+        drawn = np.array(
+            [self.rng.choice(block) for video in self.blocks for block in video]
+        )
+        self.rng.shuffle(drawn)
+
+        return iter(drawn.tolist())
