@@ -1,7 +1,8 @@
 """Train a ResNet18 to classify RoCoG-v2 gesture frames.
 
 Loads frames through the extraction manifest, fine-tunes ImageNet weights on the
-seven gesture classes, and writes a checkpoint after every epoch.
+seven gesture classes, keeps the checkpoint that validates best, and stops once
+validation has stopped improving.
 """
 
 from pathlib import Path
@@ -19,7 +20,9 @@ from splits import split_by_scene
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BATCH_SIZE = 64
 NUM_WORKERS = 8
-EPOCHS = 5
+MAX_EPOCHS = 15
+PATIENCE = 3
+TRAIN_SEED = 0
 FRAMES_PER_EPOCH = 8
 PHOTOMETRIC = True
 GEOMETRIC = True
@@ -84,6 +87,55 @@ def build_loaders(
     return train_loader, eval_loader
 
 
+class EarlyStopping:
+    """Watch validation loss and say when training has stopped paying off.
+
+    Augmentation moves where the optimum sits: the stronger the regularisation,
+    the later a run peaks. A fixed epoch count therefore cannot be fair across
+    configurations — measured here, training without augmentation turned upward
+    at the fifth epoch while the geometric run was still improving at the last
+    one, which made its result a floor rather than a peak. Letting each
+    configuration run until it stops improving is what makes them comparable.
+
+    Patience exists because the curve is not monotonic. The run without
+    augmentation went 0.693, 0.699, 0.629: stopping at the first worse epoch
+    would have discarded the best one, which came after.
+    """
+
+    def __init__(self, patience: int = PATIENCE):
+        """Start with no history, so the first epoch always counts as best.
+
+        Args:
+            patience: Epochs without a new best before training should stop.
+        """
+        self.patience = patience
+        self.best_loss = float("inf")
+        self.epochs_without_improvement = 0
+
+    def improved(self, loss: float) -> bool:
+        """Record an epoch's validation loss and say whether it is the best yet.
+
+        Args:
+            loss: The epoch's validation loss.
+
+        Returns:
+            Whether this epoch beat every earlier one, which is when the caller
+            should write a checkpoint.
+        """
+        if loss < self.best_loss:
+            self.best_loss = loss
+            self.epochs_without_improvement = 0
+            return True
+
+        self.epochs_without_improvement += 1
+        return False
+
+    @property
+    def exhausted(self) -> bool:
+        """Whether patience has run out and training should stop."""
+        return self.epochs_without_improvement >= self.patience
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
     """Run one pass over the training data and return the mean loss.
 
@@ -113,6 +165,13 @@ def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
 
 
 if __name__ == "__main__":
+    # The split and the frame sampler carry their own generators; this one covers
+    # what is left — the fresh classification head's initial weights and every
+    # random transform. Without it a run cannot be repeated, and two runs of one
+    # configuration differ by an amount that is not distinguishable from the
+    # difference between two configurations.
+    torch.manual_seed(TRAIN_SEED)
+
     manifest = pd.read_csv(PROJECT_ROOT / "data/manifests/syn_ground_train.csv")
     train_manifest, eval_manifest = split_by_scene(manifest)
 
@@ -139,20 +198,25 @@ if __name__ == "__main__":
     checkpoint_dir = PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    best_loss = float("inf")
+    stopper = EarlyStopping()
 
-    for epoch in range(EPOCHS):
+    for epoch in range(MAX_EPOCHS):
         loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
 
         logits, labels, _ = predict(model, eval_loader, device)
         eval_loss, eval_accuracy = frame_metrics(logits, labels, criterion)
 
         print(
-            f"epoch {epoch + 1}/{EPOCHS}  train loss {loss:.4f}  "
+            f"epoch {epoch + 1}/{MAX_EPOCHS}  train loss {loss:.4f}  "
             f"validation loss {eval_loss:.4f}  frame accuracy {eval_accuracy:.1%}"
         )
 
-        if eval_loss < best_loss:
-            best_loss = eval_loss
+        if stopper.improved(eval_loss):
             torch.save(model.state_dict(), checkpoint_dir / CHECKPOINT_NAME)
             print("  best so far, checkpoint written")
+
+        if stopper.exhausted:
+            print(f"stopped: {PATIENCE} epochs without improvement")
+            break
+    else:
+        print(f"stopped: reached the {MAX_EPOCHS}-epoch cap, still improving")
