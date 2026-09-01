@@ -10,14 +10,13 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-from torchvision.models import ResNet18_Weights, resnet18
 
 from dataset import FrameDataset, SegmentSampler, eval_transform, train_transform
 from evaluation import frame_metrics, predict
+from model import build_model
 from splits import split_by_scene
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-NUM_CLASSES = 7
 BATCH_SIZE = 64
 NUM_WORKERS = 8
 EPOCHS = 5
@@ -71,19 +70,6 @@ def build_loaders(
         persistent_workers=num_workers > 0,
     )
     return train_loader, eval_loader
-
-
-def build_model(num_classes: int = NUM_CLASSES) -> nn.Module:
-    """Build a ResNet18 with ImageNet weights and a fresh classification head.
-
-    The convolutional layers keep what they learned on ImageNet — edges, textures,
-    shapes. Only the final layer is replaced, mapping the 512 features it produces
-    to the gesture classes instead of ImageNet's 1000 categories. That mapping is
-    what training has to learn.
-    """
-    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    return model
 
 
 def train_one_epoch(model, loader, criterion, optimizer, device) -> float:

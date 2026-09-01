@@ -1,8 +1,10 @@
+import pandas as pd
+import pytest
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from evaluation import frame_metrics, predict
+from evaluation import frame_metrics, predict, probability_table
 
 
 class NumberedFrames(Dataset):
@@ -56,3 +58,65 @@ def test_frame_metrics_counts_every_frame():
     _, accuracy = frame_metrics(logits, labels, nn.CrossEntropyLoss())
 
     assert accuracy == 0.75
+
+
+def gesture_manifest():
+    """Two frames of one video and one of another, as extraction orders them."""
+    return pd.DataFrame(
+        {
+            "video_id": ["videoA", "videoA", "videoB"],
+            "frame_number": [4, 9, 2],
+            "position": [0.1, 0.8, 0.5],
+            "label": [0, 0, 1],
+            "class_name": ["Halt", "Halt", "Rally"],
+        }
+    )
+
+
+def test_probability_table_names_columns_by_class():
+    """A column ordered by anything but the label would mislabel every score."""
+    logits = torch.tensor([[9.0, 0.0], [9.0, 0.0], [0.0, 9.0]])
+
+    table = probability_table(
+        logits,
+        ["videoA", "videoA", "videoB"],
+        gesture_manifest(),
+        {0: "Halt", 1: "Rally"},
+    )
+
+    assert list(table.columns) == [
+        "video_id",
+        "frame_number",
+        "position",
+        "label",
+        "p_Halt",
+        "p_Rally",
+    ]
+    assert table["p_Halt"].idxmax() == 0
+    assert table["p_Rally"].idxmax() == 2
+
+
+def test_probability_table_rows_sum_to_one():
+    logits = torch.tensor([[2.0, 1.0], [0.0, 3.0], [1.0, 1.0]])
+
+    table = probability_table(
+        logits,
+        ["videoA", "videoA", "videoB"],
+        gesture_manifest(),
+        {0: "Halt", 1: "Rally"},
+    )
+
+    assert table[["p_Halt", "p_Rally"]].sum(axis=1).round(6).tolist() == [1.0, 1.0, 1.0]
+
+
+def test_probability_table_rejects_scores_out_of_order():
+    """Misaligned scores would attach every probability to the wrong frame."""
+    logits = torch.tensor([[9.0, 0.0], [9.0, 0.0], [0.0, 9.0]])
+
+    with pytest.raises(RuntimeError):
+        probability_table(
+            logits,
+            ["videoB", "videoA", "videoA"],
+            gesture_manifest(),
+            {0: "Halt", 1: "Rally"},
+        )
