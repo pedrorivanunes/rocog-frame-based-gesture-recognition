@@ -20,22 +20,82 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 CROP_SIZE = 224
 SAMPLER_SEED = 13
 
+# The widely used ImageNet recipe, taken as published rather than tuned. Fitting
+# these to the target domain would need measurements from it, and a source-only
+# result may not look at the target at all — not even at unlabelled statistics.
+# The narrower point is that they cannot be tuned on the synthetic validation
+# split either: augmentation that widens the source distribution costs accuracy
+# in-domain and earns it only across the gap, so validation would select against
+# exactly the setting that helps. Source-only training has no honest way to pick
+# these, and saying so is part of the result.
+PHOTOMETRIC_JITTER = {
+    "brightness": 0.4,
+    "contrast": 0.4,
+    "saturation": 0.4,
+    "hue": 0.1,
+}
 
-def train_transform() -> v2.Transform:
+# The subject fills roughly half the frame's height, so a crop much below this
+# starts cutting the arm away — and the arm is the signal. The ImageNet default
+# reaches down to 0.08 of the area, which would be destructive here. Aspect
+# stays close to square for the same reason: stretching one axis changes the
+# apparent length of an extended arm.
+GEOMETRIC_SCALE = (0.6, 1.0)
+GEOMETRIC_RATIO = (0.9, 1.1)
+
+
+def train_transform(
+    photometric: bool = True,
+    geometric: bool = False,
+) -> v2.Transform:
     """Pipeline used while training: the crop position is drawn at random.
 
-    Random cropping is the only augmentation applied at this stage. It keeps the
-    model from anchoring on absolute pixel positions and costs nothing, since the
-    frames were stored at 256 precisely to leave this margin.
+    Random cropping keeps the model from anchoring on absolute pixel positions
+    and costs nothing, since the frames were stored at 256 precisely to leave
+    this margin.
+
+    Photometric jitter is the second augmentation. Rendered frames are
+    photometrically narrow — measured on the source alone, their contrast spans
+    a standard deviation of 31 to 48 across the split — and a model trained
+    inside that band learns to depend on it. Widening the source distribution is
+    the cheapest way to make an unseen target fall inside it, and it needs
+    nothing from the target: the magnitudes are a published default, not a fit.
+
+    Geometric jitter is the third: a horizontal flip and a crop that varies in
+    scale rather than only in position. It is the pair the baseline paper names,
+    and unlike the photometric one it does not aim at a measured gap — the
+    subject occupies almost the same fraction of the frame in both domains, and
+    the synthetic videos are never mirrored, the metadata's ``mirrored`` field
+    being false in every file checked. It is a general regulariser, and the
+    experiment is what it contributes next to the photometric one.
+
+    Args:
+        photometric: Whether to jitter brightness, contrast, saturation and hue.
+            Off reproduces the earlier runs, which is what makes them comparable.
+        geometric: Whether to flip horizontally and vary the crop's scale. The
+            fixed-size random crop is replaced rather than added to, so that
+            exactly one crop happens either way.
+
+    Returns:
+        The pipeline, ready to apply to a frame.
     """
-    return v2.Compose(
-        [
-            v2.ToImage(),
-            v2.RandomCrop(CROP_SIZE),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-        ]
+    crop = (
+        v2.RandomResizedCrop(CROP_SIZE, scale=GEOMETRIC_SCALE, ratio=GEOMETRIC_RATIO)
+        if geometric
+        else v2.RandomCrop(CROP_SIZE)
     )
+
+    steps = [v2.ToImage(), crop]
+    if geometric:
+        steps.append(v2.RandomHorizontalFlip())
+    if photometric:
+        steps.append(v2.ColorJitter(**PHOTOMETRIC_JITTER))
+    steps += [
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ]
+
+    return v2.Compose(steps)
 
 
 def eval_transform() -> v2.Transform:

@@ -21,6 +21,9 @@ BATCH_SIZE = 64
 NUM_WORKERS = 8
 EPOCHS = 5
 FRAMES_PER_EPOCH = 8
+PHOTOMETRIC = True
+GEOMETRIC = True
+CHECKPOINT_NAME = "syn_ground_train.pt"
 
 
 def build_loaders(
@@ -29,6 +32,8 @@ def build_loaders(
     data_root: Path,
     num_workers: int = NUM_WORKERS,
     frames_per_epoch: int = FRAMES_PER_EPOCH,
+    photometric: bool = PHOTOMETRIC,
+    geometric: bool = GEOMETRIC,
 ) -> tuple[DataLoader, DataLoader]:
     """Build the training and evaluation loaders from two sets of manifest rows.
 
@@ -47,11 +52,18 @@ def build_loaders(
         frames_per_epoch: Frames drawn from each training video per epoch. The
             sampler shuffles, so the loader must not — passing a sampler and
             ``shuffle=True`` together is rejected by the DataLoader.
+        photometric: Whether training jitters brightness and contrast. Only the
+            training pipeline is affected; evaluation stays fixed, so successive
+            runs are measured against the same images.
+        geometric: Whether training flips and varies the crop's scale. Same
+            restriction — training only.
 
     Returns:
         The training loader and the evaluation loader.
     """
-    train_dataset = FrameDataset(train_manifest, data_root, transform=train_transform())
+    train_dataset = FrameDataset(
+        train_manifest, data_root, transform=train_transform(photometric, geometric)
+    )
     eval_dataset = FrameDataset(eval_manifest, data_root, transform=eval_transform())
 
     train_loader = DataLoader(
@@ -142,5 +154,5 @@ if __name__ == "__main__":
 
         if eval_loss < best_loss:
             best_loss = eval_loss
-            torch.save(model.state_dict(), checkpoint_dir / "syn_ground_train.pt")
+            torch.save(model.state_dict(), checkpoint_dir / CHECKPOINT_NAME)
             print("  best so far, checkpoint written")
