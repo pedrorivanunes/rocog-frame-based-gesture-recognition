@@ -26,6 +26,7 @@ data/
 
 ### Support Files ###
 docs/
+logs/
 support_files/
 CLAUDE.md
 PROJECT_BRIEF.md
