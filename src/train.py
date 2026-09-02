@@ -24,8 +24,8 @@ BATCH_SIZE = 64
 TRAIN_SEED = 0
 FRAMES_PER_EPOCH = 8
 
-# Defaults for the options parse_args exposes: the values the experiment log
-# fixes for the grid, so an argument-free run is the standard run.
+# Defaults for the options parse_args exposes, so an argument-free run is the
+# standard run.
 NUM_WORKERS = 12
 MAX_EPOCHS = 15
 PATIENCE = 3
@@ -37,19 +37,27 @@ CHECKPOINT_NAME = "syn_ground_train.pt"
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line: which cell of the training grid to run.
 
-    Every option defaults to the value fixed for the grid, so a call with no
+    Every option defaults to the value the grid holds fixed, so a call with no
     arguments reproduces the standard run. What legitimately varies between
     cells is what these expose — the augmentation in play, the epoch budget,
-    where the checkpoint lands. The controls the experiment log holds constant
-    (batch size, learning rate, seeds) stay as module constants on purpose: an
-    option can be varied without ever showing up in a diff.
+    where the checkpoint lands. Batch size, learning rate and the seeds stay as
+    module constants on purpose: a control that becomes an option can be varied
+    without ever showing up in a diff.
+
+    ``--num-workers`` is the exception, and worth stating plainly. It reads as a
+    machine-capacity knob, but the loader seeds every worker separately and the
+    training transforms draw inside them, so the worker count decides which
+    random crop lands on which frame — measured, not assumed. It is exposed
+    because a machine with fewer cores needs it, and it has to be held fixed
+    across any set of runs meant to be compared.
 
     Args:
         argv: Arguments to parse. ``None`` reads ``sys.argv``.
 
     Returns:
         A namespace with ``photometric``, ``geometric``, ``max_epochs``,
-        ``patience``, ``checkpoint_name`` and ``num_workers``.
+        ``patience``, ``checkpoint_name``, ``num_workers`` and
+        ``save_every_epoch``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -85,9 +93,34 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--num-workers",
         type=int,
         default=NUM_WORKERS,
-        help="DataLoader subprocesses",
+        help="DataLoader subprocesses. Decides which random transform lands on "
+        "which frame, so hold it fixed across runs being compared.",
+    )
+    parser.add_argument(
+        "--save-every-epoch",
+        action="store_true",
+        help="also write one checkpoint per epoch, not only the best; for the "
+        "epoch-vs-real-accuracy diagnostic. Pair with a patience it never hits.",
     )
     return parser.parse_args(argv)
+
+
+def epoch_checkpoint_name(base_name: str, epoch: int) -> str:
+    """Insert a zero-padded epoch number before a checkpoint's extension.
+
+    ``es_none.pt`` at epoch 3 becomes ``es_none_e03.pt``, so a run that keeps
+    every epoch's weights writes files that sort in training order and still
+    carry the configuration's name for a later pass to read back.
+
+    Args:
+        base_name: The ``--checkpoint-name`` the run was given.
+        epoch: One-based epoch number.
+
+    Returns:
+        The per-epoch file name.
+    """
+    name = Path(base_name)
+    return f"{name.stem}_e{epoch:02d}{name.suffix}"
 
 
 def build_loaders(
@@ -252,6 +285,7 @@ if __name__ == "__main__":
         f"photometric {args.photometric}  geometric {args.geometric}  "
         f"max epochs {args.max_epochs}  patience {args.patience}  "
         f"workers {args.num_workers}  ->  checkpoints/{args.checkpoint_name}"
+        f"{'  (+ one per epoch)' if args.save_every_epoch else ''}"
     )
 
     train_loader, eval_loader = build_loaders(
@@ -288,6 +322,13 @@ if __name__ == "__main__":
         if stopper.improved(eval_loss):
             torch.save(model.state_dict(), checkpoint_dir / args.checkpoint_name)
             print("  best so far, checkpoint written")
+
+        if args.save_every_epoch:
+            torch.save(
+                model.state_dict(),
+                checkpoint_dir
+                / epoch_checkpoint_name(args.checkpoint_name, epoch + 1),
+            )
 
         if stopper.exhausted:
             print(f"stopped: {args.patience} epochs without improvement")

@@ -1,4 +1,4 @@
-from train import EarlyStopping, parse_args
+from train import EarlyStopping, epoch_checkpoint_name, parse_args
 
 # The run without photometric jitter, whose curve is not monotonic.
 BASELINE_CURVE = [0.7773, 0.6929, 0.6992, 0.6294, 0.7510]
@@ -13,6 +13,16 @@ def test_parse_args_with_no_arguments_is_the_standard_run():
     assert args.patience == 3
     assert args.checkpoint_name == "syn_ground_train.pt"
     assert args.num_workers == 12
+    assert args.save_every_epoch is False
+
+
+def test_parse_args_keeps_every_epoch_when_asked():
+    assert parse_args(["--save-every-epoch"]).save_every_epoch is True
+
+
+def test_epoch_checkpoint_name_inserts_a_padded_epoch():
+    assert epoch_checkpoint_name("es_none.pt", 3) == "es_none_e03.pt"
+    assert epoch_checkpoint_name("es_none.pt", 12) == "es_none_e12.pt"
 
 
 def test_parse_args_turns_each_augmentation_off_on_its_own():
