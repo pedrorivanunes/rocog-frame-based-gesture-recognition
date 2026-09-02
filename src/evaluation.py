@@ -153,6 +153,7 @@ def probability_table(
 
 if __name__ == "__main__":
     from dataset import FrameDataset, eval_transform
+    from device import describe, pick_device
     from manifest import load_class_names
     from model import build_model
     from splits import split_by_scene
@@ -164,7 +165,8 @@ if __name__ == "__main__":
         split_name = f"{split_name}_validation"
 
     class_names = load_class_names(PROJECT_ROOT / "data" / "class_dict.json")
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = pick_device()
+    print(f"device: {describe(device)}")
     model = build_model().to(device)
     model.load_state_dict(
         torch.load(PROJECT_ROOT / "checkpoints" / CHECKPOINT, map_location=device)

@@ -13,6 +13,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from dataset import FrameDataset, SegmentSampler, eval_transform, train_transform
+from device import describe, pick_device
 from evaluation import frame_metrics, predict
 from model import build_model
 from splits import split_by_scene
@@ -190,7 +191,8 @@ if __name__ == "__main__":
         NUM_WORKERS,
     )
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = pick_device()
+    print(f"device: {describe(device)}")
     model = build_model().to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
