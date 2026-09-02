@@ -25,14 +25,17 @@ def pick_device() -> torch.device:
     """
     if torch.cuda.is_available():
         indices = list(range(torch.cuda.device_count()))
+        properties = [torch.cuda.get_device_properties(index) for index in indices]
+        # Not every build reports is_integrated. Reading a missing field as
+        # discrete leaves memory to decide, which is the behaviour on a host
+        # with one GPU anyway, rather than failing before training starts.
         discrete = [
             index
             for index in indices
-            if not torch.cuda.get_device_properties(index).is_integrated
+            if not getattr(properties[index], "is_integrated", 0)
         ]
         best = max(
-            discrete or indices,
-            key=lambda index: torch.cuda.get_device_properties(index).total_memory,
+            discrete or indices, key=lambda index: properties[index].total_memory
         )
         return torch.device("cuda", best)
     if torch.backends.mps.is_available():

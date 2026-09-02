@@ -37,6 +37,19 @@ def test_memory_breaks_the_tie_between_two_discrete_gpus(monkeypatch):
     assert pick_device() == torch.device("cuda", 1)
 
 
+def test_a_build_that_omits_is_integrated_falls_back_to_memory(monkeypatch):
+    """Not every build reports the field; a missing one must not end the run."""
+    _fake_cuda(
+        monkeypatch,
+        [
+            SimpleNamespace(total_memory=8 * 1024**3),
+            SimpleNamespace(total_memory=24 * 1024**3),
+        ],
+    )
+
+    assert pick_device() == torch.device("cuda", 1)
+
+
 def test_an_integrated_gpu_is_still_used_when_it_is_the_only_one(monkeypatch):
     _fake_cuda(monkeypatch, [_props(31, integrated=True)])
 
