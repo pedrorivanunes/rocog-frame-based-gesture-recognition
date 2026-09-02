@@ -13,7 +13,13 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from dataset import FrameDataset, SegmentSampler, eval_transform, train_transform
+from dataset import (
+    SAMPLER_SEED,
+    FrameDataset,
+    SegmentSampler,
+    eval_transform,
+    train_transform,
+)
 from device import describe, pick_device
 from evaluation import frame_metrics, predict
 from model import build_model
@@ -21,11 +27,11 @@ from splits import split_by_scene
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BATCH_SIZE = 64
-TRAIN_SEED = 0
 FRAMES_PER_EPOCH = 8
 
 # Defaults for the options parse_args exposes, so an argument-free run is the
 # standard run.
+SEED = 0
 NUM_WORKERS = 12
 MAX_EPOCHS = 15
 PATIENCE = 3
@@ -51,15 +57,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     because a machine with fewer cores needs it, and it has to be held fixed
     across any set of runs meant to be compared.
 
+    ``--seed`` fixes what this program controls, which is not the same as
+    promising an identical result. On hardware whose kernels accumulate
+    non-deterministically, two runs of one seed diverge anyway — measured here at
+    a validation-loss spread wide enough to matter. Measure that spread on the
+    machine at hand before reading any difference as the effect of a change.
+
     Args:
         argv: Arguments to parse. ``None`` reads ``sys.argv``.
 
     Returns:
-        A namespace with ``photometric``, ``geometric``, ``max_epochs``,
-        ``patience``, ``checkpoint_name``, ``num_workers`` and
+        A namespace with ``seed``, ``photometric``, ``geometric``,
+        ``max_epochs``, ``patience``, ``checkpoint_name``, ``num_workers`` and
         ``save_every_epoch``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=SEED,
+        help="repetition of a configuration. Moves the head's initial weights, "
+        "the random transforms and the per-epoch frame draw together; the "
+        "train/validation split stays fixed, being a control rather than noise",
+    )
     parser.add_argument(
         "--photometric",
         action=argparse.BooleanOptionalAction,
@@ -105,22 +125,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def epoch_checkpoint_name(base_name: str, epoch: int) -> str:
-    """Insert a zero-padded epoch number before a checkpoint's extension.
+def checkpoint_name(base_name: str, seed: int, epoch: int | None = None) -> str:
+    """Name a checkpoint after the run that produced it.
 
-    ``es_none.pt`` at epoch 3 becomes ``es_none_e03.pt``, so a run that keeps
-    every epoch's weights writes files that sort in training order and still
-    carry the configuration's name for a later pass to read back.
+    ``es_none.pt`` at seed 2 becomes ``es_none_s2.pt``, and at epoch 3 of that
+    seed ``es_none_s2_e03.pt``. The suffixes are not decoration: a grid runs the
+    same configuration once per seed, so without them every repetition would
+    write over the last one — and a checkpoint silently overwritten is a result
+    that cannot be traced back. The epoch is zero-padded so the files sort in
+    training order.
 
     Args:
         base_name: The ``--checkpoint-name`` the run was given.
-        epoch: One-based epoch number.
+        seed: The repetition this run is.
+        epoch: One-based epoch number, or ``None`` for the run's best weights.
 
     Returns:
-        The per-epoch file name.
+        The file name to write under ``checkpoints/``.
     """
     name = Path(base_name)
-    return f"{name.stem}_e{epoch:02d}{name.suffix}"
+    marks = f"_s{seed}" + (f"_e{epoch:02d}" if epoch is not None else "")
+    return f"{name.stem}{marks}{name.suffix}"
 
 
 def build_loaders(
@@ -131,6 +156,7 @@ def build_loaders(
     frames_per_epoch: int = FRAMES_PER_EPOCH,
     photometric: bool = PHOTOMETRIC,
     geometric: bool = GEOMETRIC,
+    seed: int = SEED,
 ) -> tuple[DataLoader, DataLoader]:
     """Build the training and evaluation loaders from two sets of manifest rows.
 
@@ -155,6 +181,9 @@ def build_loaders(
             runs are measured against the same images.
         geometric: Whether training flips and varies the crop's scale. Same
             restriction — training only.
+        seed: Which repetition of a configuration this is. Offsets the sampler's
+            own seed rather than replacing it, so that seed 0 keeps drawing the
+            frames earlier runs drew and stays comparable to them.
 
     Returns:
         The training loader and the evaluation loader.
@@ -167,7 +196,9 @@ def build_loaders(
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        sampler=SegmentSampler(train_dataset.data_frame, frames_per_epoch),
+        sampler=SegmentSampler(
+            train_dataset.data_frame, frames_per_epoch, seed=SAMPLER_SEED + seed
+        ),
         num_workers=num_workers,
         drop_last=True,
         persistent_workers=num_workers > 0,
@@ -264,12 +295,13 @@ def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
 if __name__ == "__main__":
     args = parse_args()
 
-    # The split and the frame sampler carry their own generators; this one covers
-    # what is left — the fresh classification head's initial weights and every
-    # random transform. Without it a run cannot be repeated, and two runs of one
-    # configuration differ by an amount that is not distinguishable from the
-    # difference between two configurations.
-    torch.manual_seed(TRAIN_SEED)
+    # Covers the fresh classification head's initial weights and every random
+    # transform; --seed also offsets the frame sampler, so one number moves all
+    # the training stochasticity together and a repetition is named by it. The
+    # train/validation split keeps its own fixed seed: which scenes are held out
+    # is a control, and varying it would change the training data between runs
+    # that are supposed to differ only in the treatment.
+    torch.manual_seed(args.seed)
 
     manifest = pd.read_csv(PROJECT_ROOT / "data/manifests/syn_ground_train.csv")
     train_manifest, eval_manifest = split_by_scene(manifest)
@@ -281,10 +313,12 @@ if __name__ == "__main__":
         f"validation {eval_manifest['video_id'].nunique()} videos "
         f"({len(eval_manifest) / len(manifest):.1%} of frames)"
     )
+    best_name = checkpoint_name(args.checkpoint_name, args.seed)
     print(
-        f"photometric {args.photometric}  geometric {args.geometric}  "
-        f"max epochs {args.max_epochs}  patience {args.patience}  "
-        f"workers {args.num_workers}  ->  checkpoints/{args.checkpoint_name}"
+        f"seed {args.seed}  photometric {args.photometric}  "
+        f"geometric {args.geometric}  max epochs {args.max_epochs}  "
+        f"patience {args.patience}  workers {args.num_workers}  ->  "
+        f"checkpoints/{best_name}"
         f"{'  (+ one per epoch)' if args.save_every_epoch else ''}"
     )
 
@@ -295,6 +329,7 @@ if __name__ == "__main__":
         args.num_workers,
         photometric=args.photometric,
         geometric=args.geometric,
+        seed=args.seed,
     )
 
     device = pick_device()
@@ -320,14 +355,14 @@ if __name__ == "__main__":
         )
 
         if stopper.improved(eval_loss):
-            torch.save(model.state_dict(), checkpoint_dir / args.checkpoint_name)
+            torch.save(model.state_dict(), checkpoint_dir / best_name)
             print("  best so far, checkpoint written")
 
         if args.save_every_epoch:
             torch.save(
                 model.state_dict(),
                 checkpoint_dir
-                / epoch_checkpoint_name(args.checkpoint_name, epoch + 1),
+                / checkpoint_name(args.checkpoint_name, args.seed, epoch + 1),
             )
 
         if stopper.exhausted:

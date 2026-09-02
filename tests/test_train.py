@@ -1,4 +1,4 @@
-from train import EarlyStopping, epoch_checkpoint_name, parse_args
+from train import EarlyStopping, checkpoint_name, parse_args
 
 # The run without photometric jitter, whose curve is not monotonic.
 BASELINE_CURVE = [0.7773, 0.6929, 0.6992, 0.6294, 0.7510]
@@ -7,6 +7,7 @@ BASELINE_CURVE = [0.7773, 0.6929, 0.6992, 0.6294, 0.7510]
 def test_parse_args_with_no_arguments_is_the_standard_run():
     args = parse_args([])
 
+    assert args.seed == 0
     assert args.photometric is True
     assert args.geometric is True
     assert args.max_epochs == 15
@@ -20,9 +21,29 @@ def test_parse_args_keeps_every_epoch_when_asked():
     assert parse_args(["--save-every-epoch"]).save_every_epoch is True
 
 
-def test_epoch_checkpoint_name_inserts_a_padded_epoch():
-    assert epoch_checkpoint_name("es_none.pt", 3) == "es_none_e03.pt"
-    assert epoch_checkpoint_name("es_none.pt", 12) == "es_none_e12.pt"
+def test_parse_args_takes_a_repetition_seed():
+    assert parse_args(["--seed", "2"]).seed == 2
+
+
+def test_checkpoint_name_marks_the_seed():
+    """A grid runs each configuration once per seed; unmarked they overwrite."""
+    assert checkpoint_name("es_none.pt", 0) == "es_none_s0.pt"
+    assert checkpoint_name("es_none.pt", 2) == "es_none_s2.pt"
+
+
+def test_checkpoint_name_adds_a_padded_epoch_when_given_one():
+    assert checkpoint_name("es_none.pt", 2, 3) == "es_none_s2_e03.pt"
+    assert checkpoint_name("es_none.pt", 2, 12) == "es_none_s2_e12.pt"
+
+
+def test_checkpoint_names_of_one_grid_are_all_distinct():
+    names = {
+        checkpoint_name(base, seed)
+        for base in ("none.pt", "photometric.pt")
+        for seed in range(3)
+    }
+
+    assert len(names) == 6
 
 
 def test_parse_args_turns_each_augmentation_off_on_its_own():
