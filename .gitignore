@@ -24,6 +24,9 @@ Desktop.ini
 ### Reference Data ###
 data/
 
+### Trained Weights ###
+checkpoints/
+
 ### Support Files ###
 docs/
 logs/
