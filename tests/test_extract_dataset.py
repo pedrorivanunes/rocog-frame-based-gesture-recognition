@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from extract_dataset import read_annotations, sample_stratified
+from extract_dataset import parse_args, read_annotations, sample_stratified
 from manifest import video_metadata
 
 
@@ -74,6 +74,18 @@ def test_a_stratum_smaller_than_requested_is_rejected():
 
     with pytest.raises(RuntimeError):
         sample_stratified(entries, "syn", 11, np.random.default_rng(0))
+
+
+def test_parse_args_reads_the_annotations_file_as_a_path():
+    args = parse_args(["data/annotations/syn_ground_train.txt"])
+
+    assert args.annotations == Path("data/annotations/syn_ground_train.txt")
+
+
+def test_parse_args_requires_the_annotations_file():
+    """The file name is what a run chooses; there is no sensible default."""
+    with pytest.raises(SystemExit):
+        parse_args([])
 
 
 def test_read_annotations_pairs_paths_with_integer_labels(tmp_path):

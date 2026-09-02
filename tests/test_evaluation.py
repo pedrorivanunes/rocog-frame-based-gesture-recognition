@@ -1,10 +1,48 @@
+from pathlib import Path
+
 import pandas as pd
 import pytest
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from evaluation import frame_metrics, predict, probability_table
+from evaluation import frame_metrics, parse_args, predict, probability_table
+
+
+def test_parse_args_leaves_the_optional_settings_alone():
+    args = parse_args(
+        ["checkpoints/syn_ground_train.pt", "--manifest", "real_ground_test.csv"]
+    )
+
+    assert args.checkpoint == Path("checkpoints/syn_ground_train.pt")
+    assert args.manifest == "real_ground_test.csv"
+    assert args.validation_split is False
+    assert args.output is None
+    assert args.num_workers == 12
+
+
+def test_parse_args_takes_the_validation_split():
+    split = parse_args(
+        [
+            "checkpoints/es_none.pt",
+            "--manifest",
+            "syn_ground_train.csv",
+            "--validation-split",
+        ]
+    )
+
+    assert split.validation_split is True
+
+
+def test_parse_args_requires_the_checkpoint():
+    with pytest.raises(SystemExit):
+        parse_args(["--manifest", "real_ground_test.csv"])
+
+
+def test_parse_args_requires_the_manifest():
+    """A default would make scoring the training frames the easy mistake."""
+    with pytest.raises(SystemExit):
+        parse_args(["checkpoints/es_none.pt"])
 
 
 class NumberedFrames(Dataset):

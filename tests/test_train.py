@@ -1,7 +1,31 @@
-from train import EarlyStopping
+from train import EarlyStopping, parse_args
 
 # The run without photometric jitter, whose curve is not monotonic.
 BASELINE_CURVE = [0.7773, 0.6929, 0.6992, 0.6294, 0.7510]
+
+
+def test_parse_args_with_no_arguments_is_the_standard_run():
+    args = parse_args([])
+
+    assert args.photometric is True
+    assert args.geometric is True
+    assert args.max_epochs == 15
+    assert args.patience == 3
+    assert args.checkpoint_name == "syn_ground_train.pt"
+    assert args.num_workers == 12
+
+
+def test_parse_args_turns_each_augmentation_off_on_its_own():
+    assert parse_args(["--no-photometric"]).photometric is False
+    assert parse_args(["--no-photometric"]).geometric is True
+    assert parse_args(["--no-geometric"]).geometric is False
+
+
+def test_parse_args_overrides_the_epoch_budget_and_the_checkpoint():
+    args = parse_args(["--max-epochs", "5", "--checkpoint-name", "es_none.pt"])
+
+    assert args.max_epochs == 5
+    assert args.checkpoint_name == "es_none.pt"
 
 
 def test_the_first_epoch_is_always_the_best_so_far():

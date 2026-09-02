@@ -20,12 +20,13 @@ follows from it.
 Reports how many videos succeeded, how many failed and why, and how long the
 pass took.
 
-Paths are resolved from the location of this file, so it can be run from any
-working directory:
+Output paths are anchored to this file's location, so it runs from any working
+directory:
 
-    python src/extract_dataset.py
+    python src/extract_dataset.py data/annotations/syn_ground_train.txt
 """
 
+import argparse
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -38,11 +39,31 @@ from frame_extraction import SampledFrame, extract_frames, read_metadata
 from manifest import load_class_names, video_metadata
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-FILE_PATH = PROJECT_ROOT / "data/annotations/real_ground_train.txt"
 NUM_FRAMES = 24
 NUM_PER_STRATUM = 250
 MAX_REPETITIONS = 4
 SEED = 42
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the command line: which annotations file to turn into frames.
+
+    Args:
+        argv: Arguments to parse. ``None`` reads ``sys.argv``.
+
+    Returns:
+        A namespace with ``annotations``, the path to the RoCoG-v2 annotations
+        file whose videos should be extracted. Domain, perspective and split
+        follow from its name, so it is the only thing a run has to choose.
+    """
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "annotations",
+        type=Path,
+        help="RoCoG-v2 annotations file to extract, "
+        "e.g. data/annotations/syn_ground_train.txt",
+    )
+    return parser.parse_args(argv)
 
 
 def save_frames(
@@ -192,6 +213,9 @@ def sample_stratified(
 
 
 if __name__ == "__main__":
+    args = parse_args()
+    print(f"annotations: {args.annotations}")
+
     start_time = time.perf_counter()
     video_counter = 0
     success_counter = 0
@@ -199,10 +223,10 @@ if __name__ == "__main__":
     manifest_rows = []
     rng = np.random.default_rng(SEED)
 
-    entries = read_annotations(FILE_PATH)
+    entries = read_annotations(args.annotations)
     num_read = len(entries)
     class_names = load_class_names(PROJECT_ROOT / "data" / "class_dict.json")
-    domain, perspective, split = FILE_PATH.stem.split("_")
+    domain, perspective, split = args.annotations.stem.split("_")
     num_after_repetitions = 0
     num_sampled = 0
 
@@ -253,7 +277,7 @@ if __name__ == "__main__":
     manifests_folder = PROJECT_ROOT / "data" / "manifests"
     manifests_folder.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(manifest_rows).to_csv(
-        manifests_folder / f"{FILE_PATH.stem}.csv", index=False
+        manifests_folder / f"{args.annotations.stem}.csv", index=False
     )
 
     end_time = time.perf_counter()

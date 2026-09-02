@@ -8,6 +8,7 @@ arithmetic over the same numbers. Returning the raw scores instead of a single
 figure is what lets the expensive half run once and the cheap half run often.
 """
 
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -16,11 +17,61 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-MANIFEST = "syn_ground_train.csv"
-CHECKPOINT = "syn_ground_train.pt"
-HOLD_OUT_VALIDATION = True
 BATCH_SIZE = 64
-NUM_WORKERS = 8
+
+# Default for the one option parse_args gives a default to. Worker count is
+# safe to vary here, unlike in training: eval_transform is deterministic, so no
+# random draw depends on how the frames were split across processes.
+NUM_WORKERS = 12
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse the command line: which checkpoint to score against which frames.
+
+    The manifest is required rather than defaulted. The obvious default would be
+    the training manifest, and scoring that without ``--validation-split`` would
+    quietly measure the model on the frames it was fitted to — the one mistake
+    this script must not make easy. Naming the rows is therefore always a
+    deliberate act.
+
+    Args:
+        argv: Arguments to parse. ``None`` reads ``sys.argv``.
+
+    Returns:
+        A namespace with ``checkpoint`` (path to the trained weights),
+        ``manifest`` (a file name under data/manifests/), ``validation_split``
+        (score only the manifest's held-out scenes, not all of it), ``output``
+        (the table's name under data/predictions/, or ``None`` to derive it from
+        the checkpoint and manifest) and ``num_workers``.
+    """
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "checkpoint",
+        type=Path,
+        help="trained weights to score, e.g. checkpoints/syn_ground_train.pt",
+    )
+    parser.add_argument(
+        "--manifest",
+        required=True,
+        help="frames to score, a file name under data/manifests/",
+    )
+    parser.add_argument(
+        "--validation-split",
+        action="store_true",
+        help="score only the held-out validation scenes of the manifest",
+    )
+    parser.add_argument(
+        "--output",
+        help="table name under data/predictions/; derived from the checkpoint "
+        "and manifest when omitted",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=NUM_WORKERS,
+        help="DataLoader subprocesses",
+    )
+    return parser.parse_args(argv)
 
 
 def predict(
@@ -158,9 +209,15 @@ if __name__ == "__main__":
     from model import build_model
     from splits import split_by_scene
 
-    manifest = pd.read_csv(PROJECT_ROOT / "data/manifests" / MANIFEST)
-    split_name = Path(MANIFEST).stem
-    if HOLD_OUT_VALIDATION:
+    args = parse_args()
+    print(
+        f"checkpoint {args.checkpoint}  manifest {args.manifest}"
+        f"{'  (validation split)' if args.validation_split else ''}"
+    )
+
+    manifest = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.manifest)
+    split_name = Path(args.manifest).stem
+    if args.validation_split:
         _, manifest = split_by_scene(manifest)
         split_name = f"{split_name}_validation"
 
@@ -168,15 +225,13 @@ if __name__ == "__main__":
     device = pick_device()
     print(f"device: {describe(device)}")
     model = build_model().to(device)
-    model.load_state_dict(
-        torch.load(PROJECT_ROOT / "checkpoints" / CHECKPOINT, map_location=device)
-    )
+    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
 
     loader = DataLoader(
         FrameDataset(manifest, PROJECT_ROOT, eval_transform()),
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=NUM_WORKERS,
+        num_workers=args.num_workers,
     )
 
     logits, labels, video_ids = predict(model, loader, device)
@@ -185,7 +240,9 @@ if __name__ == "__main__":
 
     predictions_dir = PROJECT_ROOT / "data" / "predictions"
     predictions_dir.mkdir(parents=True, exist_ok=True)
-    output = predictions_dir / f"{Path(CHECKPOINT).stem}__{split_name}.csv"
+    output = predictions_dir / (
+        args.output or f"{args.checkpoint.stem}__{split_name}.csv"
+    )
     table.to_csv(output, index=False)
 
     print(f"scored {len(table)} frames from {table['video_id'].nunique()} videos")
