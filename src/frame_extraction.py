@@ -31,6 +31,56 @@ class SampledFrame(NamedTuple):
     frame: np.ndarray
 
 
+def read_frames_at(video_path: Path, frame_numbers: list[int]) -> list[np.ndarray]:
+    """Read the frames a caller names, in the order given.
+
+    The counterpart to ``extract_frames`` for the case where the frames have
+    already been chosen. Two situations need that, and both would break under
+    re-sampling:
+
+    A companion video must line up frame for frame with one already extracted.
+    ``extract_frames`` places its picks with a random draw inside each segment,
+    so running it twice over a pair of videos yields two different sets of
+    frames — and a segmentation mask taken from a different instant than the
+    image it is meant to describe is wrong in a way nothing downstream can
+    detect. Reading the numbers a manifest already recorded removes the draw
+    from the question entirely.
+
+    Those companion videos also carry no metadata of their own, so there is no
+    gesture window to derive. Naming the frames sidesteps that too.
+
+    Args:
+        video_path: Path to the ``.mp4`` to read.
+        frame_numbers: Indices to read. Duplicates are allowed and are returned
+            once each, in the order requested — short clips do round two
+            segments onto the same frame.
+
+    Returns:
+        One BGR array per requested number, in the same order.
+
+    Raises:
+        RuntimeError: If the video cannot be opened, or a frame cannot be read.
+    """
+    video = cv2.VideoCapture(str(video_path))
+    if not video.isOpened():
+        raise RuntimeError(f"could not open video file: {video_path}")
+
+    frames = []
+    try:
+        for frame_number in frame_numbers:
+            video.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+            ok, frame = video.read()
+            if not ok:
+                raise RuntimeError(
+                    f"{video_path.name}: failure when reading frame {frame_number}"
+                )
+            frames.append(frame)
+    finally:
+        video.release()
+
+    return frames
+
+
 def read_metadata(xml_path: Path) -> ET.Element:
     """Parse a RoCoG-v2 metadata file and return its root element.
 
