@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from frame_extraction import read_frames_at
+from manifest import mask_path_for
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -80,27 +81,6 @@ def person_silhouette(mask_frame: np.ndarray) -> np.ndarray:
     blue, green, red = (mask_frame[:, :, channel].astype(int) for channel in range(3))
 
     return green < np.maximum(blue, red)
-
-
-def mask_path_for(frame_path: Path) -> Path:
-    """Name the silhouette belonging to an extracted frame.
-
-    The two trees mirror each other — ``data/frames/...`` and ``data/masks/...``
-    with the same class folders and file stems — rather than the mask being
-    recorded in the manifest. The manifest is a controlled artefact reproduced
-    byte for byte across machines, and adding a column to it would mean every
-    later run diverged from the ones already measured.
-
-    Args:
-        frame_path: The frame's path, as the manifest stores it.
-
-    Returns:
-        Where that frame's silhouette belongs, as a relative path.
-    """
-    parts = list(Path(frame_path).parts)
-    parts[parts.index("frames")] = "masks"
-
-    return Path(*parts).with_suffix(".png")
 
 
 def save_silhouettes(

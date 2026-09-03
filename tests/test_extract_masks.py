@@ -1,10 +1,8 @@
-from pathlib import Path
-
 import cv2
 import numpy as np
 import pytest
 
-from extract_masks import mask_path_for, parse_args, person_silhouette, save_silhouettes
+from extract_masks import parse_args, person_silhouette, save_silhouettes
 
 
 def segmentation_frame(person_colour: tuple[int, int, int]) -> np.ndarray:
@@ -47,18 +45,6 @@ def test_person_silhouette_returns_one_value_per_pixel():
 
     assert silhouette.shape == (4, 4)
     assert silhouette.dtype == bool
-
-
-def test_mask_path_mirrors_the_frame_tree():
-    assert mask_path_for(Path("data/frames/syn/Halt/Scene1_x_f0007.jpg")) == Path(
-        "data/masks/syn/Halt/Scene1_x_f0007.png"
-    )
-
-
-def test_mask_path_accepts_a_string_as_a_manifest_stores_it():
-    assert mask_path_for("data/frames/real/Rally/S02_y_f0012.jpg") == Path(
-        "data/masks/real/Rally/S02_y_f0012.png"
-    )
 
 
 def test_save_silhouettes_writes_only_two_values(tmp_path):

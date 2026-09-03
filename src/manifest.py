@@ -83,6 +83,27 @@ def video_metadata(video_path: Path, domain: str) -> VideoMetadata:
     return VideoMetadata(video_id, group_id, view, is_frontal)
 
 
+def mask_path_for(frame_path: Path) -> Path:
+    """Name the silhouette belonging to an extracted frame.
+
+    The two trees mirror each other — ``data/frames/...`` and ``data/masks/...``
+    with the same class folders and file stems — rather than the mask being
+    recorded in the manifest. The manifest is a controlled artefact reproduced
+    byte for byte across machines, and adding a column to it would mean every
+    later run diverged from the ones already measured.
+
+    Args:
+        frame_path: The frame's path, as the manifest stores it.
+
+    Returns:
+        Where that frame's silhouette belongs, as a relative path.
+    """
+    parts = list(Path(frame_path).parts)
+    parts[parts.index("frames")] = "masks"
+
+    return Path(*parts).with_suffix(".png")
+
+
 def load_class_names(path: Path) -> dict[int, str]:
     """Load the label-to-name mapping ..."""
     text = path.read_text(encoding="utf-8")

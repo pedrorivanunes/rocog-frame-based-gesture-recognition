@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from manifest import video_metadata
+from manifest import mask_path_for, video_metadata
 
 
 def test_synthetic_scene_number_determines_view():
@@ -36,3 +36,15 @@ def test_second_session_maps_to_the_same_subject():
     assert meta.group_id == "S04"
     assert meta.view is None
     assert meta.is_frontal is True
+
+
+def test_mask_path_mirrors_the_frame_tree():
+    assert mask_path_for(Path("data/frames/syn/Halt/Scene1_x_f0007.jpg")) == Path(
+        "data/masks/syn/Halt/Scene1_x_f0007.png"
+    )
+
+
+def test_mask_path_accepts_a_string_as_a_manifest_stores_it():
+    assert mask_path_for("data/frames/real/Rally/S02_y_f0012.jpg") == Path(
+        "data/masks/real/Rally/S02_y_f0012.png"
+    )
