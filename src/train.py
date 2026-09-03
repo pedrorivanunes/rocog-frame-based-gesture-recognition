@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from dataset import (
     SAMPLER_SEED,
+    BackgroundRandomiser,
     FrameDataset,
     SegmentSampler,
     eval_transform,
@@ -37,6 +38,10 @@ MAX_EPOCHS = 15
 PATIENCE = 3
 PHOTOMETRIC = True
 GEOMETRIC = True
+# Off by default: every run measured so far trained on the scenes as
+# rendered, and a default that silently changed the input would make the
+# new runs incomparable to them.
+BACKGROUND = 0.0
 CHECKPOINT_NAME = "syn_ground_train.pt"
 
 
@@ -91,6 +96,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=GEOMETRIC,
         help="flip and vary the crop scale while training",
+    )
+    parser.add_argument(
+        "--background",
+        type=float,
+        default=BACKGROUND,
+        metavar="PROBABILITY",
+        help="chance of replacing a training frame's scene with a random solid "
+        "colour or noise, from 0 to 1; evaluation is never composited",
     )
     parser.add_argument(
         "--max-epochs",
@@ -156,6 +169,7 @@ def build_loaders(
     frames_per_epoch: int = FRAMES_PER_EPOCH,
     photometric: bool = PHOTOMETRIC,
     geometric: bool = GEOMETRIC,
+    background: float = BACKGROUND,
     seed: int = SEED,
 ) -> tuple[DataLoader, DataLoader]:
     """Build the training and evaluation loaders from two sets of manifest rows.
@@ -181,6 +195,11 @@ def build_loaders(
             runs are measured against the same images.
         geometric: Whether training flips and varies the crop's scale. Same
             restriction — training only.
+        background: Chance of replacing a training frame's scene, 0 to 1. Zero
+            builds no randomiser at all, so a run that does not ask for this
+            never reads a silhouette. Evaluation is never composited: the real
+            test footage has no segmentation, and a model has to meet its scenes
+            as they are.
         seed: Which repetition of a configuration this is. Offsets the sampler's
             own seed rather than replacing it, so that seed 0 keeps drawing the
             frames earlier runs drew and stays comparable to them.
@@ -189,7 +208,10 @@ def build_loaders(
         The training loader and the evaluation loader.
     """
     train_dataset = FrameDataset(
-        train_manifest, data_root, transform=train_transform(photometric, geometric)
+        train_manifest,
+        data_root,
+        transform=train_transform(photometric, geometric),
+        background=BackgroundRandomiser(background) if background else None,
     )
     eval_dataset = FrameDataset(eval_manifest, data_root, transform=eval_transform())
 
@@ -316,7 +338,8 @@ if __name__ == "__main__":
     best_name = checkpoint_name(args.checkpoint_name, args.seed)
     print(
         f"seed {args.seed}  photometric {args.photometric}  "
-        f"geometric {args.geometric}  max epochs {args.max_epochs}  "
+        f"geometric {args.geometric}  background {args.background}  "
+        f"max epochs {args.max_epochs}  "
         f"patience {args.patience}  workers {args.num_workers}  ->  "
         f"checkpoints/{best_name}"
         f"{'  (+ one per epoch)' if args.save_every_epoch else ''}"
@@ -329,6 +352,7 @@ if __name__ == "__main__":
         args.num_workers,
         photometric=args.photometric,
         geometric=args.geometric,
+        background=args.background,
         seed=args.seed,
     )
 

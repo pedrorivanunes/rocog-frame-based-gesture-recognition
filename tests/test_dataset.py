@@ -1,7 +1,14 @@
+import numpy as np
 import pandas as pd
 import pytest
+import torch
 
-from dataset import SegmentSampler
+from dataset import (
+    BackgroundRandomiser,
+    SegmentSampler,
+    noise_background,
+    solid_background,
+)
 
 FRAMES_STORED = 24
 
@@ -87,3 +94,106 @@ def test_videos_of_differing_length_are_rejected():
 
     with pytest.raises(RuntimeError):
         SegmentSampler(manifest, frames_per_video=8)
+
+
+def silhouette_and_frame(size: int = 8):
+    """A frame of one colour with a square person in the middle."""
+    frame = np.full((size, size, 3), 200, dtype=np.uint8)
+    silhouette = np.zeros((size, size), dtype=bool)
+    silhouette[2:6, 2:6] = True
+    frame[silhouette] = 50
+    return frame, silhouette
+
+
+def test_background_randomiser_leaves_the_frame_alone_at_probability_zero():
+    """Zero is how a run turns this off without a second code path."""
+    frame, silhouette = silhouette_and_frame()
+
+    composited = BackgroundRandomiser(probability=0.0)(frame, silhouette)
+
+    assert np.array_equal(composited, frame)
+
+
+def test_background_randomiser_keeps_the_person_pixel_for_pixel():
+    """Everything inside the silhouette has to survive untouched."""
+    frame, silhouette = silhouette_and_frame()
+
+    composited = BackgroundRandomiser(probability=1.0)(frame, silhouette)
+
+    assert np.array_equal(composited[silhouette], frame[silhouette])
+
+
+def test_background_randomiser_replaces_everything_outside_the_person():
+    frame, silhouette = silhouette_and_frame()
+
+    composited = BackgroundRandomiser(probability=1.0, kinds=("solid",))(
+        frame, silhouette
+    )
+
+    assert not np.array_equal(composited[~silhouette], frame[~silhouette])
+    assert len(np.unique(composited[~silhouette].reshape(-1, 3), axis=0)) == 1
+
+
+def test_background_randomiser_draws_a_new_background_each_call():
+    """A background fixed across calls would be a texture to memorise."""
+    frame, silhouette = silhouette_and_frame()
+    randomiser = BackgroundRandomiser(probability=1.0, kinds=("solid",))
+
+    backgrounds = {randomiser(frame, silhouette)[0, 0].tobytes() for _ in range(20)}
+
+    assert len(backgrounds) > 1
+
+
+def test_background_randomiser_honours_its_probability():
+    frame, silhouette = silhouette_and_frame()
+    randomiser = BackgroundRandomiser(probability=0.5, kinds=("solid",))
+    generator = torch.Generator().manual_seed(0)
+
+    swapped = sum(
+        not np.array_equal(randomiser(frame, silhouette, generator), frame)
+        for _ in range(400)
+    )
+
+    assert 150 < swapped < 250
+
+
+def test_background_randomiser_reproduces_from_a_generator():
+    frame, silhouette = silhouette_and_frame()
+    randomiser = BackgroundRandomiser(probability=1.0)
+
+    first = randomiser(frame, silhouette, torch.Generator().manual_seed(7))
+    second = randomiser(frame, silhouette, torch.Generator().manual_seed(7))
+
+    assert np.array_equal(first, second)
+
+
+def test_background_randomiser_rejects_a_mismatched_silhouette():
+    """A silhouette of the wrong size would cut the person somewhere else."""
+    frame, _ = silhouette_and_frame(size=8)
+
+    with pytest.raises(ValueError, match="silhouette is"):
+        BackgroundRandomiser(probability=1.0)(frame, np.zeros((4, 4), dtype=bool))
+
+
+def test_background_randomiser_rejects_an_impossible_probability():
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        BackgroundRandomiser(probability=1.5)
+
+
+def test_background_randomiser_rejects_an_unknown_kind():
+    with pytest.raises(ValueError, match="unknown background kinds"):
+        BackgroundRandomiser(kinds=("solid", "chequerboard"))
+
+
+def test_noise_background_is_not_one_colour():
+    assert len(np.unique(noise_background((16, 16)).reshape(-1, 3), axis=0)) > 1
+
+
+def test_solid_background_is_one_colour():
+    assert len(np.unique(solid_background((16, 16)).reshape(-1, 3), axis=0)) == 1
+
+
+def test_backgrounds_match_the_frame_they_replace():
+    for build in (solid_background, noise_background):
+        assert build((11, 13)).shape == (11, 13, 3)
+        assert build((11, 13)).dtype == np.uint8

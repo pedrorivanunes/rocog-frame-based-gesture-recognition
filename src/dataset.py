@@ -15,6 +15,8 @@ import torch
 from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import v2
 
+from manifest import mask_path_for
+
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 CROP_SIZE = 224
@@ -42,6 +44,131 @@ PHOTOMETRIC_JITTER = {
 # apparent length of an extended arm.
 GEOMETRIC_SCALE = (0.6, 1.0)
 GEOMETRIC_RATIO = (0.9, 1.1)
+
+
+# How often a frame's scene is replaced during training. Not one: a model that
+# never sees the rendered terrain has no chance to learn what a plausible scene
+# looks like, and half the batch keeping its own background costs nothing while
+# hedging that. The value is a starting point, not a measurement.
+BACKGROUND_PROBABILITY = 0.5
+
+
+def solid_background(shape: tuple[int, int], generator=None) -> np.ndarray:
+    """A background of one uniform colour, drawn at random.
+
+    The bluntest possible scene: it carries no texture, no horizon and no
+    objects, so a model cannot read anything from it. What survives training
+    against it is whatever the person alone supports.
+
+    Args:
+        shape: ``(height, width)`` of the frame being composited.
+        generator: Torch generator to draw from, or ``None`` for the global one,
+            which a DataLoader seeds separately in every worker.
+
+    Returns:
+        A ``(height, width, 3)`` uint8 array of a single colour.
+    """
+    colour = torch.randint(0, 256, (3,), generator=generator, dtype=torch.uint8)
+
+    return np.broadcast_to(colour.numpy(), (*shape, 3)).copy()
+
+
+def noise_background(shape: tuple[int, int], generator=None) -> np.ndarray:
+    """A background of independent random pixels.
+
+    The opposite failure mode to a solid colour: maximal high-frequency detail
+    with no structure at all. Between the two, a model that leans on the scene
+    has nowhere left to lean.
+
+    Args:
+        shape: ``(height, width)`` of the frame being composited.
+        generator: Torch generator to draw from, or ``None`` for the global one.
+
+    Returns:
+        A ``(height, width, 3)`` uint8 array of noise.
+    """
+    noise = torch.randint(0, 256, (*shape, 3), generator=generator, dtype=torch.uint8)
+
+    return noise.numpy()
+
+
+BACKGROUNDS = {"solid": solid_background, "noise": noise_background}
+
+
+class BackgroundRandomiser:
+    """Replace the scene behind the person, some of the time.
+
+    The model reaches 82 to 87 percent on rendered scenes it has never seen and
+    falls to the low thirties on real footage. One reading of that gap is that
+    what transfers is the pose and what does not is the scene, in which case a
+    model held to the pose alone should lose less crossing over. Compositing the
+    silhouette onto backgrounds that carry no information at all is the cheapest
+    way to hold it there.
+
+    Randomness comes from torch rather than numpy because a DataLoader seeds
+    torch separately in each worker and does not always do the same for numpy's
+    global generator — which would hand every worker the same backgrounds.
+
+    Attributes:
+        probability: Chance that a given frame has its scene replaced.
+        kinds: Names of the background generators to draw between.
+    """
+
+    def __init__(
+        self,
+        probability: float = BACKGROUND_PROBABILITY,
+        kinds: tuple[str, ...] = ("solid", "noise"),
+    ):
+        """Configure how often and with what to replace a scene.
+
+        Args:
+            probability: Chance a frame is composited, from 0 to 1. Zero leaves
+                every frame untouched, which is how a run turns this off without
+                a second code path.
+            kinds: Which generators in ``BACKGROUNDS`` to draw between, uniformly.
+
+        Raises:
+            ValueError: If the probability falls outside 0 to 1, or a name is not
+                a known generator.
+        """
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"probability must be between 0 and 1, got {probability}")
+        unknown = set(kinds) - set(BACKGROUNDS)
+        if unknown:
+            raise ValueError(f"unknown background kinds: {sorted(unknown)}")
+        if not kinds:
+            raise ValueError("at least one background kind is needed")
+
+        self.probability = probability
+        self.kinds = kinds
+
+    def __call__(
+        self, frame: np.ndarray, silhouette: np.ndarray, generator=None
+    ) -> np.ndarray:
+        """Composite one frame's person onto a fresh background, or pass it through.
+
+        Args:
+            frame: The frame, ``(height, width, 3)``.
+            silhouette: Boolean array, true on the person, same height and width.
+            generator: Torch generator to draw from, or ``None`` for the global one.
+
+        Returns:
+            Either the frame unchanged, or the person over a new background.
+
+        Raises:
+            ValueError: If the silhouette does not cover the frame.
+        """
+        if silhouette.shape != frame.shape[:2]:
+            raise ValueError(
+                f"silhouette is {silhouette.shape}, frame is {frame.shape[:2]}"
+            )
+        if torch.rand((), generator=generator).item() >= self.probability:
+            return frame
+
+        index = int(torch.randint(len(self.kinds), (), generator=generator))
+        background = BACKGROUNDS[self.kinds[index]](frame.shape[:2], generator)
+
+        return np.where(silhouette[:, :, None], frame, background)
 
 
 def train_transform(
@@ -134,6 +261,7 @@ class FrameDataset(Dataset):
         manifest: pd.DataFrame,
         data_root: Path,
         transform: v2.Transform,
+        background: BackgroundRandomiser | None = None,
     ):
         """Prepare to serve the frames a manifest lists.
 
@@ -145,10 +273,17 @@ class FrameDataset(Dataset):
             data_root: Directory the manifest's ``path`` column is relative to.
             transform: Pipeline applied to every frame. Required rather than
                 optional, so a missing one fails here instead of on the first read.
+            background: Replaces the scene behind the person on some frames.
+                ``None`` serves frames as they were extracted, and is the only
+                correct setting for evaluation: the real test footage has no
+                segmentation to composite with, so a model has to meet its
+                scenes intact. Compositing there would also measure the model on
+                inputs no deployment ever produces.
         """
         self.data_frame = manifest.reset_index(drop=True)
         self.data_root = data_root
         self.transform = transform
+        self.background = background
 
     def __len__(self) -> int:
         """Count frames, not videos — the manifest holds 24 rows per video."""
@@ -161,14 +296,33 @@ class FrameDataset(Dataset):
         transform: the pretrained weights were learned on RGB, and feeding the
         channels reversed silently degrades every prediction.
 
+        A background swap happens before the transform, not after, because the
+        silhouette is stored aligned to the extracted frame. The transform crops,
+        so compositing afterwards would place a 256-wide mask over a 224-wide
+        image.
+
         Returns:
             The transformed frame as a ``(3, 224, 224)`` float tensor, the class
             label, and the ``video_id`` needed to group predictions by video.
+
+        Raises:
+            RuntimeError: If a frame, or a silhouette a background swap needs,
+                is missing from disk.
         """
         row = self.data_frame.iloc[index]
         frame_path = self.data_root / row["path"]
         frame = cv2.imread(str(frame_path))
+        if frame is None:
+            raise RuntimeError(f"could not read frame {frame_path}")
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        if self.background is not None:
+            silhouette_path = self.data_root / mask_path_for(row["path"])
+            silhouette = cv2.imread(str(silhouette_path), cv2.IMREAD_GRAYSCALE)
+            if silhouette is None:
+                raise RuntimeError(f"could not read silhouette {silhouette_path}")
+            frame = self.background(frame, silhouette > 127)
+
         frame = self.transform(frame)
         return frame, row["label"], row["video_id"]
 
