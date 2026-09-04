@@ -1,7 +1,8 @@
+import numpy as np
 import pandas as pd
 import pytest
 
-from splits import split_by_scene
+from splits import split_by_group, split_by_scene
 
 REAL_SHAPE = [7, 7, 7, 5, 6, 8]
 
@@ -97,3 +98,67 @@ def test_a_view_with_too_few_scenes_is_rejected():
 
     with pytest.raises(RuntimeError):
         split_by_scene(manifest, scenes_per_view=6)
+
+
+def test_split_by_group_holds_out_the_groups_it_is_given():
+    manifest = pd.DataFrame(
+        {"group_id": ["S01", "S01", "S02", "S03"], "video_id": list("abcd")}
+    )
+
+    train, validation = split_by_group(manifest, ["S02"])
+
+    assert sorted(train.group_id.unique()) == ["S01", "S03"]
+    assert sorted(validation.group_id.unique()) == ["S02"]
+
+
+def test_split_by_group_keeps_no_group_on_both_sides():
+    manifest = pd.DataFrame(
+        {"group_id": ["S01", "S02", "S03"], "video_id": list("abc")}
+    )
+
+    train, validation = split_by_group(manifest, ["S02", "S03"])
+
+    assert not set(train.group_id) & set(validation.group_id)
+
+
+def test_split_by_group_rejects_a_group_the_manifest_does_not_hold():
+    # A name that matches nothing would otherwise leave validation empty, and
+    # that failure surfaces much later without saying what caused it.
+    manifest = pd.DataFrame({"group_id": ["S01", "S02"], "video_id": list("ab")})
+
+    with pytest.raises(ValueError, match="not in the manifest"):
+        split_by_group(manifest, ["S99"])
+
+
+def test_split_by_group_rejects_holding_out_nothing():
+    manifest = pd.DataFrame({"group_id": ["S01"], "video_id": ["a"]})
+
+    with pytest.raises(ValueError):
+        split_by_group(manifest, [])
+
+
+def test_split_by_group_rejects_holding_out_every_group():
+    manifest = pd.DataFrame({"group_id": ["S01", "S02"], "video_id": list("ab")})
+
+    with pytest.raises(ValueError, match="nothing to train on"):
+        split_by_group(manifest, ["S01", "S02"])
+
+
+def test_the_scene_split_refuses_a_manifest_that_carries_no_viewpoint():
+    # The real manifests have no viewpoint, so grouping by one finds nothing and
+    # the scene split has no scenes to draw. Failing here is the point: the
+    # alternative is an empty validation set, which only fails once a batch of
+    # nothing reaches the model and says nothing about the cause.
+    manifest = pd.DataFrame(
+        {
+            "group_id": ["S01", "S02", "S03"],
+            "video_id": list("abc"),
+            "view": [np.nan] * 3,
+        }
+    )
+
+    with pytest.raises(ValueError):
+        split_by_scene(manifest)
+
+    _, validation = split_by_group(manifest, ["S02"])
+    assert len(validation) == 1

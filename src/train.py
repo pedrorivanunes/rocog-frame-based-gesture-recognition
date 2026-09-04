@@ -24,7 +24,7 @@ from dataset import (
 from device import describe, pick_device
 from evaluation import frame_metrics, predict
 from model import build_model
-from splits import split_by_scene
+from splits import split_by_group, split_by_scene
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BATCH_SIZE = 64
@@ -43,6 +43,7 @@ GEOMETRIC = True
 # new runs incomparable to them.
 BACKGROUND = 0.0
 CHECKPOINT_NAME = "syn_ground_train.pt"
+MANIFEST = "syn_ground_train.csv"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -68,15 +69,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     a validation-loss spread wide enough to matter. Measure that spread on the
     machine at hand before reading any difference as the effect of a change.
 
+    ``--manifest`` and ``--validation-groups`` are what let a run train on a
+    domain other than the synthetic one. Which rows are held out for validation
+    cannot be inferred from the data: the synthetic manifest is split by scene,
+    drawing one per viewpoint so that all six survive on both sides, and the real
+    manifest has no viewpoint at all — its unit is the recorded subject. Naming
+    the held-out groups keeps that choice visible in the command that produced a
+    result, which matters because it is a control and not a knob.
+
     Args:
         argv: Arguments to parse. ``None`` reads ``sys.argv``.
 
     Returns:
-        A namespace with ``seed``, ``photometric``, ``geometric``,
-        ``max_epochs``, ``patience``, ``checkpoint_name``, ``num_workers`` and
+        A namespace with ``manifest``, ``validation_groups``, ``seed``,
+        ``photometric``, ``geometric``, ``background``, ``max_epochs``,
+        ``patience``, ``checkpoint_name``, ``num_workers`` and
         ``save_every_epoch``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--manifest",
+        default=MANIFEST,
+        help="frames to train on, a file name under data/manifests/",
+    )
+    parser.add_argument(
+        "--validation-groups",
+        nargs="+",
+        default=None,
+        metavar="GROUP",
+        help="groups held out for validation, named rather than drawn. Omit for "
+        "the synthetic manifest, which is split by scene, one per viewpoint; "
+        "required for the real manifest, whose groups are the recorded subjects",
+    )
     parser.add_argument(
         "--seed",
         type=int,
@@ -183,7 +207,8 @@ def build_loaders(
     Args:
         train_manifest: Rows listing the frames to train on.
         eval_manifest: Rows listing the frames to evaluate on. Disjoint from the
-            training rows by construction — see ``splits.split_by_scene``.
+            training rows by construction — see ``splits``, which holds out
+            whole groups precisely so that nothing straddles the boundary.
         data_root: Directory the manifests' ``path`` column is relative to.
         num_workers: Loader subprocesses. Zero avoids the ~16 s spawn cost, which
             is worth paying only for runs long enough to amortise it.
@@ -325,11 +350,15 @@ if __name__ == "__main__":
     # that are supposed to differ only in the treatment.
     torch.manual_seed(args.seed)
 
-    manifest = pd.read_csv(PROJECT_ROOT / "data/manifests/syn_ground_train.csv")
-    train_manifest, eval_manifest = split_by_scene(manifest)
+    manifest = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.manifest)
+    train_manifest, eval_manifest = (
+        split_by_group(manifest, args.validation_groups)
+        if args.validation_groups
+        else split_by_scene(manifest)
+    )
 
     held_out = sorted(eval_manifest["group_id"].unique())
-    print(f"validation scenes: {' '.join(held_out)}")
+    print(f"manifest {args.manifest}  validation groups: {' '.join(held_out)}")
     print(
         f"train {train_manifest['video_id'].nunique()} videos / "
         f"validation {eval_manifest['video_id'].nunique()} videos "

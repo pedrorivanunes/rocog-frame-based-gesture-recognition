@@ -12,6 +12,56 @@ import pandas as pd
 SPLIT_SEED = 7
 
 
+def split_by_group(
+    manifest: pd.DataFrame,
+    held_out: list[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Hold out whole groups, named rather than drawn.
+
+    The group is the unit that must not straddle the boundary: the scene for
+    synthetic videos, which fixes terrain, lighting, camera and avatar, and the
+    recorded subject for real ones, since a person who appears on both sides
+    turns a measure of generalisation into a measure of memorisation.
+
+    Which groups are held out is named by the caller rather than drawn, because
+    here it is a control and not a source of variation. The real subjects differ
+    in size by a factor of three — one of the seven carries a third of the
+    videos on its own — so drawing one would change how much data a run trains
+    on, and two runs meant to differ only in their seed would differ in that
+    too. Naming it also puts the choice in the command that produced a result.
+
+    Args:
+        manifest: Rows to split. Requires the ``group_id`` column.
+        held_out: Groups whose rows become the validation side.
+
+    Returns:
+        The training rows and the validation rows, in that order. Both carry
+        every column of the input.
+
+    Raises:
+        ValueError: If nothing is held out, if a named group is absent from the
+            manifest, or if holding these out would leave nothing to train on.
+            An absent name is worth stopping for rather than ignoring: it
+            otherwise yields an empty validation set, which fails much later and
+            says nothing about what caused it.
+    """
+    if not held_out:
+        raise ValueError("no groups named to hold out")
+
+    present = set(manifest["group_id"].unique())
+    missing = sorted(set(held_out) - present)
+    if missing:
+        raise ValueError(f"groups not in the manifest: {missing}")
+    if not present - set(held_out):
+        raise ValueError("holding out every group would leave nothing to train on")
+
+    is_validation = manifest["group_id"].isin(held_out)
+    train = manifest[~is_validation].reset_index(drop=True)
+    validation = manifest[is_validation].reset_index(drop=True)
+
+    return train, validation
+
+
 def split_by_scene(
     manifest: pd.DataFrame,
     scenes_per_view: int = 1,
@@ -65,8 +115,4 @@ def split_by_scene(
 
         held_out.extend(rng.choice(scenes, size=scenes_per_view, replace=False))
 
-    is_validation = manifest["group_id"].isin(held_out)
-    train = manifest[~is_validation].reset_index(drop=True)
-    validation = manifest[is_validation].reset_index(drop=True)
-
-    return train, validation
+    return split_by_group(manifest, held_out)
