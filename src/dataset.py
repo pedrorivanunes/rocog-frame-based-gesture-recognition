@@ -25,11 +25,11 @@ SAMPLER_SEED = 13
 # The widely used ImageNet recipe, taken as published rather than tuned. Fitting
 # these to the target domain would need measurements from it, and a source-only
 # result may not look at the target at all — not even at unlabelled statistics.
-# The narrower point is that they cannot be tuned on the synthetic validation
-# split either: augmentation that widens the source distribution costs accuracy
-# in-domain and earns it only across the gap, so validation would select against
-# exactly the setting that helps. Source-only training has no honest way to pick
-# these, and saying so is part of the result.
+# Tuning them on the source validation split is possible but answers a different
+# question: that split ranks settings by what helps inside the rendered domain,
+# while what a setting is worth here is decided by what survives the crossing.
+# Taking a published default and saying it was not tuned is the honest option the
+# protocol leaves, and saying so is part of the result.
 PHOTOMETRIC_JITTER = {
     "brightness": 0.4,
     "contrast": 0.4,
@@ -98,12 +98,11 @@ BACKGROUNDS = {"solid": solid_background, "noise": noise_background}
 class BackgroundRandomiser:
     """Replace the scene behind the person, some of the time.
 
-    The model reaches 82 to 87 percent on rendered scenes it has never seen and
-    falls to the low thirties on real footage. One reading of that gap is that
-    what transfers is the pose and what does not is the scene, in which case a
-    model held to the pose alone should lose less crossing over. Compositing the
-    silhouette onto backgrounds that carry no information at all is the cheapest
-    way to hold it there.
+    The model scores far higher on rendered scenes it has never seen than on
+    real footage. One reading of that gap is that what transfers is the pose and
+    what does not is the scene, in which case a model held to the pose alone
+    should lose less crossing over. Compositing the silhouette onto backgrounds
+    that carry no information at all is the cheapest way to hold it there.
 
     Randomness comes from torch rather than numpy because a DataLoader seeds
     torch separately in each worker and does not always do the same for numpy's
