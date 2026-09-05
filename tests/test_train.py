@@ -1,4 +1,7 @@
-from train import EarlyStopping, checkpoint_name, parse_args
+import pytest
+import torch
+
+from train import EarlyStopping, build_criteria, checkpoint_name, parse_args
 
 # The run without photometric jitter, whose curve is not monotonic.
 BASELINE_CURVE = [0.7773, 0.6929, 0.6992, 0.6294, 0.7510]
@@ -15,6 +18,7 @@ def test_parse_args_with_no_arguments_is_the_standard_run():
     assert args.checkpoint_name == "syn_ground_train.pt"
     assert args.num_workers == 12
     assert args.save_every_epoch is False
+    assert args.label_smoothing == 0.0
 
 
 def test_parse_args_keeps_every_epoch_when_asked():
@@ -23,6 +27,39 @@ def test_parse_args_keeps_every_epoch_when_asked():
 
 def test_parse_args_takes_a_repetition_seed():
     assert parse_args(["--seed", "2"]).seed == 2
+
+
+def test_parse_args_takes_a_smoothing_fraction():
+    assert parse_args(["--label-smoothing", "0.1"]).label_smoothing == 0.1
+
+
+def test_the_validation_criterion_is_never_smoothed():
+    """The treatment must not reach the number that measures it."""
+    training, validation = build_criteria(0.1)
+
+    assert training.label_smoothing == 0.1
+    assert validation.label_smoothing == 0.0
+
+
+def test_smoothing_lifts_the_loss_that_a_perfect_answer_still_carries():
+    """Why the two criteria stay separate: the floor moves with the treatment."""
+    certain = torch.tensor([[20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    truth = torch.tensor([0])
+    training, validation = build_criteria(0.1)
+
+    assert validation(certain, truth).item() == pytest.approx(0.0, abs=1e-6)
+    assert training(certain, truth).item() > 1.0
+
+
+def test_no_smoothing_leaves_the_two_criteria_agreeing():
+    """The default has to reproduce every run recorded before the option."""
+    certain = torch.tensor([[20.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+    truth = torch.tensor([0])
+    training, validation = build_criteria(0.0)
+
+    assert training(certain, truth).item() == pytest.approx(
+        validation(certain, truth).item()
+    )
 
 
 def test_checkpoint_name_marks_the_seed():

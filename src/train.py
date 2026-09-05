@@ -42,6 +42,10 @@ GEOMETRIC = True
 # rendered, and a default that silently changed the input would make the
 # new runs incomparable to them.
 BACKGROUND = 0.0
+# Off for the same reason as BACKGROUND: every run recorded so far trained
+# against hard targets, and a default that softened them would make the runs
+# after this option incomparable to the ones before it.
+LABEL_SMOOTHING = 0.0
 CHECKPOINT_NAME = "syn_ground_train.pt"
 MANIFEST = "syn_ground_train.csv"
 
@@ -82,8 +86,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     Returns:
         A namespace with ``manifest``, ``validation_groups``, ``seed``,
-        ``photometric``, ``geometric``, ``background``, ``max_epochs``,
-        ``patience``, ``checkpoint_name``, ``num_workers`` and
+        ``photometric``, ``geometric``, ``background``, ``label_smoothing``,
+        ``max_epochs``, ``patience``, ``checkpoint_name``, ``num_workers`` and
         ``save_every_epoch``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -128,6 +132,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="PROBABILITY",
         help="chance of replacing a training frame's scene with a random solid "
         "colour or noise, from 0 to 1; evaluation is never composited",
+    )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=LABEL_SMOOTHING,
+        metavar="FRACTION",
+        help="mass moved off the true class and spread over the other six "
+        "while training, from 0 to 1. Validation is always scored against hard "
+        "targets, so its loss stays comparable across values",
     )
     parser.add_argument(
         "--max-epochs",
@@ -311,6 +324,31 @@ class EarlyStopping:
         return self.epochs_without_improvement >= self.patience
 
 
+def build_criteria(label_smoothing: float) -> tuple[nn.Module, nn.Module]:
+    """Build the loss training minimises and the loss validation is scored with.
+
+    Deliberately two objects rather than one. Smoothing spreads part of the
+    target onto the wrong classes, which lifts the floor of the cross-entropy:
+    a model answering perfectly no longer reaches zero. A validation loss
+    carrying that offset would sit on a different scale for every value of the
+    option — unreadable against ln(7), the loss of a uniform guess, and not
+    comparable to any run recorded before the option existed.
+
+    Early stopping reads the validation loss as well, which is the second
+    reason. Sharing one criterion would let the treatment move the rule that
+    picks the best epoch, and a sweep whose selection rule shifts with the value
+    being swept measures two things at once.
+
+    Args:
+        label_smoothing: Mass moved off the true class while training, from 0
+            to 1. Zero leaves training and validation identical.
+
+    Returns:
+        The training criterion and the validation criterion.
+    """
+    return nn.CrossEntropyLoss(label_smoothing=label_smoothing), nn.CrossEntropyLoss()
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
     """Run one pass over the training data and return the mean loss.
 
@@ -368,6 +406,7 @@ if __name__ == "__main__":
     print(
         f"seed {args.seed}  photometric {args.photometric}  "
         f"geometric {args.geometric}  background {args.background}  "
+        f"label smoothing {args.label_smoothing}  "
         f"max epochs {args.max_epochs}  "
         f"patience {args.patience}  workers {args.num_workers}  ->  "
         f"checkpoints/{best_name}"
@@ -388,7 +427,7 @@ if __name__ == "__main__":
     device = pick_device()
     print(f"device: {describe(device)}")
     model = build_model().to(device)
-    criterion = nn.CrossEntropyLoss()
+    criterion, validation_criterion = build_criteria(args.label_smoothing)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
     checkpoint_dir = PROJECT_ROOT / "checkpoints"
@@ -400,7 +439,7 @@ if __name__ == "__main__":
         loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
 
         logits, labels, _ = predict(model, eval_loader, device)
-        eval_loss, eval_accuracy = frame_metrics(logits, labels, criterion)
+        eval_loss, eval_accuracy = frame_metrics(logits, labels, validation_criterion)
 
         print(
             f"epoch {epoch + 1}/{args.max_epochs}  train loss {loss:.4f}  "
