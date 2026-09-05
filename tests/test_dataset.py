@@ -5,9 +5,11 @@ import torch
 
 from dataset import (
     BackgroundRandomiser,
+    RandomGamma,
     SegmentSampler,
     noise_background,
     solid_background,
+    train_transform,
 )
 
 FRAMES_STORED = 24
@@ -197,3 +199,101 @@ def test_backgrounds_match_the_frame_they_replace():
     for build in (solid_background, noise_background):
         assert build((11, 13)).shape == (11, 13, 3)
         assert build((11, 13)).dtype == np.uint8
+
+
+def flat_gradient():
+    """A frame with a known, modest spread, standing in for a rendered one."""
+    ramp = torch.linspace(96, 160, 64, dtype=torch.float32)
+
+    return ramp.expand(3, 64, 64).round().to(torch.uint8)
+
+
+def dark_share(image):
+    """The measured gap between the domains: how much of the frame is in shadow."""
+    return (image.to(torch.float32).mean(dim=0) < 96).float().mean().item()
+
+
+def test_gamma_creates_the_dark_population_the_renders_lack():
+    """The whole point: renders carry almost no shadow, and gamma supplies it."""
+    frame = flat_gradient()
+
+    darkened = RandomGamma((1.6, 2.4))(frame)
+
+    assert dark_share(darkened) > dark_share(frame)
+
+
+def test_gamma_darkens_on_every_draw():
+    """A symmetric jitter would brighten about half the time; this must not."""
+    frame = flat_gradient()
+    shift = RandomGamma((1.6, 2.4))
+
+    assert all(
+        shift(frame).to(torch.float32).mean() < frame.to(torch.float32).mean()
+        for _ in range(50)
+    )
+
+
+def test_gamma_never_pushes_a_pixel_past_white():
+    """Why gamma and not a contrast stretch: the top of the scale cannot clip."""
+    bright = torch.full((3, 32, 32), 250, dtype=torch.uint8)
+
+    assert RandomGamma((1.0, 3.0))(bright).max().item() <= 250
+
+
+def test_a_gamma_range_of_one_leaves_the_frame_alone():
+    frame = flat_gradient()
+
+    assert torch.equal(RandomGamma((1.0, 1.0))(frame), frame)
+
+
+def test_gamma_draws_a_new_exponent_each_call():
+    """One value reused for the whole epoch would be a fixed edit, not augmentation."""
+    frame = flat_gradient()
+    shift = RandomGamma((1.0, 3.0))
+
+    means = {round(shift(frame).to(torch.float32).mean().item(), 4) for _ in range(20)}
+
+    assert len(means) > 1
+
+
+def test_gamma_follows_torch_seeding():
+    """The loader seeds torch per worker; drawing elsewhere would ignore that."""
+    frame = flat_gradient()
+    shift = RandomGamma((1.0, 3.0))
+
+    torch.manual_seed(0)
+    first = [shift(frame).to(torch.float32).mean().item() for _ in range(5)]
+    torch.manual_seed(0)
+    second = [shift(frame).to(torch.float32).mean().item() for _ in range(5)]
+
+    assert first == second
+
+
+@pytest.mark.parametrize("bad", [(0.0, 1.5), (-1.0, 1.5), (2.2, 1.5)])
+def test_gamma_rejects_an_impossible_range(bad):
+    with pytest.raises(ValueError):
+        RandomGamma(bad)
+
+
+def test_train_transform_adds_the_shift_only_when_asked():
+    """Omitting it has to reproduce the pipeline every earlier run used."""
+    without = train_transform(photometric=True, geometric=True)
+    with_shift = train_transform(
+        photometric=True, geometric=True, gamma_shift=(1.6, 2.4)
+    )
+
+    kinds = [type(step).__name__ for step in with_shift.transforms]
+
+    assert "RandomGamma" not in [type(step).__name__ for step in without.transforms]
+    assert kinds.count("RandomGamma") == 1
+    assert kinds.index("RandomGamma") > kinds.index("ColorJitter")
+
+
+def test_the_shift_runs_before_normalising():
+    """Gamma after normalisation would act on a signed scale, not on grey levels."""
+    kinds = [
+        type(step).__name__
+        for step in train_transform(gamma_shift=(1.6, 2.4)).transforms
+    ]
+
+    assert kinds.index("RandomGamma") < kinds.index("Normalize")

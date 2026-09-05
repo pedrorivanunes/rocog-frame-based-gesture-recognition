@@ -46,6 +46,9 @@ BACKGROUND = 0.0
 # against hard targets, and a default that softened them would make the runs
 # after this option incomparable to the ones before it.
 LABEL_SMOOTHING = 0.0
+# None, not a range: every run recorded so far left tone to the symmetric
+# jitter, and a default range would silently make them incomparable.
+GAMMA_SHIFT = None
 CHECKPOINT_NAME = "syn_ground_train.pt"
 MANIFEST = "syn_ground_train.csv"
 
@@ -86,7 +89,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     Returns:
         A namespace with ``manifest``, ``validation_groups``, ``seed``,
-        ``photometric``, ``geometric``, ``background``, ``label_smoothing``,
+        ``photometric``, ``geometric``, ``background``, ``gamma_shift``,
+        ``label_smoothing``,
         ``max_epochs``, ``patience``, ``checkpoint_name``, ``num_workers`` and
         ``save_every_epoch``.
     """
@@ -132,6 +136,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="PROBABILITY",
         help="chance of replacing a training frame's scene with a random solid "
         "colour or noise, from 0 to 1; evaluation is never composited",
+    )
+    parser.add_argument(
+        "--gamma-shift",
+        type=float,
+        nargs=2,
+        default=GAMMA_SHIFT,
+        metavar=("LOW", "HIGH"),
+        help="draw a gamma exponent from this range while training, on top of "
+        "the jitter. Above 1 darkens the midtones, which is where the rendered "
+        "frames differ from photographed ones; a range wide enough to span from "
+        "untouched to heavily darkened needs nothing measured from the target",
     )
     parser.add_argument(
         "--label-smoothing",
@@ -207,6 +222,7 @@ def build_loaders(
     photometric: bool = PHOTOMETRIC,
     geometric: bool = GEOMETRIC,
     background: float = BACKGROUND,
+    gamma_shift: tuple[float, float] | None = GAMMA_SHIFT,
     seed: int = SEED,
 ) -> tuple[DataLoader, DataLoader]:
     """Build the training and evaluation loaders from two sets of manifest rows.
@@ -238,6 +254,9 @@ def build_loaders(
             never reads a silhouette. Evaluation is never composited: the real
             test footage has no segmentation, and a model has to meet its scenes
             as they are.
+        gamma_shift: Range the training pipeline draws a gamma exponent from,
+            or ``None`` to leave tone to the jitter. Training only, like the
+            rest: evaluation meets its frames as they are.
         seed: Which repetition of a configuration this is. Offsets the sampler's
             own seed rather than replacing it, so that seed 0 keeps drawing the
             frames earlier runs drew and stays comparable to them.
@@ -248,7 +267,7 @@ def build_loaders(
     train_dataset = FrameDataset(
         train_manifest,
         data_root,
-        transform=train_transform(photometric, geometric),
+        transform=train_transform(photometric, geometric, gamma_shift),
         background=BackgroundRandomiser(background) if background else None,
     )
     eval_dataset = FrameDataset(eval_manifest, data_root, transform=eval_transform())
@@ -407,6 +426,7 @@ if __name__ == "__main__":
         f"seed {args.seed}  photometric {args.photometric}  "
         f"geometric {args.geometric}  background {args.background}  "
         f"label smoothing {args.label_smoothing}  "
+        f"gamma shift {args.gamma_shift}  "
         f"max epochs {args.max_epochs}  "
         f"patience {args.patience}  workers {args.num_workers}  ->  "
         f"checkpoints/{best_name}"
@@ -421,6 +441,7 @@ if __name__ == "__main__":
         photometric=args.photometric,
         geometric=args.geometric,
         background=args.background,
+        gamma_shift=args.gamma_shift,
         seed=args.seed,
     )
 

@@ -170,9 +170,67 @@ class BackgroundRandomiser:
         return np.where(silhouette[:, :, None], frame, background)
 
 
+class RandomGamma:
+    """Darken a rendered frame's midtones, the way outdoor footage is darkened.
+
+    What separates the two domains photometrically is shadow. The renders carry
+    almost no dark pixels; the real footage is full of them, and a model trained
+    inside the rendered band has never seen the tones it meets on the other side.
+
+    The jitter above cannot close that. Every factor ``ColorJitter`` draws is
+    centred on one, so it widens a distribution without moving it, whatever
+    magnitude it is given. Multiplying contrast does move it, but the wrong way
+    round: most rendered pixels already sit in the bright half, so raising
+    contrast drives them past white and destroys them.
+
+    Gamma is the operation the gap asks for. It compresses the top of the scale
+    and stretches the bottom, which is what creates the missing dark population,
+    and by construction it cannot push a pixel past white. It darkens enough on
+    its own to close the brightness gap too, so no separate brightness shift is
+    needed.
+
+    A range spanning untouched to heavily darkened is what keeps this
+    source-only. Covering that breadth needs nothing measured from the target to
+    justify, and it lands closer to the real distribution than a range fitted to
+    it would.
+
+    Attributes:
+        gamma_range: Low and high bound the exponent is drawn between.
+    """
+
+    def __init__(self, gamma_range: tuple[float, float]):
+        """Fix the range every draw comes from.
+
+        Args:
+            gamma_range: Low and high bound of the uniform draw. A gamma of 1.0
+                leaves the frame untouched; above 1.0 darkens the midtones.
+
+        Raises:
+            ValueError: If a bound is not positive, or the two are out of order.
+        """
+        low, high = gamma_range
+        if low <= 0 or high < low:
+            raise ValueError(
+                f"gamma range must be positive and ordered, got {gamma_range}"
+            )
+        self.gamma_range = (float(low), float(high))
+
+    def __call__(self, image):
+        """Apply one draw to one frame.
+
+        Draws through torch's own generator rather than numpy's, which is what
+        puts the draw under the per-worker seeding the loader already does — the
+        same path ``ColorJitter`` takes.
+        """
+        low, high = self.gamma_range
+        gamma = float(torch.empty(1).uniform_(low, high))
+        return v2.functional.adjust_gamma(image, gamma)
+
+
 def train_transform(
     photometric: bool = True,
     geometric: bool = False,
+    gamma_shift: tuple[float, float] | None = None,
 ) -> v2.Transform:
     """Pipeline used while training: the crop position is drawn at random.
 
@@ -195,12 +253,21 @@ def train_transform(
     being false in every file checked. It is a general regulariser, and the
     experiment is what it contributes next to the photometric one.
 
+    Gamma is the fourth, and the only one aimed at a mismatch measured
+    between the two domains rather than inside one. It runs after the jitter
+    rather than instead of it, so the jitter's own spread survives underneath
+    and exactly one thing changes against the runs it is compared to. See
+    ``RandomGamma`` for why.
+
     Args:
         photometric: Whether to jitter brightness, contrast, saturation and hue.
             Off reproduces the earlier runs, which is what makes them comparable.
         geometric: Whether to flip horizontally and vary the crop's scale. The
             fixed-size random crop is replaced rather than added to, so that
             exactly one crop happens either way.
+        gamma_shift: Range the gamma exponent is drawn from, or ``None`` to
+            leave tone to the jitter alone, which is what every run before this
+            option did.
 
     Returns:
         The pipeline, ready to apply to a frame.
@@ -216,6 +283,8 @@ def train_transform(
         steps.append(v2.RandomHorizontalFlip())
     if photometric:
         steps.append(v2.ColorJitter(**PHOTOMETRIC_JITTER))
+    if gamma_shift:
+        steps.append(RandomGamma(gamma_shift))
     steps += [
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),

@@ -29,6 +29,17 @@ def test_parse_args_takes_a_repetition_seed():
     assert parse_args(["--seed", "2"]).seed == 2
 
 
+def test_parse_args_takes_a_gamma_range():
+    args = parse_args(["--gamma-shift", "1.0", "3.0"])
+
+    assert args.gamma_shift == [1.0, 3.0]
+
+
+def test_the_standard_run_shifts_no_gamma():
+    """Every run before this option left tone to the jitter; the default keeps that."""
+    assert parse_args([]).gamma_shift is None
+
+
 def test_parse_args_takes_a_smoothing_fraction():
     assert parse_args(["--label-smoothing", "0.1"]).label_smoothing == 0.1
 
