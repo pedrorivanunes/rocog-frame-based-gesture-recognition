@@ -257,12 +257,8 @@ def test_compare_rejects_views_that_disagree_in_shape():
 
 
 def test_format_delta_marks_only_the_cells_that_clear_the_threshold():
-    delta = pd.DataFrame(
-        [[10.0, 1.0], [0.0, 0.0]], index=CLASSES, columns=CLASSES
-    )
-    error = pd.DataFrame(
-        [[1.0, 1.0], [1.0, 1.0]], index=CLASSES, columns=CLASSES
-    )
+    delta = pd.DataFrame([[10.0, 1.0], [0.0, 0.0]], index=CLASSES, columns=CLASSES)
+    error = pd.DataFrame([[1.0, 1.0], [1.0, 1.0]], index=CLASSES, columns=CLASSES)
 
     rendered = format_delta(delta, error, threshold=2.0)
 
@@ -271,9 +267,7 @@ def test_format_delta_marks_only_the_cells_that_clear_the_threshold():
 
 
 def test_format_delta_leaves_a_cell_unmarked_when_its_error_is_unknown():
-    delta = pd.DataFrame(
-        [[10.0, 0.0], [0.0, 0.0]], index=CLASSES, columns=CLASSES
-    )
+    delta = pd.DataFrame([[10.0, 0.0], [0.0, 0.0]], index=CLASSES, columns=CLASSES)
     error = pd.DataFrame(np.nan, index=CLASSES, columns=CLASSES)
 
     assert "*" not in format_delta(delta, error)
