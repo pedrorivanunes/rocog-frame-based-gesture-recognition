@@ -29,6 +29,7 @@ def test_parse_args_with_no_arguments_is_the_standard_run():
     assert args.save_every_epoch is False
     assert args.label_smoothing == 0.0
     assert args.freeze == "none"
+    assert args.lr == 1e-4
 
 
 def test_parse_args_keeps_every_epoch_when_asked():
@@ -48,6 +49,10 @@ def test_parse_args_takes_a_gamma_range():
 def test_the_standard_run_shifts_no_gamma():
     """Every run before this option left tone to the jitter; the default keeps that."""
     assert parse_args([]).gamma_shift is None
+
+
+def test_parse_args_takes_a_learning_rate():
+    assert parse_args(["--lr", "1e-3"]).lr == 1e-3
 
 
 def test_the_standard_run_freezes_nothing():

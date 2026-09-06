@@ -29,6 +29,7 @@ from splits import split_by_group, split_by_scene
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BATCH_SIZE = 64
 FRAMES_PER_EPOCH = 8
+LEARNING_RATE = 1e-4
 
 # Defaults for the options parse_args exposes, so an argument-free run is the
 # standard run.
@@ -63,9 +64,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     Every option defaults to the value the grid holds fixed, so a call with no
     arguments reproduces the standard run. What legitimately varies between
     cells is what these expose — the augmentation in play, the epoch budget,
-    where the checkpoint lands. Batch size, learning rate and the seeds stay as
-    module constants on purpose: a control that becomes an option can be varied
+    where the checkpoint lands. Batch size and the seeds stay as module
+    constants on purpose: a control that becomes an option can be varied
     without ever showing up in a diff.
+
+    ``--lr`` is the one control that had to be given up, and only because
+    ``--freeze`` turned it into two controls sharing a name. Fine-tuning a
+    pretrained network wants steps small enough not to undo what it already
+    knows. Fitting a freshly initialised head on a backbone that cannot move is
+    an ordinary optimisation from scratch, and the step that suits the first
+    leaves the second still improving when the epoch budget runs out — measured
+    here, and a run that has not converged measures nothing. One value cannot
+    serve both. Every run prints the value it used, so the record still carries
+    it.
 
     ``--num-workers`` is the exception, and worth stating plainly. It reads as a
     machine-capacity knob, but the loader seeds every worker separately and the
@@ -102,7 +113,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     Returns:
         A namespace with ``manifest``, ``validation_groups``, ``seed``,
         ``photometric``, ``geometric``, ``background``, ``gamma_shift``,
-        ``label_smoothing``, ``freeze``,
+        ``label_smoothing``, ``freeze``, ``lr``,
         ``max_epochs``, ``patience``, ``checkpoint_name``, ``num_workers`` and
         ``save_every_epoch``.
     """
@@ -179,6 +190,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "stage and trains the head alone. Batch normalization statistics are "
         "held with the weights, so a frozen stage never adapts to the training "
         "domain",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=LEARNING_RATE,
+        help="Adam's step size. The default suits fine-tuning a pretrained "
+        "network; a frozen backbone leaves a fresh head to fit from scratch, "
+        "which wants a larger one to converge inside the epoch budget",
     )
     parser.add_argument(
         "--max-epochs",
@@ -468,6 +487,7 @@ if __name__ == "__main__":
         f"label smoothing {args.label_smoothing}  "
         f"gamma shift {args.gamma_shift}  "
         f"freeze {args.freeze}  "
+        f"lr {args.lr}  "
         f"max epochs {args.max_epochs}  "
         f"patience {args.patience}  workers {args.num_workers}  ->  "
         f"checkpoints/{best_name}"
@@ -500,7 +520,7 @@ if __name__ == "__main__":
         f"training {sum(p.numel() for p in trainable):,} of "
         f"{sum(p.numel() for p in model.parameters()):,} parameters"
     )
-    optimizer = torch.optim.Adam(trainable, lr=1e-4)
+    optimizer = torch.optim.Adam(trainable, lr=args.lr)
 
     checkpoint_dir = PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
