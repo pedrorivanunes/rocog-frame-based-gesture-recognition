@@ -1,7 +1,16 @@
 import pytest
 import torch
+from torch import nn
+from torchvision.models import resnet18
 
-from train import EarlyStopping, build_criteria, checkpoint_name, parse_args
+from model import freeze
+from train import (
+    EarlyStopping,
+    build_criteria,
+    checkpoint_name,
+    parse_args,
+    train_one_epoch,
+)
 
 # The run without photometric jitter, whose curve is not monotonic.
 BASELINE_CURVE = [0.7773, 0.6929, 0.6992, 0.6294, 0.7510]
@@ -19,6 +28,7 @@ def test_parse_args_with_no_arguments_is_the_standard_run():
     assert args.num_workers == 12
     assert args.save_every_epoch is False
     assert args.label_smoothing == 0.0
+    assert args.freeze == "none"
 
 
 def test_parse_args_keeps_every_epoch_when_asked():
@@ -38,6 +48,25 @@ def test_parse_args_takes_a_gamma_range():
 def test_the_standard_run_shifts_no_gamma():
     """Every run before this option left tone to the jitter; the default keeps that."""
     assert parse_args([]).gamma_shift is None
+
+
+def test_the_standard_run_freezes_nothing():
+    """Every run before this option trained the whole net; the default keeps that."""
+    assert parse_args([]).freeze == "none"
+
+
+def test_parse_args_takes_a_freeze_depth():
+    assert parse_args(["--freeze", "backbone"]).freeze == "backbone"
+
+
+def test_parse_args_rejects_a_depth_that_is_not_defined():
+    """A typo has to fail loudly.
+
+    A run that silently trained everything would land in the sweep as if it had
+    been frozen.
+    """
+    with pytest.raises(SystemExit):
+        parse_args(["--freeze", "everything"])
 
 
 def test_parse_args_takes_a_smoothing_fraction():
@@ -152,3 +181,30 @@ def test_the_measured_baseline_curve_would_not_stop_early():
     assert best == [True, True, False, True, False]
     assert not stopper.exhausted
     assert stopper.best_loss == 0.6294
+
+
+def test_an_epoch_leaves_a_frozen_stage_exactly_as_it_found_it():
+    """The integration the sweep depends on: freeze applied, epoch run, nothing moved.
+
+    Both halves are checked, because they fail separately. Weights move when the
+    optimizer is handed a parameter it should not have; statistics move when the
+    epoch's ``model.train()`` is allowed to stand.
+    """
+    model = resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, 7)
+    frozen = freeze(model, "backbone")
+    optimizer = torch.optim.Adam(
+        [p for p in model.parameters() if p.requires_grad], lr=1e-2
+    )
+    batches = [(torch.randn(4, 3, 64, 64), torch.tensor([0, 1, 2, 3]), ["v"] * 4)]
+    weights = model.layer4[0].conv1.weight.clone()
+    statistics = model.bn1.running_mean.clone()
+    head = model.fc.weight.clone()
+
+    train_one_epoch(
+        model, batches, nn.CrossEntropyLoss(), optimizer, torch.device("cpu"), frozen
+    )
+
+    assert torch.equal(model.layer4[0].conv1.weight, weights)
+    assert torch.equal(model.bn1.running_mean, statistics)
+    assert not torch.equal(model.fc.weight, head), "the head should still be learning"

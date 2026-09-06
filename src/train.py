@@ -23,7 +23,7 @@ from dataset import (
 )
 from device import describe, pick_device
 from evaluation import frame_metrics, predict
-from model import build_model
+from model import FROZEN_STAGES, build_model, freeze
 from splits import split_by_group, split_by_scene
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -49,6 +49,10 @@ LABEL_SMOOTHING = 0.0
 # None, not a range: every run recorded so far left tone to the symmetric
 # jitter, and a default range would silently make them incomparable.
 GAMMA_SHIFT = None
+# Same reason once more: every run recorded so far trained the whole network,
+# and freezing by default would make the runs after this option incomparable to
+# the ones before it.
+FREEZE = "none"
 CHECKPOINT_NAME = "syn_ground_train.pt"
 MANIFEST = "syn_ground_train.csv"
 
@@ -76,6 +80,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     a validation-loss spread wide enough to matter. Measure that spread on the
     machine at hand before reading any difference as the effect of a change.
 
+    ``--freeze`` is the one option that changes what the run is measuring
+    rather than what it is trained on. Fitting every layer to the source domain
+    reshapes the features as well as the classifier, so a low score on another
+    domain has two candidate causes that a single number cannot separate: a
+    representation that never held the answer, or one that held it and was
+    trained away. Holding the early stages fixed rules the second out by
+    construction, at the price of a model that can fit the source less well.
+
     ``--manifest`` and ``--validation-groups`` are what let a run train on a
     domain other than the synthetic one. Which rows are held out for validation
     cannot be inferred from the data: the synthetic manifest is split by scene,
@@ -90,7 +102,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     Returns:
         A namespace with ``manifest``, ``validation_groups``, ``seed``,
         ``photometric``, ``geometric``, ``background``, ``gamma_shift``,
-        ``label_smoothing``,
+        ``label_smoothing``, ``freeze``,
         ``max_epochs``, ``patience``, ``checkpoint_name``, ``num_workers`` and
         ``save_every_epoch``.
     """
@@ -156,6 +168,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="mass moved off the true class and spread over the other six "
         "while training, from 0 to 1. Validation is always scored against hard "
         "targets, so its loss stays comparable across values",
+    )
+    parser.add_argument(
+        "--freeze",
+        choices=sorted(FROZEN_STAGES),
+        default=FREEZE,
+        metavar="DEPTH",
+        help="how far to hold the pretrained weights fixed: none trains the "
+        "whole network, early keeps the first two stages, backbone keeps every "
+        "stage and trains the head alone. Batch normalization statistics are "
+        "held with the weights, so a frozen stage never adapts to the training "
+        "domain",
     )
     parser.add_argument(
         "--max-epochs",
@@ -368,16 +391,33 @@ def build_criteria(label_smoothing: float) -> tuple[nn.Module, nn.Module]:
     return nn.CrossEntropyLoss(label_smoothing=label_smoothing), nn.CrossEntropyLoss()
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device) -> float:
+def train_one_epoch(model, loader, criterion, optimizer, device, frozen=()) -> float:
     """Run one pass over the training data and return the mean loss.
 
     Measured against ln(7) ≈ 1.95, the loss of a model guessing uniformly across
     seven classes: a lower value means the model learned something.
 
+    ``model.train()`` is recursive, which is why the frozen stages are named
+    again here rather than only once at setup. Left alone they would come back
+    into training mode at the top of every epoch and their batch normalization
+    would resume re-estimating its statistics from these batches — a freeze that
+    holds the weights and lets the normalisation drift is half a freeze, and the
+    half that moves is the one the domain gap is made of.
+
+    Args:
+        model: The network to update.
+        loader: Serves the epoch's training batches.
+        criterion: The loss being minimised, smoothed targets included.
+        optimizer: Applies the gradients. Sees only trainable parameters.
+        device: Where the pass runs.
+        frozen: Stages held at their pretrained values, from ``model.freeze``.
+
     Returns:
         Mean loss across the epoch's batches.
     """
     model.train()
+    for stage in frozen:
+        stage.eval()
 
     running_loss = 0.0
     for frames, labels, _ in loader:
@@ -427,6 +467,7 @@ if __name__ == "__main__":
         f"geometric {args.geometric}  background {args.background}  "
         f"label smoothing {args.label_smoothing}  "
         f"gamma shift {args.gamma_shift}  "
+        f"freeze {args.freeze}  "
         f"max epochs {args.max_epochs}  "
         f"patience {args.patience}  workers {args.num_workers}  ->  "
         f"checkpoints/{best_name}"
@@ -448,8 +489,18 @@ if __name__ == "__main__":
     device = pick_device()
     print(f"device: {describe(device)}")
     model = build_model().to(device)
+    frozen = freeze(model, args.freeze)
     criterion, validation_criterion = build_criteria(args.label_smoothing)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    # Only the parameters that still train. Adam would skip a frozen one anyway,
+    # having no gradient to apply, but naming them keeps the optimizer's state to
+    # the size of what it actually updates. Under --freeze none this is every
+    # parameter, so the runs recorded before the option are untouched.
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(
+        f"training {sum(p.numel() for p in trainable):,} of "
+        f"{sum(p.numel() for p in model.parameters()):,} parameters"
+    )
+    optimizer = torch.optim.Adam(trainable, lr=1e-4)
 
     checkpoint_dir = PROJECT_ROOT / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -457,7 +508,9 @@ if __name__ == "__main__":
     stopper = EarlyStopping(args.patience)
 
     for epoch in range(args.max_epochs):
-        loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, frozen
+        )
 
         logits, labels, _ = predict(model, eval_loader, device)
         eval_loss, eval_accuracy = frame_metrics(logits, labels, validation_criterion)
