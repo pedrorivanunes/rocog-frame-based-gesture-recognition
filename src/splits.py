@@ -1,15 +1,32 @@
-"""Partition a manifest into the subsets a run trains and evaluates on.
+"""Choose the manifest rows a run trains and evaluates on.
 
 Every experiment in this project is a selection: a camera viewpoint, a fraction
-of real data, a validation split. The manifest is the table those selections are
-made on, and keeping them here means the data a run saw can be read from the
-code that built it, rather than inferred from a file name.
+of real data, a validation split, a stretch of the gesture. The manifest is the
+table those selections are made on, and keeping them here means the data a run
+saw can be read from the code that built it, rather than inferred from a file
+name.
+
+Two kinds live here. A split cuts the rows in two and hands back both sides, so
+that nothing straddles the boundary between training and validation. A selection
+narrows one side and hands back what is left. They are kept together because
+both answer the same question about a result — which frames produced it.
 """
 
 import numpy as np
 import pandas as pd
 
 SPLIT_SEED = 7
+WINDOW_SEED = 23
+
+WINDOWS = ("full", "middle", "scattered")
+
+# Frames dropped from each end of a video by the narrower windows. Extraction
+# stores twenty-four per video, one per segment of the gesture, so four is the
+# outer sixth at each end and sixteen survive. Sixteen is also a count the
+# sampler can cut into the eight blocks an epoch draws from, which a threshold on
+# ``position`` would not guarantee: it leaves a different number of frames in
+# every video.
+EDGE_FRAMES = 4
 
 
 def split_by_group(
@@ -116,3 +133,83 @@ def split_by_scene(
         held_out.extend(rng.choice(scenes, size=scenes_per_view, replace=False))
 
     return split_by_group(manifest, held_out)
+
+
+def select_frames(
+    manifest: pd.DataFrame,
+    window: str = "full",
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Choose which of each video's stored frames a run may train on.
+
+    The annotated window spans the whole movement, its rise and its fall
+    included, so the frames nearest each end show a body close to neutral while
+    still carrying the gesture's label. Training on them asks the model to read
+    a gesture out of a body at rest — a demand no single frame can meet, and one
+    that leaves the neutral pose with no label of its own to fall into.
+
+    ``middle`` drops that material from training. ``scattered`` is its control
+    and exists only for it: cutting the ends also cuts a third of the frames, so
+    a difference between ``middle`` and ``full`` confounds *which* frames with
+    *how many*. Keeping the same reduced count, drawn across the whole window
+    instead of taken from its centre, separates the two — whatever ``middle``
+    buys over ``scattered`` is the position of the frames and nothing else.
+
+    Trimming by rank rather than by a threshold on ``position`` is what keeps
+    the count identical across videos, which the sampler requires; on the
+    twenty-four frames extraction stores, one per segment, dropping four from
+    each end leaves the window from 0.154 to 0.846.
+
+    This is a training-side selection. Applying it to evaluation would decide
+    which frames to score using where they sit in the clip, and a model in the
+    field does not know where a frame sits — that is temporal information, and
+    reading it at decision time makes the selection a treatment rather than a
+    control.
+
+    Args:
+        manifest: Rows to select from, one per frame. Requires the ``video_id``
+            column, and expects each video's frames to be consecutive and in
+            ascending order, which is how extraction writes them.
+        window: ``full`` keeps every stored frame, ``middle`` keeps all but the
+            outermost of each video, and ``scattered`` keeps as many as
+            ``middle`` does, drawn at random across the whole window.
+        seed: Draws the ``scattered`` frames, and is ignored by the other two.
+            Moving with the run's seed is deliberate: the control asks what an
+            arbitrary subset of this size does, so three repetitions should meet
+            three arbitrary subsets rather than agree on one that might happen
+            to be lucky. It costs the control some variance and buys it freedom
+            from a single draw.
+
+    Returns:
+        The rows the window keeps, in the order the manifest holds them. The
+        input frame itself under ``full``, since nothing is dropped.
+
+    Raises:
+        ValueError: If the window is not one this knows, or if a video holds too
+            few frames to trim.
+    """
+    if window not in WINDOWS:
+        raise ValueError(f"window {window!r} is not one of {', '.join(WINDOWS)}")
+
+    if window == "full":
+        return manifest
+
+    videos = manifest.groupby("video_id", sort=False).indices
+
+    smallest = min(len(frames) for frames in videos.values())
+    if smallest <= 2 * EDGE_FRAMES:
+        raise ValueError(
+            f"a video holds {smallest} frames, too few to drop {EDGE_FRAMES} "
+            "from each end"
+        )
+
+    if window == "middle":
+        kept = [frames[EDGE_FRAMES:-EDGE_FRAMES] for frames in videos.values()]
+    else:
+        rng = np.random.default_rng(WINDOW_SEED + seed)
+        kept = [
+            rng.choice(frames, size=len(frames) - 2 * EDGE_FRAMES, replace=False)
+            for frames in videos.values()
+        ]
+
+    return manifest.iloc[np.sort(np.concatenate(kept))]

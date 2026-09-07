@@ -24,7 +24,7 @@ from dataset import (
 from device import describe, pick_device
 from evaluation import frame_metrics, predict
 from model import FROZEN_STAGES, build_model, freeze
-from splits import split_by_group, split_by_scene
+from splits import WINDOWS, select_frames, split_by_group, split_by_scene
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BATCH_SIZE = 64
@@ -54,6 +54,10 @@ GAMMA_SHIFT = None
 # and freezing by default would make the runs after this option incomparable to
 # the ones before it.
 FREEZE = "none"
+# And once more: every run recorded so far trained on the whole annotated
+# window, so narrowing it by default would make the runs after this option
+# incomparable to the ones before it.
+WINDOW = "full"
 CHECKPOINT_NAME = "syn_ground_train.pt"
 MANIFEST = "syn_ground_train.csv"
 
@@ -99,6 +103,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     trained away. Holding the early stages fixed rules the second out by
     construction, at the price of a model that can fit the source less well.
 
+    ``--window`` narrows the training frames without narrowing the ones a run is
+    scored on, and the asymmetry is deliberate. Which frames a model learns from
+    is a design choice available in the field; which frames it is judged on is
+    not, because judging it on a chosen stretch of the clip would use where a
+    frame sits to decide how much it counts. The option therefore carries its own
+    control, ``scattered``, since narrowing the window also drops a third of the
+    frames and the two effects would otherwise arrive together.
+
     ``--manifest`` and ``--validation-groups`` are what let a run train on a
     domain other than the synthetic one. Which rows are held out for validation
     cannot be inferred from the data: the synthetic manifest is split by scene,
@@ -113,7 +125,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     Returns:
         A namespace with ``manifest``, ``validation_groups``, ``seed``,
         ``photometric``, ``geometric``, ``background``, ``gamma_shift``,
-        ``label_smoothing``, ``freeze``, ``lr``,
+        ``label_smoothing``, ``freeze``, ``window``, ``lr``,
         ``max_epochs``, ``patience``, ``checkpoint_name``, ``num_workers`` and
         ``save_every_epoch``.
     """
@@ -190,6 +202,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "stage and trains the head alone. Batch normalization statistics are "
         "held with the weights, so a frozen stage never adapts to the training "
         "domain",
+    )
+    parser.add_argument(
+        "--window",
+        choices=WINDOWS,
+        default=WINDOW,
+        metavar="EXTENT",
+        help="which of each training video's frames to use: full keeps the "
+        "annotated gesture window as extracted, middle drops the outermost "
+        "frames at each end, where the pose is near neutral, and scattered "
+        "keeps as many frames as middle does but spread over the whole window, "
+        "which is middle's control. Training only: choosing frames by where "
+        "they sit in the clip is temporal information, and evaluation may not "
+        "have it",
     )
     parser.add_argument(
         "--lr",
@@ -472,6 +497,12 @@ if __name__ == "__main__":
         if args.validation_groups
         else split_by_scene(manifest)
     )
+    # Training rows only, and after the split rather than before it. Validation
+    # keeps the whole window on purpose: it is what every run recorded so far
+    # was scored on, so narrowing it here would move the measurement along with
+    # the treatment, and scoring on frames the model no longer trains on is the
+    # honest question anyway.
+    train_manifest = select_frames(train_manifest, args.window, args.seed)
 
     held_out = sorted(eval_manifest["group_id"].unique())
     print(f"manifest {args.manifest}  validation groups: {' '.join(held_out)}")
@@ -487,6 +518,7 @@ if __name__ == "__main__":
         f"label smoothing {args.label_smoothing}  "
         f"gamma shift {args.gamma_shift}  "
         f"freeze {args.freeze}  "
+        f"window {args.window} ({len(train_manifest)} training frames)  "
         f"lr {args.lr}  "
         f"max epochs {args.max_epochs}  "
         f"patience {args.patience}  workers {args.num_workers}  ->  "

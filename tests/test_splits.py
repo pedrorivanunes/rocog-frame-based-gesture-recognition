@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from splits import split_by_group, split_by_scene
+from splits import EDGE_FRAMES, select_frames, split_by_group, split_by_scene
 
 REAL_SHAPE = [7, 7, 7, 5, 6, 8]
 
@@ -162,3 +162,113 @@ def test_the_scene_split_refuses_a_manifest_that_carries_no_viewpoint():
 
     _, validation = split_by_group(manifest, ["S02"])
     assert len(validation) == 1
+
+
+def video_manifest(videos=3, frames_per_video=24):
+    """Build a manifest holding whole videos, frames consecutive and in order.
+
+    That layout is not decoration: select_frames trims by rank, so it reads the
+    order the rows sit in rather than any column. A manifest built any other way
+    would test something the extraction never produces.
+
+    Args:
+        videos: How many videos the manifest holds.
+        frames_per_video: Rows each video contributes.
+
+    Returns:
+        One row per frame, carrying ``video_id`` and the frame's position along
+        the gesture window, evenly spaced as extraction spaces them.
+    """
+    return pd.DataFrame(
+        [
+            {
+                "video_id": f"Scene0_{video}_Halt_1_1_2026_0_0_0",
+                "frame_number": frame,
+                "position": (frame + 1) / frames_per_video,
+            }
+            for video in range(videos)
+            for frame in range(frames_per_video)
+        ]
+    )
+
+
+def test_full_window_keeps_every_frame():
+    """The default has to leave earlier runs measuring exactly what they measured."""
+    manifest = video_manifest()
+
+    assert len(select_frames(manifest, "full")) == len(manifest)
+
+
+def test_middle_drops_the_same_count_from_both_ends():
+    """Trimming one end only would shift the window instead of narrowing it."""
+    manifest = video_manifest(frames_per_video=24)
+
+    kept = select_frames(manifest, "middle")
+
+    for _, frames in kept.groupby("video_id"):
+        assert frames["frame_number"].min() == EDGE_FRAMES
+        assert frames["frame_number"].max() == 24 - EDGE_FRAMES - 1
+
+
+def test_middle_leaves_every_video_the_same_number_of_frames():
+    """The sampler cuts each video into equal blocks and refuses uneven counts."""
+    manifest = video_manifest(videos=5)
+
+    kept = select_frames(manifest, "middle")
+
+    assert set(kept.groupby("video_id").size()) == {24 - 2 * EDGE_FRAMES}
+
+
+def test_scattered_keeps_as_many_frames_as_middle():
+    """The control exists to separate which frames from how many."""
+    manifest = video_manifest(videos=5)
+
+    middle = select_frames(manifest, "middle")
+    scattered = select_frames(manifest, "scattered")
+
+    assert scattered.groupby("video_id").size().tolist() == (
+        middle.groupby("video_id").size().tolist()
+    )
+
+
+def test_scattered_reaches_the_ends_middle_removes():
+    """A control that avoided the ends too would confound the same thing again."""
+    manifest = video_manifest(videos=40)
+
+    kept = select_frames(manifest, "scattered")
+
+    assert kept["frame_number"].min() == 0
+    assert kept["frame_number"].max() == 23
+
+
+def test_scattered_moves_with_the_seed():
+    """Three repetitions should meet three subsets, not agree on one lucky draw."""
+    manifest = video_manifest(videos=5)
+
+    first = select_frames(manifest, "scattered", seed=0)
+    second = select_frames(manifest, "scattered", seed=1)
+
+    assert not first.index.equals(second.index)
+
+
+def test_a_window_returns_rows_in_manifest_order():
+    """The sampler reads consecutive rows as one video's frames, in time order."""
+    manifest = video_manifest(videos=4)
+
+    kept = select_frames(manifest, "scattered")
+
+    assert kept.index.tolist() == sorted(kept.index)
+
+
+def test_an_unknown_window_is_refused():
+    """A typo that silently trained on everything would be invisible in the log."""
+    with pytest.raises(ValueError, match="not one of"):
+        select_frames(video_manifest(), "midle")
+
+
+def test_a_video_too_short_to_trim_is_refused():
+    """Trimming eight from a video of eight would leave a run with no frames."""
+    manifest = video_manifest(frames_per_video=2 * EDGE_FRAMES)
+
+    with pytest.raises(ValueError, match="too few"):
+        select_frames(manifest, "middle")

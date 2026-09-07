@@ -29,6 +29,7 @@ def test_parse_args_with_no_arguments_is_the_standard_run():
     assert args.save_every_epoch is False
     assert args.label_smoothing == 0.0
     assert args.freeze == "none"
+    assert args.window == "full"
     assert args.lr == 1e-4
 
 
@@ -72,6 +73,21 @@ def test_parse_args_rejects_a_depth_that_is_not_defined():
     """
     with pytest.raises(SystemExit):
         parse_args(["--freeze", "everything"])
+
+
+def test_the_standard_run_trains_on_the_whole_window():
+    """Every run before this option saw the annotated window entire."""
+    assert parse_args([]).window == "full"
+
+
+def test_parse_args_takes_a_window_extent():
+    assert parse_args(["--window", "middle"]).window == "middle"
+
+
+def test_parse_args_rejects_an_extent_that_is_not_defined():
+    """A typo would land in the sweep as a narrowed run that trained on everything."""
+    with pytest.raises(SystemExit):
+        parse_args(["--window", "centre"])
 
 
 def test_parse_args_takes_a_smoothing_fraction():
