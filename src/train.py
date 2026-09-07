@@ -15,9 +15,11 @@ from torch.utils.data import DataLoader
 
 from dataset import (
     SAMPLER_SEED,
+    TEXTURES,
     BackgroundRandomiser,
     FrameDataset,
     SegmentSampler,
+    TextureRandomiser,
     eval_transform,
     train_transform,
 )
@@ -54,6 +56,10 @@ GAMMA_SHIFT = None
 # and freezing by default would make the runs after this option incomparable to
 # the ones before it.
 FREEZE = "none"
+# And again: every run recorded so far met the person as rendered, so replacing
+# its appearance by default would make the runs after this option incomparable
+# to the ones before it.
+TEXTURE = "none"
 # And once more: every run recorded so far trained on the whole annotated
 # window, so narrowing it by default would make the runs after this option
 # incomparable to the ones before it.
@@ -103,6 +109,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     trained away. Holding the early stages fixed rules the second out by
     construction, at the price of a model that can fit the source less well.
 
+    ``--texture`` carries its control in the same option, for the same reason
+    ``--window`` does. Replacing what the person is made of is a strong
+    perturbation, and a strong perturbation regularises whatever it touches, so a
+    gain from ``blend`` alone would not say whether the silhouette mattered.
+    ``everywhere`` applies the identical mixture to the whole frame; the pair
+    coming apart is what would make the restriction the explanation.
+
     ``--window`` narrows the training frames without narrowing the ones a run is
     scored on, and the asymmetry is deliberate. Which frames a model learns from
     is a design choice available in the field; which frames it is judged on is
@@ -125,7 +138,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     Returns:
         A namespace with ``manifest``, ``validation_groups``, ``seed``,
         ``photometric``, ``geometric``, ``background``, ``gamma_shift``,
-        ``label_smoothing``, ``freeze``, ``window``, ``lr``,
+        ``label_smoothing``, ``freeze``, ``texture``, ``window``, ``lr``,
         ``max_epochs``, ``patience``, ``checkpoint_name``, ``num_workers`` and
         ``save_every_epoch``.
     """
@@ -202,6 +215,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "stage and trains the head alone. Batch normalization statistics are "
         "held with the weights, so a frozen stage never adapts to the training "
         "domain",
+    )
+    parser.add_argument(
+        "--texture",
+        choices=TEXTURES,
+        default=TEXTURE,
+        metavar="MODE",
+        help="replace what the person is made of while training: blend mixes "
+        "the person toward a random fill by a random amount, replace always "
+        "goes all the way, and everywhere applies blend's mixture to the whole "
+        "frame instead, which is the control that says whether restricting it "
+        "to the person is the point. Needs silhouettes, so training only",
     )
     parser.add_argument(
         "--window",
@@ -289,6 +313,7 @@ def build_loaders(
     photometric: bool = PHOTOMETRIC,
     geometric: bool = GEOMETRIC,
     background: float = BACKGROUND,
+    texture: str = TEXTURE,
     gamma_shift: tuple[float, float] | None = GAMMA_SHIFT,
     seed: int = SEED,
 ) -> tuple[DataLoader, DataLoader]:
@@ -321,6 +346,10 @@ def build_loaders(
             never reads a silhouette. Evaluation is never composited: the real
             test footage has no segmentation, and a model has to meet its scenes
             as they are.
+        texture: Which replacement the training pipeline applies inside the
+            person, or ``none`` to leave the person as rendered. Training only,
+            and for the same reason as the background: it needs a silhouette,
+            and the real footage has none.
         gamma_shift: Range the training pipeline draws a gamma exponent from,
             or ``None`` to leave tone to the jitter. Training only, like the
             rest: evaluation meets its frames as they are.
@@ -336,6 +365,7 @@ def build_loaders(
         data_root,
         transform=train_transform(photometric, geometric, gamma_shift),
         background=BackgroundRandomiser(background) if background else None,
+        texture=TextureRandomiser(texture) if texture != "none" else None,
     )
     eval_dataset = FrameDataset(eval_manifest, data_root, transform=eval_transform())
 
@@ -517,7 +547,7 @@ if __name__ == "__main__":
         f"geometric {args.geometric}  background {args.background}  "
         f"label smoothing {args.label_smoothing}  "
         f"gamma shift {args.gamma_shift}  "
-        f"freeze {args.freeze}  "
+        f"freeze {args.freeze}  texture {args.texture}  "
         f"window {args.window} ({len(train_manifest)} training frames)  "
         f"lr {args.lr}  "
         f"max epochs {args.max_epochs}  "
@@ -534,6 +564,7 @@ if __name__ == "__main__":
         photometric=args.photometric,
         geometric=args.geometric,
         background=args.background,
+        texture=args.texture,
         gamma_shift=args.gamma_shift,
         seed=args.seed,
     )

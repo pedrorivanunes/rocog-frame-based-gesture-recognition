@@ -170,6 +170,136 @@ class BackgroundRandomiser:
         return np.where(silhouette[:, :, None], frame, background)
 
 
+# How often a training frame has the person's appearance replaced. Held as a
+# constant rather than exposed, for the reason the sampler seeds are: within a
+# sweep it is a control, and a control that becomes an option can be varied
+# without ever showing up in a diff. Half, matching the background's default, so
+# a model still meets the rendered person on the other half and cannot settle on
+# "the person is a flat shape" — which would transfer no better than the texture
+# it replaced.
+TEXTURE_PROBABILITY = 0.5
+
+TEXTURES = ("none", "blend", "replace", "everywhere")
+
+
+class TextureRandomiser:
+    """Replace the appearance inside the person, some of the time.
+
+    The background randomiser holds a model to the person by taking the scene
+    away. This takes the next thing: what the person is made of, leaving only
+    where the person is. ImageNet-trained networks are known to lean on texture
+    rather than shape, and a rendered body and a photographed one differ in
+    texture far more than in outline — so a model held to the outline has one
+    less rendered cue to lean on.
+
+    Three modes, and the third is the control. ``blend`` mixes the person toward
+    a replacement by a random amount, so the model meets every degree of texture
+    between untouched and gone. ``replace`` always goes all the way, so when it
+    fires the person carries no interior detail at all. ``everywhere`` applies
+    ``blend``'s mixture to the whole frame instead of the person alone: if the
+    restriction to the silhouette is what matters, the two must come apart, and
+    if any perturbation of this size would have done, they will not.
+
+    ⚠️ ``everywhere`` is the stronger perturbation, not an equal one applied
+    elsewhere — it covers the person as well as the scene. A draw near total
+    leaves a frame with little left to read, which happens on a small share of
+    the frames it fires on. That cost falls on the control, so it biases the
+    comparison toward the treatment and has to be read with the result.
+
+    Randomness comes from torch for the reason the background randomiser gives:
+    a DataLoader seeds torch separately in each worker and does not always do the
+    same for numpy's global generator.
+
+    Attributes:
+        mode: Which of ``blend``, ``replace`` or ``everywhere`` is in play.
+        probability: Chance that a given frame is touched at all.
+        kinds: Names of the fill generators to draw between.
+    """
+
+    def __init__(
+        self,
+        mode: str,
+        probability: float = TEXTURE_PROBABILITY,
+        kinds: tuple[str, ...] = ("solid", "noise"),
+    ):
+        """Configure what replaces the person, and how completely.
+
+        Args:
+            mode: One of ``TEXTURES`` other than ``none``. A run that wants this
+                off builds no randomiser at all, rather than passing a mode that
+                does nothing.
+            probability: Chance a frame is touched, from 0 to 1. Defaulted rather
+                than exposed on the command line: within a sweep it is a control,
+                and every cell holds it at the same value. It is an argument at
+                all so that a test can pin it.
+            kinds: Which generators in ``BACKGROUNDS`` to draw the replacement
+                from, uniformly. Both are used for the reason the background
+                gives: a flat colour and pixel noise are opposite failures, and
+                a model that leans on interior appearance has nowhere left to
+                lean when it meets both.
+
+        Raises:
+            ValueError: If the mode is not one this knows, or a kind is not a
+                known generator.
+        """
+        if mode not in TEXTURES or mode == "none":
+            raise ValueError(f"texture mode {mode!r} is not one of {TEXTURES[1:]}")
+        if not 0.0 <= probability <= 1.0:
+            raise ValueError(f"probability must be between 0 and 1, got {probability}")
+        unknown = set(kinds) - set(BACKGROUNDS)
+        if unknown:
+            raise ValueError(f"unknown fill kinds: {sorted(unknown)}")
+        if not kinds:
+            raise ValueError("at least one fill kind is needed")
+
+        self.mode = mode
+        self.probability = probability
+        self.kinds = kinds
+
+    def __call__(
+        self, frame: np.ndarray, silhouette: np.ndarray, generator=None
+    ) -> np.ndarray:
+        """Replace one frame's person appearance, or pass the frame through.
+
+        Args:
+            frame: The frame, ``(height, width, 3)``. Composited already, if the
+                run also randomises the background — see the dataset, which
+                applies them in that order so that this one's effect on the
+                scene survives instead of being painted over.
+            silhouette: Boolean array, true on the person, same height and width.
+            generator: Torch generator to draw from, or ``None`` for the global one.
+
+        Returns:
+            Either the frame unchanged, or the frame with the person's interior
+            mixed toward a random fill.
+
+        Raises:
+            ValueError: If the silhouette does not cover the frame.
+        """
+        if silhouette.shape != frame.shape[:2]:
+            raise ValueError(
+                f"silhouette is {silhouette.shape}, frame is {frame.shape[:2]}"
+            )
+        if torch.rand((), generator=generator).item() >= self.probability:
+            return frame
+
+        index = int(torch.randint(len(self.kinds), (), generator=generator))
+        fill = BACKGROUNDS[self.kinds[index]](frame.shape[:2], generator)
+
+        strength = (
+            1.0
+            if self.mode == "replace"
+            else torch.rand((), generator=generator).item()
+        )
+        mixed = (1.0 - strength) * frame.astype(np.float32) + strength * fill
+        mixed = mixed.round().astype(np.uint8)
+
+        if self.mode == "everywhere":
+            return mixed
+
+        return np.where(silhouette[:, :, None], mixed, frame)
+
+
 class RandomGamma:
     """Darken a rendered frame's midtones, the way outdoor footage is darkened.
 
@@ -330,6 +460,7 @@ class FrameDataset(Dataset):
         data_root: Path,
         transform: v2.Transform,
         background: BackgroundRandomiser | None = None,
+        texture: TextureRandomiser | None = None,
     ):
         """Prepare to serve the frames a manifest lists.
 
@@ -347,11 +478,15 @@ class FrameDataset(Dataset):
                 segmentation to composite with, so a model has to meet its
                 scenes intact. Compositing there would also measure the model on
                 inputs no deployment ever produces.
+            texture: Replaces the appearance inside the person on some frames.
+                ``None`` for the same reason and with the same restriction: it
+                needs a silhouette, and evaluation has none.
         """
         self.data_frame = manifest.reset_index(drop=True)
         self.data_root = data_root
         self.transform = transform
         self.background = background
+        self.texture = texture
 
     def __len__(self) -> int:
         """Count frames, not videos — the manifest holds 24 rows per video."""
@@ -369,6 +504,11 @@ class FrameDataset(Dataset):
         so compositing afterwards would place a 256-wide mask over a 224-wide
         image.
 
+        The scene is replaced before the person is, and the order is not
+        arbitrary. The texture randomiser's control mode covers the whole frame,
+        scene included; replacing the scene afterwards would paint that part of
+        its work away and leave the control doing what the treatment does.
+
         Returns:
             The transformed frame as a ``(3, 224, 224)`` float tensor, the class
             label, and the ``video_id`` needed to group predictions by video.
@@ -384,12 +524,16 @@ class FrameDataset(Dataset):
             raise RuntimeError(f"could not read frame {frame_path}")
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        if self.background is not None:
+        if self.background is not None or self.texture is not None:
             silhouette_path = self.data_root / mask_path_for(row["path"])
             silhouette = cv2.imread(str(silhouette_path), cv2.IMREAD_GRAYSCALE)
             if silhouette is None:
                 raise RuntimeError(f"could not read silhouette {silhouette_path}")
-            frame = self.background(frame, silhouette > 127)
+            person = silhouette > 127
+            if self.background is not None:
+                frame = self.background(frame, person)
+            if self.texture is not None:
+                frame = self.texture(frame, person)
 
         frame = self.transform(frame)
         return frame, row["label"], row["video_id"]

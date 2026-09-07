@@ -7,6 +7,7 @@ from dataset import (
     BackgroundRandomiser,
     RandomGamma,
     SegmentSampler,
+    TextureRandomiser,
     noise_background,
     solid_background,
     train_transform,
@@ -297,3 +298,117 @@ def test_the_shift_runs_before_normalising():
     ]
 
     assert kinds.index("RandomGamma") < kinds.index("Normalize")
+
+
+def test_texture_randomiser_leaves_the_frame_alone_at_probability_zero():
+    """Zero is how a run turns this off without a second code path."""
+    frame, silhouette = silhouette_and_frame()
+
+    touched = TextureRandomiser("blend", probability=0.0)(frame, silhouette)
+
+    assert np.array_equal(touched, frame)
+
+
+def test_texture_randomiser_keeps_the_scene_pixel_for_pixel():
+    """The person's modes must not touch the background — that is the other knob."""
+    frame, silhouette = silhouette_and_frame()
+
+    touched = TextureRandomiser("replace", probability=1.0)(frame, silhouette)
+
+    assert np.array_equal(touched[~silhouette], frame[~silhouette])
+
+
+def test_replace_leaves_the_person_one_flat_colour():
+    """Going all the way is what makes this cell shape and nothing else."""
+    frame, silhouette = silhouette_and_frame()
+
+    touched = TextureRandomiser("replace", probability=1.0, kinds=("solid",))(
+        frame, silhouette
+    )
+
+    assert len(np.unique(touched[silhouette].reshape(-1, 3), axis=0)) == 1
+    assert not np.array_equal(touched[silhouette], frame[silhouette])
+
+
+def test_blend_keeps_the_person_between_the_frame_and_the_fill():
+    """A partial mixture has to stay a mixture, not jump to either end."""
+    frame, silhouette = silhouette_and_frame()
+    generator = torch.Generator().manual_seed(4)
+
+    touched = TextureRandomiser("blend", probability=1.0, kinds=("solid",))(
+        frame, silhouette, generator
+    )
+    person = touched[silhouette].reshape(-1, 3)
+
+    # One fill colour and one original colour, so every mixed pixel is equal and
+    # sits on the segment between them.
+    assert len(np.unique(person, axis=0)) == 1
+    assert not np.array_equal(person[0], frame[silhouette][0])
+
+
+def test_everywhere_touches_the_scene_as_well_as_the_person():
+    """The control has to be unrestricted, or it is not controlling for anything."""
+    frame, silhouette = silhouette_and_frame()
+
+    touched = TextureRandomiser("everywhere", probability=1.0, kinds=("solid",))(
+        frame, silhouette
+    )
+
+    assert not np.array_equal(touched[~silhouette], frame[~silhouette])
+    assert not np.array_equal(touched[silhouette], frame[silhouette])
+
+
+def test_texture_randomiser_draws_a_new_fill_each_call():
+    """A fill reused across frames would be a constant, not a randomisation."""
+    frame, silhouette = silhouette_and_frame()
+    randomiser = TextureRandomiser("replace", probability=1.0, kinds=("solid",))
+
+    first = randomiser(frame, silhouette)
+    second = randomiser(frame, silhouette)
+
+    assert not np.array_equal(first, second)
+
+
+def test_texture_randomiser_reproduces_from_a_generator():
+    """Two workers handed the same generator must produce the same frame."""
+    frame, silhouette = silhouette_and_frame()
+    randomiser = TextureRandomiser("blend", probability=1.0)
+
+    first = randomiser(frame, silhouette, torch.Generator().manual_seed(11))
+    second = randomiser(frame, silhouette, torch.Generator().manual_seed(11))
+
+    assert np.array_equal(first, second)
+
+
+def test_texture_randomiser_honours_its_probability():
+    """Half means half; a mode that always fired would be a different cell."""
+    frame, silhouette = silhouette_and_frame()
+    randomiser = TextureRandomiser("replace", probability=0.5, kinds=("solid",))
+    generator = torch.Generator().manual_seed(0)
+
+    touched = sum(
+        not np.array_equal(randomiser(frame, silhouette, generator), frame)
+        for _ in range(200)
+    )
+
+    assert 70 < touched < 130
+
+
+def test_texture_randomiser_rejects_a_mismatched_silhouette():
+    """A silhouette of the wrong size would mask the wrong pixels in silence."""
+    frame, _ = silhouette_and_frame()
+
+    with pytest.raises(ValueError, match="silhouette is"):
+        TextureRandomiser("blend", probability=1.0)(frame, np.zeros((4, 4), dtype=bool))
+
+
+def test_texture_randomiser_rejects_a_mode_it_does_not_know():
+    """A typo would land in the sweep as a cell that trained on plain frames."""
+    with pytest.raises(ValueError, match="is not one of"):
+        TextureRandomiser("stylise")
+
+
+def test_none_is_not_a_mode_this_builds():
+    """Off is the absence of a randomiser, not one that passes frames through."""
+    with pytest.raises(ValueError, match="is not one of"):
+        TextureRandomiser("none")

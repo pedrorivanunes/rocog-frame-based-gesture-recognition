@@ -29,6 +29,7 @@ def test_parse_args_with_no_arguments_is_the_standard_run():
     assert args.save_every_epoch is False
     assert args.label_smoothing == 0.0
     assert args.freeze == "none"
+    assert args.texture == "none"
     assert args.window == "full"
     assert args.lr == 1e-4
 
@@ -73,6 +74,21 @@ def test_parse_args_rejects_a_depth_that_is_not_defined():
     """
     with pytest.raises(SystemExit):
         parse_args(["--freeze", "everything"])
+
+
+def test_the_standard_run_meets_the_person_as_rendered():
+    """Every run before this option trained on the rendered body."""
+    assert parse_args([]).texture == "none"
+
+
+def test_parse_args_takes_a_texture_mode():
+    assert parse_args(["--texture", "everywhere"]).texture == "everywhere"
+
+
+def test_parse_args_rejects_a_texture_mode_that_is_not_defined():
+    """A typo would land in the sweep as a cell that trained on plain frames."""
+    with pytest.raises(SystemExit):
+        parse_args(["--texture", "stylise"])
 
 
 def test_the_standard_run_trains_on_the_whole_window():
