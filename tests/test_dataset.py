@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from dataset import (
+    TEXTURE_FILLS,
     BackgroundRandomiser,
     RandomGamma,
     SegmentSampler,
@@ -412,3 +413,21 @@ def test_none_is_not_a_mode_this_builds():
     """Off is the absence of a randomiser, not one that passes frames through."""
     with pytest.raises(ValueError, match="is not one of"):
         TextureRandomiser("none")
+
+
+def test_every_fill_names_known_generators():
+    """A fill naming a generator that does not exist would fail mid-epoch."""
+    for kinds in TEXTURE_FILLS.values():
+        assert TextureRandomiser("blend", kinds=kinds).kinds == kinds
+
+
+def test_a_single_fill_uses_only_that_generator():
+    """Splitting the two is the whole point of naming one."""
+    frame, silhouette = silhouette_and_frame()
+    randomiser = TextureRandomiser(
+        "replace", probability=1.0, kinds=TEXTURE_FILLS["solid"]
+    )
+
+    for _ in range(20):
+        person = randomiser(frame, silhouette)[silhouette].reshape(-1, 3)
+        assert len(np.unique(person, axis=0)) == 1

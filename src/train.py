@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from dataset import (
     SAMPLER_SEED,
+    TEXTURE_FILLS,
     TEXTURES,
     BackgroundRandomiser,
     FrameDataset,
@@ -60,6 +61,7 @@ FREEZE = "none"
 # its appearance by default would make the runs after this option incomparable
 # to the ones before it.
 TEXTURE = "none"
+TEXTURE_FILL = "both"
 # And once more: every run recorded so far trained on the whole annotated
 # window, so narrowing it by default would make the runs after this option
 # incomparable to the ones before it.
@@ -138,7 +140,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     Returns:
         A namespace with ``manifest``, ``validation_groups``, ``seed``,
         ``photometric``, ``geometric``, ``background``, ``gamma_shift``,
-        ``label_smoothing``, ``freeze``, ``texture``, ``window``, ``lr``,
+        ``label_smoothing``, ``freeze``, ``texture``, ``texture_fill``,
+        ``window``, ``lr``,
         ``max_epochs``, ``patience``, ``checkpoint_name``, ``num_workers`` and
         ``save_every_epoch``.
     """
@@ -228,6 +231,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "to the person is the point. Needs silhouettes, so training only",
     )
     parser.add_argument(
+        "--texture-fill",
+        choices=sorted(TEXTURE_FILLS),
+        default=TEXTURE_FILL,
+        metavar="KIND",
+        help="what the replacement is made of: both draws between a flat "
+        "colour and pixel noise, and naming one alone asks which of the two "
+        "carries whatever the mode is worth. Ignored without --texture",
+    )
+    parser.add_argument(
         "--window",
         choices=WINDOWS,
         default=WINDOW,
@@ -314,6 +326,7 @@ def build_loaders(
     geometric: bool = GEOMETRIC,
     background: float = BACKGROUND,
     texture: str = TEXTURE,
+    texture_fill: str = TEXTURE_FILL,
     gamma_shift: tuple[float, float] | None = GAMMA_SHIFT,
     seed: int = SEED,
 ) -> tuple[DataLoader, DataLoader]:
@@ -350,6 +363,8 @@ def build_loaders(
             person, or ``none`` to leave the person as rendered. Training only,
             and for the same reason as the background: it needs a silhouette,
             and the real footage has none.
+        texture_fill: Which fills the replacement draws between. Separating them
+            is how a run asks which of the two a result rests on.
         gamma_shift: Range the training pipeline draws a gamma exponent from,
             or ``None`` to leave tone to the jitter. Training only, like the
             rest: evaluation meets its frames as they are.
@@ -365,7 +380,11 @@ def build_loaders(
         data_root,
         transform=train_transform(photometric, geometric, gamma_shift),
         background=BackgroundRandomiser(background) if background else None,
-        texture=TextureRandomiser(texture) if texture != "none" else None,
+        texture=(
+            TextureRandomiser(texture, kinds=TEXTURE_FILLS[texture_fill])
+            if texture != "none"
+            else None
+        ),
     )
     eval_dataset = FrameDataset(eval_manifest, data_root, transform=eval_transform())
 
@@ -547,7 +566,8 @@ if __name__ == "__main__":
         f"geometric {args.geometric}  background {args.background}  "
         f"label smoothing {args.label_smoothing}  "
         f"gamma shift {args.gamma_shift}  "
-        f"freeze {args.freeze}  texture {args.texture}  "
+        f"freeze {args.freeze}  "
+        f"texture {args.texture}/{args.texture_fill}  "
         f"window {args.window} ({len(train_manifest)} training frames)  "
         f"lr {args.lr}  "
         f"max epochs {args.max_epochs}  "
@@ -565,6 +585,7 @@ if __name__ == "__main__":
         geometric=args.geometric,
         background=args.background,
         texture=args.texture,
+        texture_fill=args.texture_fill,
         gamma_shift=args.gamma_shift,
         seed=args.seed,
     )

@@ -181,6 +181,12 @@ TEXTURE_PROBABILITY = 0.5
 
 TEXTURES = ("none", "blend", "replace", "everywhere")
 
+# What the replacement is made of. Both by default, for the reason the background
+# draws between the same two: a flat colour and pixel noise are opposite
+# failures, and a model that meets both has nowhere left to lean. Naming one
+# alone is how a run asks which of the two was doing the work.
+TEXTURE_FILLS = {"both": ("solid", "noise"), "solid": ("solid",), "noise": ("noise",)}
+
 
 class TextureRandomiser:
     """Replace the appearance inside the person, some of the time.
