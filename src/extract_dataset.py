@@ -361,7 +361,6 @@ if __name__ == "__main__":
     num_read = len(entries)
     class_names = load_class_names(PROJECT_ROOT / "data" / "class_dict.json")
     domain, perspective, split = args.annotations.stem.split("_")
-    num_after_repetitions = 0
     num_sampled = 0
 
     if domain == "syn":
