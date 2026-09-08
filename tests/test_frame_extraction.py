@@ -323,3 +323,19 @@ def test_asking_for_more_idle_frames_than_exist_is_rejected(annotated):
 def test_idle_frames_reject_a_missing_video(tmp_path):
     with pytest.raises(RuntimeError, match="could not open"):
         extract_idle_frames(tmp_path / "absent.avi", 4, np.random.default_rng(0))
+
+
+def test_idle_frames_never_include_the_first_frame_of_the_clip(late_gesture):
+    """Its companion carries no person, so nothing would be kept from it."""
+    for seed in range(30):
+        frames = extract_idle_frames(late_gesture, 4, np.random.default_rng(seed))
+        assert all(frame.frame_number >= 1 for frame in frames)
+
+
+def test_the_dropped_first_frame_is_not_counted_as_available(tmp_path):
+    """Four frames sit before this gesture and only three of them can be used."""
+    video_path = write_video(tmp_path / "tight.avi", list(range(0, 248, 4)))
+    write_window(video_path, 0.4, 5.9)
+
+    with pytest.raises(RuntimeError, match="3 frames before the gesture"):
+        extract_idle_frames(video_path, 4, np.random.default_rng(0))

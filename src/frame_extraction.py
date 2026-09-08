@@ -12,6 +12,12 @@ from typing import NamedTuple
 import cv2
 import numpy as np
 
+# First frame of a clip a sampler may take. The segmentation companion every
+# synthetic video ships opens with an empty frame — no person anywhere in it —
+# while the image at that instant is ordinary footage, so the pair only agrees
+# from the second frame on.
+FIRST_USABLE_FRAME = 1
+
 
 class SampledFrame(NamedTuple):
     """One frame drawn from a video's gesture window.
@@ -320,6 +326,11 @@ def extract_idle_frames(
     synthetic frame is composited. The stretch before ends where the gesture
     begins, which both files always hold.
 
+    It starts at the second frame for the same reason. The companion's first
+    frame carries no person at all, while the image's does, so a frame taken
+    from there would be composited against an empty silhouette and arrive as a
+    frame with nothing kept from it.
+
     Args:
         video_path: Path to the ``.mp4`` to sample. Its ``.xml`` sibling
             declares the window; a video without one is gesture from its first
@@ -345,12 +356,15 @@ def extract_idle_frames(
 
     video, gesture_start_frame, gesture_end_frame = _open_at_gesture(video_path)
     try:
-        if gesture_start_frame < num_frames:
+        available = gesture_start_frame - FIRST_USABLE_FRAME
+        if available < num_frames:
             raise RuntimeError(
-                f"{video_path.name}: {gesture_start_frame} frames before the "
+                f"{video_path.name}: {max(available, 0)} frames before the "
                 f"gesture, need {num_frames}"
             )
-        frame_numbers = _segment_draw(0, gesture_start_frame - 1, num_frames, rng)
+        frame_numbers = _segment_draw(
+            FIRST_USABLE_FRAME, gesture_start_frame - 1, num_frames, rng
+        )
         frames = _read_at(
             video, video_path, frame_numbers, gesture_start_frame, gesture_end_frame
         )
