@@ -6,6 +6,7 @@ import pytest
 
 from frame_extraction import (
     extract_frames,
+    extract_idle_frames,
     gesture_window,
     read_frames_at,
     read_metadata,
@@ -247,3 +248,78 @@ def test_the_frames_a_seed_draws_are_pinned(annotated):
     frames = extract_frames(annotated, 6, np.random.default_rng(0))
 
     assert [frame.frame_number for frame in frames] == [11, 16, 23, 32, 48, 58]
+
+
+@pytest.fixture
+def late_gesture(tmp_path):
+    """A clip whose gesture starts at frame 30, leaving thirty frames before it."""
+    video_path = write_video(tmp_path / "late.avi", list(range(0, 248, 4)))
+    write_window(video_path, 3.0, 5.9)
+
+    return video_path
+
+
+def test_idle_frames_all_come_from_before_the_gesture(late_gesture):
+    frames = extract_idle_frames(late_gesture, 4, np.random.default_rng(0))
+
+    assert all(frame.frame_number < 30 for frame in frames)
+
+
+def test_the_number_of_idle_frames_is_honored_exactly(late_gesture):
+    assert len(extract_idle_frames(late_gesture, 7, np.random.default_rng(0))) == 7
+
+
+def test_idle_frames_arrive_in_increasing_order(late_gesture):
+    frames = extract_idle_frames(late_gesture, 4, np.random.default_rng(0))
+
+    numbers = [frame.frame_number for frame in frames]
+    assert numbers == sorted(numbers)
+
+
+def test_idle_frames_are_spread_across_the_stretch(late_gesture):
+    """Four picks clustered at one end would be four copies of one instant."""
+    frames = extract_idle_frames(late_gesture, 4, np.random.default_rng(0))
+
+    numbers = [frame.frame_number for frame in frames]
+    assert numbers[0] <= 8
+    assert numbers[-1] >= 21
+
+
+def test_idle_position_falls_below_the_start_of_the_gesture(late_gesture):
+    """Leaving the zero to one range is what marks the row as idle."""
+    frames = extract_idle_frames(late_gesture, 4, np.random.default_rng(0))
+
+    for frame in frames:
+        assert frame.position < 0.0
+        assert frame.position == (frame.frame_number - 30) / 29
+
+
+def test_the_frame_an_idle_number_names_is_the_frame_returned(late_gesture):
+    frames = extract_idle_frames(late_gesture, 4, np.random.default_rng(0))
+
+    for frame in frames:
+        assert int(frame.frame[0, 0, 0]) == frame.frame_number * 4
+
+
+def test_the_same_seed_samples_the_same_idle_frames(late_gesture):
+    first = extract_idle_frames(late_gesture, 4, np.random.default_rng(3))
+    second = extract_idle_frames(late_gesture, 4, np.random.default_rng(3))
+
+    assert [f.frame_number for f in first] == [f.frame_number for f in second]
+
+
+def test_a_video_without_metadata_has_nothing_before_its_gesture(video):
+    """Real footage ships none, and is gesture from its very first frame."""
+    with pytest.raises(RuntimeError, match="before the gesture"):
+        extract_idle_frames(video, 4, np.random.default_rng(0))
+
+
+def test_asking_for_more_idle_frames_than_exist_is_rejected(annotated):
+    """Returning fewer would leave that video weighted below every other."""
+    with pytest.raises(RuntimeError, match="before the gesture"):
+        extract_idle_frames(annotated, 6, np.random.default_rng(0))
+
+
+def test_idle_frames_reject_a_missing_video(tmp_path):
+    with pytest.raises(RuntimeError, match="could not open"):
+        extract_idle_frames(tmp_path / "absent.avi", 4, np.random.default_rng(0))

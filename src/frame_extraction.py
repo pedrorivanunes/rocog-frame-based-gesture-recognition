@@ -299,3 +299,66 @@ def extract_frames(
     )
 
     return frames
+
+
+def extract_idle_frames(
+    video_path: Path,
+    num_frames: int,
+    rng: np.random.Generator | None = None,
+) -> list[SampledFrame]:
+    """Sample frames from the stretch before a video's gesture begins.
+
+    A synthetic clip declares a start delay, and through it the avatar holds a
+    named idle pose. That footage is the only material in the dataset showing a
+    body performing none of the seven gestures, and a classifier offered seven
+    labels has to call a body at rest one of the seven.
+
+    Only the stretch before the gesture, though the clip holds the same pose
+    after it as well. The stretch after runs to the final frame of the clip, and
+    the companion files the dataset ships alongside each video do not always
+    reach that far — a frame with no companion cannot be composited, and every
+    synthetic frame is composited. The stretch before ends where the gesture
+    begins, which both files always hold.
+
+    Args:
+        video_path: Path to the ``.mp4`` to sample. Its ``.xml`` sibling
+            declares the window; a video without one is gesture from its first
+            frame and has nothing before it.
+        num_frames: How many frames to return. Always honored exactly.
+        rng: Generator used to place a frame inside each segment. Defaults to an
+            unseeded generator; pass a seeded one for reproducible extraction.
+
+    Returns:
+        A list of ``num_frames`` ``SampledFrame`` records, in increasing frame
+        order. ``position`` follows the formula it has inside the window and so
+        falls below 0.0 for every one of them, which is what tells these frames
+        from the gesture's own once the two meet in one table, without a column
+        that exists to say so.
+
+    Raises:
+        RuntimeError: If the video cannot be opened, if a frame cannot be read,
+            if the gesture window has no length, or if fewer than ``num_frames``
+            frames sit before the gesture.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    video, gesture_start_frame, gesture_end_frame = _open_at_gesture(video_path)
+    try:
+        if gesture_start_frame < num_frames:
+            raise RuntimeError(
+                f"{video_path.name}: {gesture_start_frame} frames before the "
+                f"gesture, need {num_frames}"
+            )
+        frame_numbers = _segment_draw(0, gesture_start_frame - 1, num_frames, rng)
+        frames = _read_at(
+            video, video_path, frame_numbers, gesture_start_frame, gesture_end_frame
+        )
+    finally:
+        video.release()
+
+    assert len(frames) == num_frames, (
+        f"{video_path.name}: {len(frames)} frames, expected {num_frames}"
+    )
+
+    return frames
