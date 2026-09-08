@@ -4,7 +4,12 @@ import cv2
 import numpy as np
 import pytest
 
-from frame_extraction import read_frames_at
+from frame_extraction import (
+    extract_frames,
+    gesture_window,
+    read_frames_at,
+    read_metadata,
+)
 
 
 def write_video(path: Path, shades: list[int], size: int = 32) -> Path:
@@ -65,3 +70,180 @@ def test_read_frames_at_rejects_a_frame_past_the_end(video):
     """Silently returning fewer frames would misalign a mask from its image."""
     with pytest.raises(RuntimeError, match="failure when reading frame"):
         read_frames_at(video, [99])
+
+
+def write_window(video_path: Path, start_time: float, end_time: float) -> Path:
+    """Write the metadata sibling that declares where a video's gesture sits.
+
+    Only the two boundaries are read from it, but the encoding matters: the
+    dataset's files declare utf-16 while holding utf-8, and the reader corrects
+    that, so a test file has to carry the same mistake to exercise the same path.
+    """
+    xml_path = video_path.with_suffix(".xml")
+    xml_path.write_bytes(
+        f'<?xml version="1.0" encoding="utf-16"?>'
+        f"<GestureVideo>"
+        f"<startTime>{start_time}</startTime>"
+        f"<endTime>{end_time}</endTime>"
+        f"</GestureVideo>".encode()
+    )
+
+    return xml_path
+
+
+@pytest.fixture
+def annotated(tmp_path):
+    """A sixty-two frame clip at 10 fps whose gesture runs from frame 5 to 59.
+
+    Shades step by four, so the value a frame reads back with names the frame it
+    is. The window divides into six segments on whole frames — 5, 14, 23, 32,
+    41, 50, 59 — which lets a test say where a pick belongs without repeating
+    the arithmetic that placed it.
+    """
+    video_path = write_video(tmp_path / "clip.avi", list(range(0, 248, 4)))
+    write_window(video_path, 0.5, 5.9)
+
+    return video_path
+
+
+def test_read_metadata_parses_a_file_that_lies_about_its_encoding(annotated):
+    """Following the declaration, the parser refuses the dataset's own files."""
+    root = read_metadata(annotated.with_suffix(".xml"))
+
+    assert root.findtext("startTime") == "0.5"
+
+
+def test_the_window_is_read_from_the_metadata(annotated):
+    assert gesture_window(annotated, 62.0, 10.0) == (5, 59)
+
+
+def test_the_window_scales_with_the_frame_rate(annotated):
+    """The metadata gives seconds, and the same instant is a different frame."""
+    assert gesture_window(annotated, 124.0, 20.0) == (10, 118)
+
+
+def test_a_boundary_between_two_frames_lands_on_the_earlier_one(tmp_path):
+    video_path = write_video(tmp_path / "between.avi", list(range(0, 248, 4)))
+    write_window(video_path, 0.55, 5.97)
+
+    assert gesture_window(video_path, 62.0, 10.0) == (5, 59)
+
+
+def test_a_video_without_metadata_is_gesture_from_end_to_end(video):
+    """Real footage ships none, and is one gesture spanning the whole clip."""
+    assert gesture_window(video, 8.0, 10.0) == (0, 7)
+
+
+def test_an_end_past_the_last_frame_is_clamped_to_it(tmp_path):
+    """Around 2% of synthetic annotations, Rally above all, end past the video."""
+    video_path = write_video(tmp_path / "over.avi", list(range(0, 248, 4)))
+    write_window(video_path, 0.5, 99.0)
+
+    assert gesture_window(video_path, 62.0, 10.0) == (5, 61)
+
+
+def test_the_number_of_frames_is_honored_exactly(annotated):
+    assert len(extract_frames(annotated, 6, np.random.default_rng(0))) == 6
+
+
+def test_every_frame_comes_from_inside_the_window(annotated):
+    frames = extract_frames(annotated, 6, np.random.default_rng(0))
+
+    assert all(5 <= frame.frame_number <= 59 for frame in frames)
+
+
+def test_frames_arrive_in_increasing_order(annotated):
+    frames = extract_frames(annotated, 6, np.random.default_rng(0))
+
+    numbers = [frame.frame_number for frame in frames]
+    assert numbers == sorted(numbers)
+
+
+def test_one_frame_is_drawn_from_each_segment(annotated):
+    """Covering the whole window is what separates this from six blind draws."""
+    frames = extract_frames(annotated, 6, np.random.default_rng(0))
+
+    boundaries = [5, 14, 23, 32, 41, 50, 59]
+    segments = zip(boundaries, boundaries[1:], strict=False)
+    for frame, (low, high) in zip(frames, segments, strict=True):
+        assert low <= frame.frame_number <= high
+
+
+def test_a_pick_moves_within_its_segment(annotated):
+    """A fixed offset would lock the sample onto one phase of a repeating gesture."""
+    first_picks = {
+        extract_frames(annotated, 6, np.random.default_rng(seed))[0].frame_number
+        for seed in range(20)
+    }
+
+    assert len(first_picks) > 1
+
+
+def test_position_is_where_the_frame_sits_in_the_window(annotated):
+    frames = extract_frames(annotated, 6, np.random.default_rng(0))
+
+    for frame in frames:
+        assert frame.position == (frame.frame_number - 5) / 54
+        assert 0.0 <= frame.position <= 1.0
+
+
+def test_the_frame_a_number_names_is_the_frame_returned(annotated):
+    """A record whose image came from elsewhere is wrong past any later check."""
+    frames = extract_frames(annotated, 6, np.random.default_rng(0))
+
+    for frame in frames:
+        assert int(frame.frame[0, 0, 0]) == frame.frame_number * 4
+
+
+def test_the_same_seed_samples_the_same_frames(annotated):
+    first = extract_frames(annotated, 6, np.random.default_rng(3))
+    second = extract_frames(annotated, 6, np.random.default_rng(3))
+
+    assert [f.frame_number for f in first] == [f.frame_number for f in second]
+
+
+def test_a_different_seed_samples_different_frames(annotated):
+    first = extract_frames(annotated, 6, np.random.default_rng(3))
+    second = extract_frames(annotated, 6, np.random.default_rng(4))
+
+    assert [f.frame_number for f in first] != [f.frame_number for f in second]
+
+
+def test_a_window_shorter_than_the_sample_repeats_frames(tmp_path):
+    """Short clips round two segments onto one frame, and the count still holds."""
+    video_path = write_video(tmp_path / "short.avi", list(range(0, 248, 4)))
+    write_window(video_path, 0.5, 0.7)
+
+    frames = extract_frames(video_path, 8, np.random.default_rng(0))
+
+    numbers = [frame.frame_number for frame in frames]
+    assert len(numbers) == 8
+    assert len(set(numbers)) < 8
+
+
+def test_a_window_of_no_length_is_rejected(tmp_path):
+    """Dividing by it would make every position infinite rather than fail."""
+    video_path = write_video(tmp_path / "empty.avi", list(range(0, 248, 4)))
+    write_window(video_path, 0.5, 0.5)
+
+    with pytest.raises(RuntimeError, match="length zero"):
+        extract_frames(video_path, 6, np.random.default_rng(0))
+
+
+def test_extract_frames_rejects_a_missing_video(tmp_path):
+    with pytest.raises(RuntimeError, match="could not open"):
+        extract_frames(tmp_path / "absent.avi", 6, np.random.default_rng(0))
+
+
+def test_the_frames_a_seed_draws_are_pinned(annotated):
+    """Checking a seed only against itself would let a rewrite pass unnoticed.
+
+    Extraction is reproducible from a seed, and the manifests on disk record
+    the frames one particular sampler drew. Any change to how a pick is placed
+    inside its segment silently moves every frame a future extraction takes,
+    and the images already written stop being the ones the code would produce.
+    Pinning the draw is what turns that into a failing test.
+    """
+    frames = extract_frames(annotated, 6, np.random.default_rng(0))
+
+    assert [frame.frame_number for frame in frames] == [11, 16, 23, 32, 48, 58]
