@@ -9,6 +9,11 @@ Then writes one manifest row per frame to::
 
     data/manifests/{annotations file name}.csv
 
+With ``--idle`` it samples the stretch before each gesture begins instead of
+the window itself — the same videos, the same output tree, a manifest of its
+own — so that the pose a body holds before it gestures can carry a label rather
+than having to be called one of the seven.
+
 The manifest is the index the training pipeline reads: it carries domain, split,
 label, source video, camera viewpoint and position within the gesture, so any
 subset can be selected without touching the images themselves.
@@ -40,11 +45,24 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from frame_extraction import SampledFrame, extract_frames, read_metadata
+from frame_extraction import (
+    SampledFrame,
+    extract_frames,
+    extract_idle_frames,
+    read_metadata,
+)
 from manifest import load_class_names, video_metadata
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 NUM_FRAMES = 24
+
+# Frames taken from before the gesture. The clip declares an idle pose and holds
+# it through its start delay rather than moving through one, so these come back
+# near copies of each other: the count does not buy variety, it sets how heavily
+# that pose weighs against the seven gestures. Four per video puts the idle
+# material in the same order as a single gesture class, and a run may use fewer.
+NUM_IDLE_FRAMES = 4
+
 NUM_PER_STRATUM = 250
 MAX_REPETITIONS = 4
 SEED = 42
@@ -58,8 +76,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     Returns:
         A namespace with ``annotations``, the path to the RoCoG-v2 annotations
-        file whose videos should be extracted. Domain, perspective and split
-        follow from its name, so it is the only thing a run has to choose.
+        file whose videos should be extracted, and ``idle``, whether to sample
+        the stretch before each gesture rather than the gesture itself. Domain,
+        perspective and split follow from the file name, so the file and that
+        switch are the only things a run has to choose.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -67,6 +87,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="RoCoG-v2 annotations file to extract, "
         "e.g. data/annotations/syn_ground_train.txt",
+    )
+    parser.add_argument(
+        "--idle",
+        action="store_true",
+        help="sample the stretch before each gesture instead of the gesture itself",
     )
     return parser.parse_args(argv)
 
@@ -348,6 +373,7 @@ def append_rows(rows: list[dict], manifest_path: Path) -> None:
 if __name__ == "__main__":
     args = parse_args()
     print(f"annotations: {args.annotations}")
+    print(f"sampling: {'before' if args.idle else 'across'} the gesture")
 
     start_time = time.perf_counter()
     video_counter = 0
@@ -369,9 +395,17 @@ if __name__ == "__main__":
         entries = sample_stratified(entries, domain, NUM_PER_STRATUM, selection_rng)
         num_sampled = len(entries)
 
-    manifest_path = PROJECT_ROOT / "data" / "manifests" / f"{args.annotations.stem}.csv"
-    dropped_rows = drop_incomplete_videos(manifest_path, NUM_FRAMES)
-    already_extracted = completed_videos(manifest_path, NUM_FRAMES)
+    # The two passes cover the same videos and write into the same tree, and
+    # they are told apart by the frames they name: a run over the gesture never
+    # picks a number a run before it could pick. Separate manifests keep each one
+    # a table of whole videos, which is what resuming counts on.
+    sample_frames = extract_idle_frames if args.idle else extract_frames
+    frames_per_video = NUM_IDLE_FRAMES if args.idle else NUM_FRAMES
+    manifest_name = args.annotations.stem + ("_idle" if args.idle else "")
+
+    manifest_path = PROJECT_ROOT / "data" / "manifests" / f"{manifest_name}.csv"
+    dropped_rows = drop_incomplete_videos(manifest_path, frames_per_video)
+    already_extracted = completed_videos(manifest_path, frames_per_video)
     print(f"videos already in the manifest: {len(already_extracted)}")
     print(f"rows dropped from videos left half written: {dropped_rows}")
 
@@ -393,9 +427,9 @@ if __name__ == "__main__":
                 skipped_counter += 1
                 continue
 
-            frames = extract_frames(
+            frames = sample_frames(
                 PROJECT_ROOT / "data" / video_path,
-                NUM_FRAMES,
+                frames_per_video,
                 video_rng(metadata.video_id),
             )
             frame_paths = save_frames(frames, output_dir, metadata.video_id)

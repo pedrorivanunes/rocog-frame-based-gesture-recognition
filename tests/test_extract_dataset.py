@@ -249,3 +249,16 @@ def test_trimming_leaves_the_surviving_rows_byte_for_byte(tmp_path):
     drop_incomplete_videos(manifest, 2)
 
     assert manifest.read_text().splitlines() == before[:3]
+
+
+def test_a_run_samples_across_the_gesture_by_default():
+    """The pass that built every manifest so far has to keep its old command."""
+    args = parse_args(["data/annotations/syn_ground_train.txt"])
+
+    assert args.idle is False
+
+
+def test_a_run_can_ask_for_the_stretch_before_the_gesture():
+    args = parse_args(["data/annotations/syn_ground_train.txt", "--idle"])
+
+    assert args.idle is True
