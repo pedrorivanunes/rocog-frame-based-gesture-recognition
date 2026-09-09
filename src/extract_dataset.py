@@ -41,9 +41,7 @@ import zlib
 from collections import defaultdict
 from pathlib import Path
 
-import cv2
 import numpy as np
-import pandas as pd
 
 from frame_extraction import (
     SampledFrame,
@@ -51,7 +49,13 @@ from frame_extraction import (
     extract_idle_frames,
     read_metadata,
 )
-from manifest import load_class_names, video_metadata
+from frame_store import (
+    append_rows,
+    completed_videos,
+    drop_incomplete_videos,
+    save_frames,
+)
+from manifest import FRAME_SIZE, load_class_names, video_metadata
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 NUM_FRAMES = 24
@@ -96,37 +100,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def save_frames(
-    frames: list[SampledFrame],
-    output_dir: Path,
-    video_id: str,
-    size: int = 256,
-    quality: int = 90,
+def frame_paths(
+    output_dir: Path, video_id: str, frames: list[SampledFrame]
 ) -> list[Path]:
-    """Resize and write a video's sampled frames as JPEG files.
+    """Name the files a video's sampled frames are written to.
+
+    The frame number goes in the name rather than the position within the
+    gesture, because it is what identifies a frame in the video it came from:
+    the companion pass that extracts silhouettes, and any later pass that
+    re-renders these frames, both find their way back through it.
 
     Args:
-        frames: Frames returned by ``extract_frames``.
-        output_dir: Directory to write into. Created if missing.
-        video_id: Video the frames came from; used as the file name prefix.
-        size: Side length of the square output, in pixels.
-        quality: JPEG quality, 0-100.
+        output_dir: Directory for this video's class and domain.
+        video_id: Video the frames came from; the file name's prefix.
+        frames: Frames about to be written, in the order they will be.
 
     Returns:
-        The paths written, in the same order as ``frames``.
+        One path per frame, in the same order.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    written = []
-    for sampled in frames:
-        image = cv2.resize(sampled.frame, (size, size), interpolation=cv2.INTER_AREA)
-        path = output_dir / f"{video_id}_f{sampled.frame_number:04d}.jpg"
-        written_ok = cv2.imwrite(str(path), image, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        if not written_ok:
-            raise RuntimeError(f"could not write frame to {path}")
-        written.append(path)
-
-    return written
+    return [
+        output_dir / f"{video_id}_f{sampled.frame_number:04d}.jpg" for sampled in frames
+    ]
 
 
 def read_annotations(file_path: Path) -> list[tuple[Path, int]]:
@@ -272,104 +266,6 @@ def video_rng(video_id: str, seed: int = SEED) -> np.random.Generator:
     return np.random.default_rng([seed, zlib.crc32(video_id.encode())])
 
 
-def drop_incomplete_videos(manifest_path: Path, frames_per_video: int) -> int:
-    """Trim a manifest back to whole videos, before a pass resumes into it.
-
-    A pass cut off while writing leaves a short group of rows behind. That video
-    is extracted again, which is right, but appending its rows would leave the
-    short group in front of the complete one and the manifest would hold more
-    rows for that video than any video should have — enough to weight it above
-    the others in training, and to break a frame selection that counts on every
-    video carrying the same number.
-
-    Rows that survive have to come back out unchanged, and the default CSV
-    reader does not guarantee that: it parses floats with a fast routine that
-    can land one unit in the last place away from the value written, so reading
-    the manifest and writing it again would quietly edit the position of every
-    frame already extracted. ``round_trip`` asks for the parser that returns the
-    float the text names.
-
-    Args:
-        manifest_path: Manifest to trim in place. Missing or empty is left
-            alone, there being nothing to trim.
-        frames_per_video: How many rows a finished video contributes.
-
-    Returns:
-        How many rows were dropped.
-    """
-    if not manifest_path.exists() or manifest_path.stat().st_size == 0:
-        return 0
-
-    written = pd.read_csv(manifest_path, float_precision="round_trip")
-    rows_per_video = written["video_id"].map(written["video_id"].value_counts())
-    whole = written[rows_per_video == frames_per_video]
-
-    if len(whole) < len(written):
-        whole.to_csv(manifest_path, index=False)
-
-    return len(written) - len(whole)
-
-
-def completed_videos(manifest_path: Path, frames_per_video: int) -> set[str]:
-    """Read back which videos a previous pass finished.
-
-    A pass over the synthetic subset runs for hours and this machine has lost
-    power four times in a week, so it has to be able to pick up where it
-    stopped. The manifest is what decides: it is the index the rest of the
-    pipeline reads, and frames on disk that no row points at are invisible
-    downstream, so a video counts as done only once its rows are written.
-
-    A video is accepted only with its full complement of rows. A pass cut off
-    while writing leaves a short group behind, and one video is cheap to extract
-    again — while trusting a short group would leave a hole that nothing further
-    down reports.
-
-    Counting rows also catches the case where the extraction itself changed: ask
-    for a different number of frames per video and no earlier group matches, so
-    the pass redoes the work instead of resuming into a manifest built under
-    other rules. It does not catch a change that leaves the count alone, such as
-    a different output size — deleting the manifest is what forces those.
-
-    Args:
-        manifest_path: Manifest a previous pass wrote. Missing or empty means
-            nothing is done yet.
-        frames_per_video: How many rows a finished video contributes.
-
-    Returns:
-        The ids of the videos that need not be extracted again.
-    """
-    if not manifest_path.exists() or manifest_path.stat().st_size == 0:
-        return set()
-
-    rows_per_video = pd.read_csv(manifest_path, usecols=["video_id"])[
-        "video_id"
-    ].value_counts()
-
-    return set(rows_per_video[rows_per_video == frames_per_video].index)
-
-
-def append_rows(rows: list[dict], manifest_path: Path) -> None:
-    """Add one video's rows to the manifest, creating the file if needed.
-
-    Holding every row until the end of the pass puts hours of work behind a
-    single write. Appending as each video finishes puts at most one video at
-    risk, which is what makes the pass resumable at all.
-
-    Rows are appended only after the images they point at are on disk, so a
-    manifest row is a promise that its frame exists — the order the resume logic
-    depends on.
-
-    Args:
-        rows: Manifest rows for a single video.
-        manifest_path: Manifest to append to. Its directory is created if
-            missing, and the header is written only for a new file.
-    """
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    is_new = not manifest_path.exists() or manifest_path.stat().st_size == 0
-
-    pd.DataFrame(rows).to_csv(manifest_path, mode="a", header=is_new, index=False)
-
-
 if __name__ == "__main__":
     args = parse_args()
     print(f"annotations: {args.annotations}")
@@ -432,10 +328,11 @@ if __name__ == "__main__":
                 frames_per_video,
                 video_rng(metadata.video_id),
             )
-            frame_paths = save_frames(frames, output_dir, metadata.video_id)
+            paths = frame_paths(output_dir, metadata.video_id, frames)
+            save_frames([sampled.frame for sampled in frames], paths, FRAME_SIZE)
 
             rows = []
-            for sampled, frame_path in zip(frames, frame_paths, strict=True):
+            for sampled, frame_path in zip(frames, paths, strict=True):
                 row = {
                     "domain": domain,
                     "perspective": perspective,

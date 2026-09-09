@@ -18,6 +18,11 @@ from typing import NamedTuple
 IDLE_LABEL = 7
 IDLE_CLASS_NAME = "Idle"
 
+# Side length the frames every measured manifest points at are stored at. A copy
+# of the dataset at another size gets a tree of its own named for that size, so
+# this one is the only size whose paths carry no size in them.
+FRAME_SIZE = 256
+
 
 class VideoMetadata(NamedTuple):
     """Facts about a video that can be read from its file name alone.
@@ -109,6 +114,39 @@ def mask_path_for(frame_path: Path) -> Path:
     parts[parts.index("frames")] = "masks"
 
     return Path(*parts).with_suffix(".png")
+
+
+def sized_path_for(frame_path: Path, size: int) -> Path:
+    """Name the same frame stored at another side length.
+
+    A resolution experiment has to change how many pixels a frame carries and
+    nothing else — not which videos, not which frames of them, not the rows that
+    index either. So a copy at another size is not a second extraction: it is the
+    same manifest re-rendered, and its rows differ from the original's in this
+    one column. Drawing the frames again would look equivalent and is not, since
+    the draw is random within each segment.
+
+    The size becomes a directory under ``frames`` rather than a suffix on it,
+    which is what lets ``mask_path_for`` go on working: it swaps the ``frames``
+    component wherever that component sits, so the silhouette tree mirrors the
+    frame tree at every size without being told sizes exist.
+
+    Args:
+        frame_path: The frame's path, as the manifest stores it.
+        size: Side length the copy is stored at.
+
+    Returns:
+        Where that frame belongs at the given size, as a relative path. The
+        default size is the tree the path already names, and comes back
+        unchanged.
+    """
+    if size == FRAME_SIZE:
+        return Path(frame_path)
+
+    parts = list(Path(frame_path).parts)
+    parts.insert(parts.index("frames") + 1, str(size))
+
+    return Path(*parts)
 
 
 def with_idle_class(class_names: dict[int, str]) -> dict[int, str]:

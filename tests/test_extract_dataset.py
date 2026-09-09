@@ -2,18 +2,16 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import pytest
 
 from extract_dataset import (
-    append_rows,
-    completed_videos,
-    drop_incomplete_videos,
+    frame_paths,
     parse_args,
     read_annotations,
     sample_stratified,
     video_rng,
 )
+from frame_extraction import SampledFrame
 from manifest import video_metadata
 
 
@@ -113,18 +111,6 @@ def test_read_annotations_pairs_paths_with_integer_labels(tmp_path):
     assert isinstance(entries[0][1], int)
 
 
-def manifest_rows(video_id, count, start=0):
-    """Build the rows one video contributes, with only the columns resume reads."""
-    return [
-        {
-            "video_id": video_id,
-            "frame_number": start + i,
-            "path": f"{video_id}_f{i}.jpg",
-        }
-        for i in range(count)
-    ]
-
-
 def test_the_same_video_is_given_the_same_frames_whatever_its_position():
     """Resuming skips videos, so a draw that moves with the stream would move."""
     first = video_rng("Scene1_0_Halt_1_1_2026_0_0_0").integers(0, 1000, size=24)
@@ -149,108 +135,6 @@ def test_a_different_seed_places_frames_differently():
     assert not np.array_equal(first, second)
 
 
-def test_no_manifest_means_nothing_is_done(tmp_path):
-    assert completed_videos(tmp_path / "absent.csv", 24) == set()
-
-
-def test_an_empty_manifest_means_nothing_is_done(tmp_path):
-    """A file created but never written to would otherwise fail to parse."""
-    manifest = tmp_path / "syn_ground_train.csv"
-    manifest.touch()
-
-    assert completed_videos(manifest, 24) == set()
-
-
-def test_videos_with_every_row_count_as_done(tmp_path):
-    manifest = tmp_path / "syn_ground_train.csv"
-    append_rows(manifest_rows("first", 4) + manifest_rows("second", 4), manifest)
-
-    assert completed_videos(manifest, 4) == {"first", "second"}
-
-
-def test_a_video_cut_off_partway_is_extracted_again(tmp_path):
-    """Trusting a short group would leave a hole nothing downstream reports."""
-    manifest = tmp_path / "syn_ground_train.csv"
-    append_rows(manifest_rows("whole", 4) + manifest_rows("cut", 2), manifest)
-
-    assert completed_videos(manifest, 4) == {"whole"}
-
-
-def test_asking_for_more_frames_per_video_redoes_the_pass(tmp_path):
-    """A manifest built under other rules must not be resumed into."""
-    manifest = tmp_path / "syn_ground_train.csv"
-    append_rows(manifest_rows("first", 4), manifest)
-
-    assert completed_videos(manifest, 8) == set()
-
-
-def test_appending_writes_one_header_and_keeps_every_row(tmp_path):
-    manifest = tmp_path / "syn_ground_train.csv"
-
-    append_rows(manifest_rows("first", 3), manifest)
-    append_rows(manifest_rows("second", 3), manifest)
-
-    written = pd.read_csv(manifest)
-    assert list(written["video_id"]) == ["first"] * 3 + ["second"] * 3
-    assert manifest.read_text().count("video_id") == 1
-
-
-def test_appending_creates_the_manifest_directory(tmp_path):
-    manifest = tmp_path / "manifests" / "syn_ground_train.csv"
-
-    append_rows(manifest_rows("first", 3), manifest)
-
-    assert manifest.exists()
-
-
-def test_trimming_leaves_whole_videos_untouched(tmp_path):
-    manifest = tmp_path / "syn_ground_train.csv"
-    append_rows(manifest_rows("first", 4) + manifest_rows("second", 4), manifest)
-
-    assert drop_incomplete_videos(manifest, 4) == 0
-    assert len(pd.read_csv(manifest)) == 8
-
-
-def test_trimming_removes_the_rows_of_a_video_left_half_written(tmp_path):
-    """Left in place, they would sit in front of the complete group written next."""
-    manifest = tmp_path / "syn_ground_train.csv"
-    append_rows(manifest_rows("whole", 4) + manifest_rows("cut", 2), manifest)
-
-    assert drop_incomplete_videos(manifest, 4) == 2
-
-    remaining = pd.read_csv(manifest)
-    assert set(remaining["video_id"]) == {"whole"}
-    assert len(remaining) == 4
-
-
-def test_a_trimmed_manifest_still_takes_appended_rows(tmp_path):
-    """Trimming everything away leaves a header, which is not an empty file."""
-    manifest = tmp_path / "syn_ground_train.csv"
-    append_rows(manifest_rows("cut", 2), manifest)
-    drop_incomplete_videos(manifest, 4)
-
-    append_rows(manifest_rows("cut", 4), manifest)
-
-    written = pd.read_csv(manifest)
-    assert list(written["video_id"]) == ["cut"] * 4
-    assert manifest.read_text().count("video_id") == 1
-
-
-def test_trimming_leaves_the_surviving_rows_byte_for_byte(tmp_path):
-    """The CSV reader's fast float parser would edit a position by one ulp."""
-    manifest = tmp_path / "syn_ground_train.csv"
-    append_rows(
-        [{"video_id": "whole", "position": 0.01694915254237288}] * 2
-        + [{"video_id": "cut", "position": 0.13559322033898305}],
-        manifest,
-    )
-    before = manifest.read_text().splitlines()
-
-    drop_incomplete_videos(manifest, 2)
-
-    assert manifest.read_text().splitlines() == before[:3]
-
-
 def test_a_run_samples_across_the_gesture_by_default():
     """The pass that built every manifest so far has to keep its old command."""
     args = parse_args(["data/annotations/syn_ground_train.txt"])
@@ -262,3 +146,17 @@ def test_a_run_can_ask_for_the_stretch_before_the_gesture():
     args = parse_args(["data/annotations/syn_ground_train.txt", "--idle"])
 
     assert args.idle is True
+
+
+def test_a_frame_is_named_for_the_video_and_the_number_it_carries():
+    """The number is what leads back to the video.
+
+    The mask pass reads it, and so does any later pass re-rendering these frames
+    at another size.
+    """
+    frames = [SampledFrame(7, 0.5, None), SampledFrame(140, 0.9, None)]
+
+    assert frame_paths(Path("data/frames/syn/Halt"), "Scene1_Halt", frames) == [
+        Path("data/frames/syn/Halt/Scene1_Halt_f0007.jpg"),
+        Path("data/frames/syn/Halt/Scene1_Halt_f0140.jpg"),
+    ]
