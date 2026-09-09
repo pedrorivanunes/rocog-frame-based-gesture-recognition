@@ -18,6 +18,7 @@ from dataset import (
     TEXTURE_FILLS,
     TEXTURES,
     BackgroundRandomiser,
+    CombinedSampler,
     FrameDataset,
     SegmentSampler,
     TextureRandomiser,
@@ -26,12 +27,27 @@ from dataset import (
 )
 from device import describe, pick_device
 from evaluation import frame_metrics, predict
-from model import FROZEN_STAGES, build_model, freeze
-from splits import WINDOWS, select_frames, split_by_group, split_by_scene
+from manifest import IDLE_LABEL
+from model import FROZEN_STAGES, NUM_CLASSES, build_model, freeze
+from splits import (
+    WINDOWS,
+    add_idle_rows,
+    select_frames,
+    split_by_group,
+    split_by_scene,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BATCH_SIZE = 64
 FRAMES_PER_EPOCH = 8
+
+# Idle frames drawn from each training video per epoch. Every video carries one
+# gesture and every video carries idle material, so a video's frames land in one
+# of seven classes while its idle frames all land in the eighth. Drawing one
+# leaves the eighth class a little under the size of a gesture class; drawing two
+# would put it at nearly twice. Extraction stores more than an epoch uses, here
+# as everywhere else, so that the draw can move between epochs.
+IDLE_FRAMES_PER_EPOCH = 1
 LEARNING_RATE = 1e-4
 
 # Defaults for the options parse_args exposes, so an argument-free run is the
@@ -146,6 +162,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ``save_every_epoch``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--idle-manifest",
+        default=None,
+        help="frames of the pose a body holds before it gestures, a file name "
+        "under data/manifests/. Adds an eighth class for them",
+    )
     parser.add_argument(
         "--manifest",
         default=MANIFEST,
@@ -322,6 +344,7 @@ def build_loaders(
     data_root: Path,
     num_workers: int = NUM_WORKERS,
     frames_per_epoch: int = FRAMES_PER_EPOCH,
+    idle_frames_per_epoch: int = IDLE_FRAMES_PER_EPOCH,
     photometric: bool = PHOTOMETRIC,
     geometric: bool = GEOMETRIC,
     background: float = BACKGROUND,
@@ -346,6 +369,9 @@ def build_loaders(
         data_root: Directory the manifests' ``path`` column is relative to.
         num_workers: Loader subprocesses. Zero avoids the ~16 s spawn cost, which
             is worth paying only for runs long enough to amortise it.
+        idle_frames_per_epoch: Idle frames drawn from each training video per
+            epoch. Read only when the training rows carry any, so a run without
+            them is the run as it was before the class existed.
         frames_per_epoch: Frames drawn from each training video per epoch. The
             sampler shuffles, so the loader must not — passing a sampler and
             ``shuffle=True`` together is rejected by the DataLoader.
@@ -388,12 +414,32 @@ def build_loaders(
     )
     eval_dataset = FrameDataset(eval_manifest, data_root, transform=eval_transform())
 
+    # Two draws rather than one when the rows carry both kinds. A video holds a
+    # different number of each, so counting them together would refuse to split
+    # into equal blocks, and drawing them at one rate would let the class that
+    # is stored least often decide the rate for all of them.
+    rows = train_dataset.data_frame
+    is_idle = (rows["label"] == IDLE_LABEL).to_numpy()
+    sampler = (
+        CombinedSampler(
+            [
+                SegmentSampler(
+                    rows, frames_per_epoch, seed=SAMPLER_SEED + seed, rows=~is_idle
+                ),
+                SegmentSampler(
+                    rows, idle_frames_per_epoch, seed=SAMPLER_SEED + seed, rows=is_idle
+                ),
+            ],
+            seed=SAMPLER_SEED + seed,
+        )
+        if is_idle.any()
+        else SegmentSampler(rows, frames_per_epoch, seed=SAMPLER_SEED + seed)
+    )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
-        sampler=SegmentSampler(
-            train_dataset.data_frame, frames_per_epoch, seed=SAMPLER_SEED + seed
-        ),
+        sampler=sampler,
         num_workers=num_workers,
         drop_last=True,
         persistent_workers=num_workers > 0,
@@ -554,6 +600,19 @@ if __name__ == "__main__":
     train_manifest = select_frames(train_manifest, args.window, args.seed)
 
     held_out = sorted(eval_manifest["group_id"].unique())
+
+    # Training only. Validation stays the seven-class question every run so far
+    # was scored on, so the curve that picks a checkpoint keeps meaning what it
+    # meant. The held-out groups are named rather than drawn again: the two
+    # manifests cover the same videos, and a second draw could put a scene on
+    # opposite sides of the boundary in the two of them.
+    num_classes = NUM_CLASSES
+    if args.idle_manifest:
+        idle = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.idle_manifest)
+        idle_train, _ = split_by_group(idle, held_out)
+        train_manifest = add_idle_rows(train_manifest, idle_train)
+        num_classes = IDLE_LABEL + 1
+
     print(f"manifest {args.manifest}  validation groups: {' '.join(held_out)}")
     print(
         f"train {train_manifest['video_id'].nunique()} videos / "
@@ -569,6 +628,7 @@ if __name__ == "__main__":
         f"freeze {args.freeze}  "
         f"texture {args.texture}/{args.texture_fill}  "
         f"window {args.window} ({len(train_manifest)} training frames)  "
+        f"idle {args.idle_manifest or 'off'} ({num_classes} classes)  "
         f"lr {args.lr}  "
         f"max epochs {args.max_epochs}  "
         f"patience {args.patience}  workers {args.num_workers}  ->  "
@@ -592,7 +652,7 @@ if __name__ == "__main__":
 
     device = pick_device()
     print(f"device: {describe(device)}")
-    model = build_model().to(device)
+    model = build_model(num_classes).to(device)
     frozen = freeze(model, args.freeze)
     criterion, validation_criterion = build_criteria(args.label_smoothing)
     # Only the parameters that still train. Adam would skip a frozen one anyway,

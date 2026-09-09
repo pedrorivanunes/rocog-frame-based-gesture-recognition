@@ -205,7 +205,7 @@ def probability_table(
 if __name__ == "__main__":
     from dataset import FrameDataset, eval_transform
     from device import describe, pick_device
-    from manifest import load_class_names
+    from manifest import load_class_names, with_idle_class
     from model import build_model
     from splits import split_by_scene
 
@@ -224,8 +224,17 @@ if __name__ == "__main__":
     class_names = load_class_names(PROJECT_ROOT / "data" / "class_dict.json")
     device = pick_device()
     print(f"device: {describe(device)}")
-    model = build_model().to(device)
-    model.load_state_dict(torch.load(args.checkpoint, map_location=device))
+
+    # How wide the head is belongs to the checkpoint, not to the run scoring it.
+    # One trained with the idle class carries an output the dataset's own
+    # vocabulary has no name for, and building the network at the wrong width
+    # fails on a shape mismatch rather than on a wrong number.
+    weights = torch.load(args.checkpoint, map_location=device)
+    num_classes = len(weights["fc.bias"])
+    if num_classes > len(class_names):
+        class_names = with_idle_class(class_names)
+    model = build_model(num_classes).to(device)
+    model.load_state_dict(weights)
 
     loader = DataLoader(
         FrameDataset(manifest, PROJECT_ROOT, eval_transform()),

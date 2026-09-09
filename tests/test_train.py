@@ -1,12 +1,15 @@
+import pandas as pd
 import pytest
 import torch
 from torch import nn
 from torchvision.models import resnet18
 
+from manifest import IDLE_LABEL
 from model import freeze
 from train import (
     EarlyStopping,
     build_criteria,
+    build_loaders,
     checkpoint_name,
     parse_args,
     train_one_epoch,
@@ -256,3 +259,67 @@ def test_an_epoch_leaves_a_frozen_stage_exactly_as_it_found_it():
     assert torch.equal(model.layer4[0].conv1.weight, weights)
     assert torch.equal(model.bn1.running_mean, statistics)
     assert not torch.equal(model.fc.weight, head), "the head should still be learning"
+
+
+def test_a_run_trains_on_the_gestures_alone_by_default():
+    """Every run recorded so far was seven classes, and stays comparable to itself."""
+    args = parse_args([])
+
+    assert args.idle_manifest is None
+
+
+def test_a_run_can_name_the_frames_that_carry_no_gesture():
+    args = parse_args(["--idle-manifest", "syn_ground_train_idle.csv"])
+
+    assert args.idle_manifest == "syn_ground_train_idle.csv"
+
+
+def rows_for(video, label, count, first=0):
+    """Manifest rows for one video, carrying the columns the loaders read.
+
+    No image has to exist: building a loader reads the table and nothing else,
+    and these tests never draw a batch from it.
+    """
+    return pd.DataFrame(
+        {
+            "video_id": [video] * count,
+            "label": [label] * count,
+            "path": [f"frames/{video}_f{first + i}.jpg" for i in range(count)],
+        }
+    )
+
+
+def mixed_rows(videos=3, gesture_frames=16, idle_frames=4):
+    """Training rows as a run with the idle class assembles them."""
+    return pd.concat(
+        [rows_for(f"v{v}", 0, gesture_frames) for v in range(videos)]
+        + [
+            rows_for(f"v{v}", IDLE_LABEL, idle_frames, first=gesture_frames)
+            for v in range(videos)
+        ],
+        ignore_index=True,
+    )
+
+
+def test_the_loaders_draw_each_kind_of_row_at_its_own_rate(tmp_path):
+    """Counted as one kind, twenty rows a video refuse to split into eight blocks."""
+    train_rows = mixed_rows(videos=3)
+
+    train_loader, _ = build_loaders(
+        train_rows, rows_for("v0", 0, 16), tmp_path, num_workers=0
+    )
+
+    assert len(train_loader.sampler) == 3 * (8 + 1)
+
+
+def test_rows_of_one_kind_are_drawn_by_one_sampler(tmp_path):
+    """A run without the idle class has to stay the run it was."""
+    train_rows = pd.concat(
+        [rows_for(f"v{v}", 0, 16) for v in range(3)], ignore_index=True
+    )
+
+    train_loader, _ = build_loaders(
+        train_rows, rows_for("v0", 0, 16), tmp_path, num_workers=0
+    )
+
+    assert len(train_loader.sampler) == 3 * 8
