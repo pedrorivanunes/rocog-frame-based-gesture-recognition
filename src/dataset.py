@@ -567,6 +567,7 @@ class SegmentSampler(Sampler[int]):
         manifest: pd.DataFrame,
         frames_per_video: int,
         seed: int = SAMPLER_SEED,
+        rows: np.ndarray | None = None,
     ):
         """Group the manifest rows into the blocks each epoch draws from.
 
@@ -577,13 +578,22 @@ class SegmentSampler(Sampler[int]):
                 how many blocks each video is cut into.
             seed: Draws the frames. Its own generator, so that a run stays
                 reproducible whatever else consumes randomness alongside it.
+            rows: Which of those rows this sampler draws from, as a boolean mask
+                over them. ``None`` is all of them. A frame carrying two kinds
+                of row — a video's gesture frames and the idle frames of the
+                same video, stored at different counts — needs one sampler per
+                kind, and each still has to name positions in the whole frame,
+                since that is what the dataset serves.
 
         Raises:
             RuntimeError: If videos hold differing numbers of frames, or if the
                 stored count does not divide into equal blocks.
         """
-        rows = manifest.reset_index(drop=True)
-        positions = rows.groupby("video_id", sort=False).indices
+        frame = manifest.reset_index(drop=True)
+        selected = (
+            np.arange(len(frame)) if rows is None else np.flatnonzero(np.asarray(rows))
+        )
+        positions = frame.iloc[selected].groupby("video_id", sort=False).indices
 
         stored = {len(indices) for indices in positions.values()}
         if len(stored) != 1:
@@ -597,7 +607,8 @@ class SegmentSampler(Sampler[int]):
             )
 
         self.blocks = [
-            indices.reshape(frames_per_video, -1) for indices in positions.values()
+            selected[indices].reshape(frames_per_video, -1)
+            for indices in positions.values()
         ]
         self.frames_per_video = frames_per_video
         self.rng = np.random.default_rng(seed)
@@ -614,6 +625,52 @@ class SegmentSampler(Sampler[int]):
         """
         drawn = np.array(
             [self.rng.choice(block) for video in self.blocks for block in video]
+        )
+        self.rng.shuffle(drawn)
+
+        return iter(drawn.tolist())
+
+
+class CombinedSampler(Sampler[int]):
+    """Draw one epoch from several samplers and hand it back in a single order.
+
+    An epoch that mixes rows stored at different counts per video needs one
+    sampler for each. Eight frames drawn from a video's gesture and one drawn
+    from the material before it are two draws over two sets of blocks, and a
+    single sampler asked to do both would have to be told which rows are which —
+    which is the dataset's business, not the sampler's.
+
+    Shuffling again over the union is what makes this more than concatenation.
+    Each sampler shuffles only its own draw, so without this an epoch would
+    arrive as every gesture frame followed by every idle frame, and the batches
+    at the end would hold nothing but bodies at rest — a batch normalisation
+    layer meeting one class at a time is not the same layer.
+    """
+
+    def __init__(self, samplers: list[Sampler[int]], seed: int = SAMPLER_SEED):
+        """Hold the samplers whose draws make up an epoch.
+
+        Args:
+            samplers: The samplers to draw from. Each must name positions in the
+                same frame, since all of them index one dataset.
+            seed: Shuffles the union. Its own generator, kept apart from the
+                ones the samplers draw with so that adding a kind of row does
+                not move the frames the others choose.
+        """
+        self.samplers = list(samplers)
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self) -> int:
+        """Count the frames one epoch draws, which is the length the loader reports."""
+        return sum(len(sampler) for sampler in self.samplers)
+
+    def __iter__(self):
+        """Draw from every sampler and shuffle the lot together."""
+        drawn = np.concatenate(
+            [
+                np.fromiter(sampler, dtype=int, count=len(sampler))
+                for sampler in self.samplers
+            ]
         )
         self.rng.shuffle(drawn)
 

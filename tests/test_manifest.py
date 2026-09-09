@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from manifest import mask_path_for, video_metadata
+from manifest import mask_path_for, video_metadata, with_idle_class
 
 
 def test_synthetic_scene_number_determines_view():
@@ -48,3 +48,19 @@ def test_mask_path_accepts_a_string_as_a_manifest_stores_it():
     assert mask_path_for("data/frames/real/Rally/S02_y_f0012.jpg") == Path(
         "data/masks/real/Rally/S02_y_f0012.png"
     )
+
+
+def test_the_idle_class_is_added_past_the_last_gesture():
+    """Sitting past them is what leaves a table read without it unchanged."""
+    names = with_idle_class({0: "Advance", 1: "Attention"})
+
+    assert names == {0: "Advance", 1: "Attention", 7: "Idle"}
+
+
+def test_adding_the_idle_class_leaves_the_mapping_it_was_given():
+    """A caller still working in seven classes has to keep having seven."""
+    seven = {0: "Advance", 1: "Attention"}
+
+    with_idle_class(seven)
+
+    assert seven == {0: "Advance", 1: "Attention"}

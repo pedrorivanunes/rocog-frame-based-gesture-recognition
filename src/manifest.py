@@ -11,6 +11,13 @@ import json
 from pathlib import Path
 from typing import NamedTuple
 
+# What a frame is called when it shows a body performing no gesture at all. The
+# dataset's own vocabulary stops at the seven gestures, so this label sits one
+# past the last of them: a table read without it is unchanged, and a model
+# trained with it is the same network one output wider.
+IDLE_LABEL = 7
+IDLE_CLASS_NAME = "Idle"
+
 
 class VideoMetadata(NamedTuple):
     """Facts about a video that can be read from its file name alone.
@@ -102,6 +109,26 @@ def mask_path_for(frame_path: Path) -> Path:
     parts[parts.index("frames")] = "masks"
 
     return Path(*parts).with_suffix(".png")
+
+
+def with_idle_class(class_names: dict[int, str]) -> dict[int, str]:
+    """Add the idle class to a label-to-name mapping.
+
+    The dataset ships seven names, one per gesture, and none for a body at rest
+    — its clips declare an idle pose in their metadata, but the class vocabulary
+    stops at the gestures. A run trained on that material needs the eighth name
+    wherever the seven appear: the width of the model's output, the columns of a
+    probability table, the rows of a confusion matrix.
+
+    Args:
+        class_names: The mapping the dataset ships, as ``load_class_names``
+            reads it.
+
+    Returns:
+        A new mapping with the idle class added. The one passed in is left
+        alone, so a caller still holding the seven-class vocabulary keeps it.
+    """
+    return {**class_names, IDLE_LABEL: IDLE_CLASS_NAME}
 
 
 def load_class_names(path: Path) -> dict[int, str]:

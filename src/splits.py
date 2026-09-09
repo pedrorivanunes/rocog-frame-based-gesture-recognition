@@ -15,6 +15,8 @@ both answer the same question about a result — which frames produced it.
 import numpy as np
 import pandas as pd
 
+from manifest import IDLE_CLASS_NAME, IDLE_LABEL
+
 SPLIT_SEED = 7
 WINDOW_SEED = 23
 
@@ -213,3 +215,33 @@ def select_frames(
         ]
 
     return manifest.iloc[np.sort(np.concatenate(kept))]
+
+
+def add_idle_rows(gesture: pd.DataFrame, idle: pd.DataFrame) -> pd.DataFrame:
+    """Put a video's idle frames behind its gesture frames, under a label of their own.
+
+    The two are stored in separate manifests because a video contributes a
+    different number of each, and a table where every video holds the same
+    number of rows is what both resuming an extraction and selecting a window
+    rest on. Training is where the two meet.
+
+    The idle rows arrive carrying the gesture of the clip they came from, which
+    is what extraction recorded and what leaves a question like "whose idle
+    frames are hardest" answerable later. Here that label is replaced. What the
+    model is asked is which of eight things a frame shows, and a body at rest is
+    the same answer whichever gesture it is about to perform.
+
+    Args:
+        gesture: Rows sampled across the gesture, already narrowed to whatever
+            the run trains on.
+        idle: Rows sampled before it, for the same videos.
+
+    Returns:
+        The two sets in one frame, gesture rows first, numbered from zero. The
+        numbering matters: the dataset serves rows by position, so a sampler
+        over this frame names positions in it.
+    """
+    return pd.concat(
+        [gesture, idle.assign(label=IDLE_LABEL, class_name=IDLE_CLASS_NAME)],
+        ignore_index=True,
+    )

@@ -6,6 +6,7 @@ import torch
 from dataset import (
     TEXTURE_FILLS,
     BackgroundRandomiser,
+    CombinedSampler,
     RandomGamma,
     SegmentSampler,
     TextureRandomiser,
@@ -13,6 +14,7 @@ from dataset import (
     solid_background,
     train_transform,
 )
+from manifest import IDLE_LABEL
 
 FRAMES_STORED = 24
 
@@ -431,3 +433,112 @@ def test_a_single_fill_uses_only_that_generator():
     for _ in range(20):
         person = randomiser(frame, silhouette)[silhouette].reshape(-1, 3)
         assert len(np.unique(person, axis=0)) == 1
+
+
+def mixed_manifest(videos, gesture_frames=16, idle_frames=4):
+    """Build a manifest holding both kinds of row, as training combines them.
+
+    Gesture rows come first for every video, then the idle rows, which is the
+    order the two manifests are concatenated in.
+    """
+    gesture = frame_manifest(videos, gesture_frames)
+    gesture["label"] = 0
+    idle = frame_manifest(videos, idle_frames)
+    idle["label"] = IDLE_LABEL
+
+    return pd.concat([gesture, idle], ignore_index=True)
+
+
+def test_a_sampler_over_part_of_a_frame_names_positions_in_the_whole_frame():
+    """The dataset serves the whole frame, so a slice's own numbering is wrong."""
+    manifest = mixed_manifest(videos=3)
+
+    drawn = list(SegmentSampler(manifest, 1, rows=manifest["label"] == IDLE_LABEL))
+
+    assert all(manifest.iloc[position]["label"] == IDLE_LABEL for position in drawn)
+    assert min(drawn) >= 3 * 16
+
+
+def test_a_sampler_over_part_of_a_frame_draws_one_per_block():
+    manifest = mixed_manifest(videos=3)
+
+    drawn = list(SegmentSampler(manifest, 2, rows=manifest["label"] == IDLE_LABEL))
+
+    assert len(drawn) == 6
+    assert len(set(drawn)) == 6
+
+
+def test_naming_every_row_draws_what_naming_none_draws():
+    """The selection has to be an addition, not a change to what was there."""
+    manifest = frame_manifest(videos=3)
+
+    without = list(SegmentSampler(manifest, 8, seed=1))
+    with_all = list(
+        SegmentSampler(manifest, 8, seed=1, rows=np.ones(len(manifest), bool))
+    )
+
+    assert without == with_all
+
+
+def test_the_two_kinds_of_row_are_counted_apart():
+    """Counted together, twenty rows a video would refuse to split into eight."""
+    manifest = mixed_manifest(videos=3)
+    is_gesture = manifest["label"] != IDLE_LABEL
+
+    gestures = SegmentSampler(manifest, 8, rows=is_gesture)
+    idle = SegmentSampler(manifest, 1, rows=~is_gesture)
+
+    assert len(gestures) == 24
+    assert len(idle) == 3
+
+
+def test_a_combined_epoch_holds_every_sampler_it_was_given():
+    manifest = mixed_manifest(videos=3)
+    is_gesture = manifest["label"] != IDLE_LABEL
+
+    combined = CombinedSampler(
+        [
+            SegmentSampler(manifest, 8, rows=is_gesture),
+            SegmentSampler(manifest, 1, rows=~is_gesture),
+        ]
+    )
+
+    drawn = list(combined)
+    assert len(combined) == 27
+    assert len(drawn) == 27
+    assert (
+        sum(manifest.iloc[position]["label"] == IDLE_LABEL for position in drawn) == 3
+    )
+
+
+def test_a_combined_epoch_mixes_the_kinds_rather_than_stacking_them():
+    """Stacked, the last batches would hold nothing but bodies at rest."""
+    manifest = mixed_manifest(videos=20)
+    is_gesture = manifest["label"] != IDLE_LABEL
+
+    drawn = list(
+        CombinedSampler(
+            [
+                SegmentSampler(manifest, 8, rows=is_gesture),
+                SegmentSampler(manifest, 1, rows=~is_gesture),
+            ]
+        )
+    )
+
+    kinds = [manifest.iloc[position]["label"] == IDLE_LABEL for position in drawn]
+    assert any(kinds[: len(kinds) // 2])
+
+
+def test_a_combined_epoch_draws_again_every_time():
+    """Extraction stored more than an epoch uses so the draw could move."""
+    manifest = mixed_manifest(videos=20)
+    is_gesture = manifest["label"] != IDLE_LABEL
+
+    combined = CombinedSampler(
+        [
+            SegmentSampler(manifest, 8, rows=is_gesture),
+            SegmentSampler(manifest, 1, rows=~is_gesture),
+        ]
+    )
+
+    assert list(combined) != list(combined)

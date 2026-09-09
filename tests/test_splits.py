@@ -2,7 +2,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from splits import EDGE_FRAMES, select_frames, split_by_group, split_by_scene
+from splits import (
+    EDGE_FRAMES,
+    add_idle_rows,
+    select_frames,
+    split_by_group,
+    split_by_scene,
+)
 
 REAL_SHAPE = [7, 7, 7, 5, 6, 8]
 
@@ -272,3 +278,53 @@ def test_a_video_too_short_to_trim_is_refused():
 
     with pytest.raises(ValueError, match="too few"):
         select_frames(manifest, "middle")
+
+
+def labelled_rows(video, label, class_name, frames, position):
+    """Build the manifest columns that adding the idle rows reads."""
+    return pd.DataFrame(
+        {
+            "video_id": [video] * frames,
+            "label": [label] * frames,
+            "class_name": [class_name] * frames,
+            "position": [position] * frames,
+        }
+    )
+
+
+def test_idle_rows_lose_the_gesture_they_came_from():
+    """What is asked is whether a body gestures, not which gesture follows."""
+    gesture = labelled_rows("v0", 4, "Halt", 3, 0.5)
+    idle = labelled_rows("v0", 4, "Halt", 2, -0.2)
+
+    combined = add_idle_rows(gesture, idle)
+
+    assert list(combined["label"]) == [4, 4, 4, 7, 7]
+    assert list(combined["class_name"]) == ["Halt"] * 3 + ["Idle"] * 2
+
+
+def test_the_gesture_rows_keep_their_label():
+    gesture = labelled_rows("v0", 4, "Halt", 3, 0.5)
+    idle = labelled_rows("v0", 4, "Halt", 2, -0.2)
+
+    combined = add_idle_rows(gesture, idle)
+
+    assert list(combined.iloc[:3]["label"]) == [4, 4, 4]
+
+
+def test_the_combined_rows_are_numbered_from_zero():
+    """The dataset serves rows by position, so a sampler names positions in this."""
+    gesture = labelled_rows("v0", 4, "Halt", 3, 0.5).iloc[[1, 2]]
+    idle = labelled_rows("v0", 4, "Halt", 2, -0.2).iloc[[1]]
+
+    combined = add_idle_rows(gesture, idle)
+
+    assert list(combined.index) == [0, 1, 2]
+
+
+def test_adding_idle_rows_leaves_the_table_it_was_given():
+    idle = labelled_rows("v0", 4, "Halt", 2, -0.2)
+
+    add_idle_rows(labelled_rows("v0", 4, "Halt", 3, 0.5), idle)
+
+    assert list(idle["label"]) == [4, 4]
