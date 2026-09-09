@@ -494,6 +494,139 @@ class EarlyStopping:
         return self.epochs_without_improvement >= self.patience
 
 
+# Options a resumed run may differ in without describing a different run. The
+# worker count is machine bookkeeping; everything else defines the experiment,
+# so a change in any of it means the saved progress belongs to another run.
+INCIDENTAL_OPTIONS = {"num_workers"}
+
+
+def save_atomically(state: dict, path: Path) -> None:
+    """Write a checkpoint so that a crash cannot leave half of one behind.
+
+    Saving takes long enough on a file this size for the machine to die partway
+    through it, and a truncated checkpoint is worse than none: it exists, so
+    everything downstream treats it as real and fails later, somewhere else.
+    Writing beside the target and renaming afterwards makes the swap atomic, so
+    the file is either the previous one or the new one and never a mixture.
+
+    Args:
+        state: What to save.
+        path: Where it belongs. Its directory is created if missing.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    beside = path.with_suffix(".partial")
+    torch.save(state, beside)
+    beside.replace(path)
+
+
+def save_progress(
+    path: Path,
+    epochs_done: int,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    stopper: "EarlyStopping",
+    sampler,
+    arguments: argparse.Namespace,
+) -> None:
+    """Record everything a run would need to carry on from where it is.
+
+    Four things move between epochs and all four have to travel together. The
+    weights are the obvious one. The optimizer holds the running moments Adam
+    accumulates, and a run restarted without them takes its next steps as if
+    from a standing start. The stopper holds the best loss seen and how long
+    ago, which is what decides when to give up. The sampler holds where the
+    frame draw has got to.
+
+    The options are recorded alongside them so that progress can be recognised
+    as belonging to this run and no other. It is the same file name for every
+    repetition of a configuration, and silently carrying on from a different
+    one is the kind of mistake that shows up only as a number that will not
+    reproduce.
+
+    Args:
+        path: Where to write. Overwritten atomically each epoch.
+        epochs_done: How many epochs have finished, so the next one is this.
+        model: The network, as it stands.
+        optimizer: The optimizer, with its accumulated moments.
+        stopper: The early-stopping state.
+        sampler: The training sampler, which knows where its draw has got to.
+        arguments: The parsed command line, kept for the identity check.
+    """
+    save_atomically(
+        {
+            "epochs_done": epochs_done,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "best_loss": stopper.best_loss,
+            "epochs_without_improvement": stopper.epochs_without_improvement,
+            "sampler": sampler.state_dict(),
+            "arguments": vars(arguments),
+        },
+        path,
+    )
+
+
+def load_progress(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    stopper: "EarlyStopping",
+    sampler,
+    arguments: argparse.Namespace,
+) -> int:
+    """Put a run back where it stopped, and say which epoch is next.
+
+    What comes back is a continuation, not a reproduction. This machine's GPU is
+    not deterministic — two identical runs of it already differ by more than
+    most treatments do — so no amount of saved state would make a resumed run
+    retrace the one that was interrupted. What the state buys is that the
+    resumed run is drawn from the same distribution as an uninterrupted one
+    rather than a narrower one: the draw carries on instead of replaying, and
+    the optimizer keeps its momentum instead of restarting cold.
+
+    Args:
+        path: Where progress was written. Missing means there is none, which is
+            the ordinary case and not an error.
+        model: The network to load into, modified in place.
+        optimizer: The optimizer to load into, modified in place.
+        stopper: The early-stopping state to restore, modified in place.
+        sampler: The training sampler to restore, modified in place.
+        arguments: The parsed command line, checked against the saved one.
+
+    Returns:
+        The number of epochs already finished. Zero when there is nothing to
+        resume, so a caller can always start its loop there.
+
+    Raises:
+        RuntimeError: If the saved progress was written by a run configured
+            differently. Carrying on regardless would train one configuration
+            on top of another and report the result as either.
+    """
+    if not path.exists():
+        return 0
+
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+
+    differences = sorted(
+        option
+        for option, value in vars(arguments).items()
+        if option not in INCIDENTAL_OPTIONS and saved["arguments"].get(option) != value
+    )
+    if differences:
+        raise RuntimeError(
+            f"{path.name} was written by a run with a different "
+            f"{', '.join(differences)}. Delete it to start this one over."
+        )
+
+    model.load_state_dict(saved["model"])
+    optimizer.load_state_dict(saved["optimizer"])
+    stopper.best_loss = saved["best_loss"]
+    stopper.epochs_without_improvement = saved["epochs_without_improvement"]
+    sampler.load_state_dict(saved["sampler"])
+
+    return saved["epochs_done"]
+
+
 def build_criteria(label_smoothing: float) -> tuple[nn.Module, nn.Module]:
     """Build the loss training minimises and the loss validation is scored with.
 
@@ -667,7 +800,19 @@ if __name__ == "__main__":
 
     stopper = EarlyStopping(args.patience)
 
-    for epoch in range(args.max_epochs):
+    # Named beside the checkpoint it belongs to, and deleted when the run ends,
+    # so its presence is exactly the statement "this run was cut off".
+    progress_path = checkpoint_dir / f"{Path(best_name).stem}_progress.pt"
+    epochs_done = load_progress(
+        progress_path, model, optimizer, stopper, train_loader.sampler, args
+    )
+    if epochs_done:
+        print(
+            f"resuming after epoch {epochs_done}, best validation loss so far "
+            f"{stopper.best_loss:.4f}"
+        )
+
+    for epoch in range(epochs_done, args.max_epochs):
         loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device, frozen
         )
@@ -681,15 +826,27 @@ if __name__ == "__main__":
         )
 
         if stopper.improved(eval_loss):
-            torch.save(model.state_dict(), checkpoint_dir / best_name)
+            save_atomically(model.state_dict(), checkpoint_dir / best_name)
             print("  best so far, checkpoint written")
 
         if args.save_every_epoch:
-            torch.save(
+            save_atomically(
                 model.state_dict(),
                 checkpoint_dir
                 / checkpoint_name(args.checkpoint_name, args.seed, epoch + 1),
             )
+
+        # Last, so that progress is only claimed for an epoch whose checkpoint
+        # is already on disk.
+        save_progress(
+            progress_path,
+            epoch + 1,
+            model,
+            optimizer,
+            stopper,
+            train_loader.sampler,
+            args,
+        )
 
         if stopper.exhausted:
             print(f"stopped: {args.patience} epochs without improvement")
@@ -705,3 +862,8 @@ if __name__ == "__main__":
             "still improving" if past_best == 0 else f"{past_best} epochs past its best"
         )
         print(f"stopped: reached the {args.max_epochs}-epoch cap, {state}")
+
+    # However the loop ended, it ended: what is left on disk is the best
+    # checkpoint, and progress that describes a finished run would only mislead
+    # the next one launched under the same name.
+    progress_path.unlink(missing_ok=True)

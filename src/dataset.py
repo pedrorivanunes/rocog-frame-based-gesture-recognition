@@ -721,6 +721,25 @@ class SegmentSampler(Sampler[int]):
         """Count the frames one epoch draws, which is the length the loader reports."""
         return len(self.blocks) * self.frames_per_video
 
+    def state_dict(self) -> dict:
+        """Where the draw has got to, so a resumed run carries on rather than repeats.
+
+        One generator serves every epoch, and each draws from where the last one
+        left off — that is what makes an epoch meet different frames from the one
+        before it. A run restarted from a saved model but a fresh generator would
+        replay the first epoch's draw, and its later epochs would see a narrower
+        slice of the stored frames than an uninterrupted run does.
+        """
+        return self.rng.bit_generator.state
+
+    def load_state_dict(self, state: dict) -> None:
+        """Put the draw back where it was.
+
+        Args:
+            state: What ``state_dict`` returned.
+        """
+        self.rng.bit_generator.state = state
+
     def __iter__(self):
         """Draw one frame from every block of every video, in shuffled order.
 
@@ -767,6 +786,28 @@ class CombinedSampler(Sampler[int]):
     def __len__(self) -> int:
         """Count the frames one epoch draws, which is the length the loader reports."""
         return sum(len(sampler) for sampler in self.samplers)
+
+    def state_dict(self) -> dict:
+        """Where every draw has got to: this sampler's shuffle and each part's.
+
+        Three generators run here, not one — the two kinds of row draw from their
+        own, and the shuffle that mixes them draws from a third. Saving only one
+        would leave a resumed run half where it was.
+        """
+        return {
+            "shuffle": self.rng.bit_generator.state,
+            "parts": [sampler.state_dict() for sampler in self.samplers],
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Put every draw back where it was.
+
+        Args:
+            state: What ``state_dict`` returned.
+        """
+        self.rng.bit_generator.state = state["shuffle"]
+        for sampler, part in zip(self.samplers, state["parts"], strict=True):
+            sampler.load_state_dict(part)
 
     def __iter__(self):
         """Draw from every sampler and shuffle the lot together."""

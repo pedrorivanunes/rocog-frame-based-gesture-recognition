@@ -4,6 +4,7 @@ import torch
 from torch import nn
 from torchvision.models import resnet18
 
+from dataset import SegmentSampler
 from manifest import IDLE_LABEL
 from model import freeze
 from train import (
@@ -11,7 +12,10 @@ from train import (
     build_criteria,
     build_loaders,
     checkpoint_name,
+    load_progress,
     parse_args,
+    save_atomically,
+    save_progress,
     train_one_epoch,
 )
 
@@ -348,3 +352,98 @@ def test_rows_of_one_kind_are_drawn_by_one_sampler(tmp_path):
     )
 
     assert len(train_loader.sampler) == 3 * 8
+
+
+def resumable():
+    """A network, an optimizer, a stopper and a sampler, as a run holds them."""
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    stopper = EarlyStopping(patience=3)
+    rows = pd.concat([rows_for(f"v{v}", 0, 8) for v in range(4)], ignore_index=True)
+
+    return model, optimizer, stopper, SegmentSampler(rows, 4, seed=5)
+
+
+def test_a_saved_file_is_whole_or_absent(tmp_path):
+    """A checkpoint written over hours of work must never come back truncated."""
+    path = tmp_path / "run.pt"
+    save_atomically({"a": 1}, path)
+    save_atomically({"a": 2}, path)
+
+    assert torch.load(path, weights_only=False) == {"a": 2}
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_nothing_to_resume_starts_at_the_first_epoch(tmp_path):
+    """The ordinary case: no progress on disk is not an error."""
+    model, optimizer, stopper, sampler = resumable()
+
+    done = load_progress(
+        tmp_path / "absent.pt", model, optimizer, stopper, sampler, parse_args([])
+    )
+
+    assert done == 0
+
+
+def test_a_resumed_run_carries_on_from_where_it_stopped(tmp_path):
+    path = tmp_path / "run_progress.pt"
+    model, optimizer, stopper, sampler = resumable()
+    stopper.improved(0.8)
+    stopper.improved(0.9)
+
+    save_progress(path, 7, model, optimizer, stopper, sampler, parse_args([]))
+
+    later, later_optimizer, later_stopper, later_sampler = resumable()
+    done = load_progress(
+        path, later, later_optimizer, later_stopper, later_sampler, parse_args([])
+    )
+
+    assert done == 7
+    assert later_stopper.best_loss == 0.8
+    assert later_stopper.epochs_without_improvement == 1
+    assert torch.equal(later.weight, model.weight)
+
+
+def test_a_resumed_draw_continues_instead_of_replaying(tmp_path):
+    """Replaying would narrow the frames a run meets, which no clean run does."""
+    path = tmp_path / "run_progress.pt"
+    model, optimizer, stopper, sampler = resumable()
+    for _ in range(2):
+        list(sampler)
+    save_progress(path, 2, model, optimizer, stopper, sampler, parse_args([]))
+    uninterrupted = list(sampler)
+
+    fresh = resumable()
+    load_progress(path, *fresh, parse_args([]))
+
+    assert list(fresh[3]) == uninterrupted
+
+
+def test_progress_from_a_differently_configured_run_is_refused(tmp_path):
+    """Same name, other flags: carrying on would train one cell inside another."""
+    path = tmp_path / "run_progress.pt"
+    model, optimizer, stopper, sampler = resumable()
+    save_progress(path, 3, model, optimizer, stopper, sampler, parse_args([]))
+
+    with pytest.raises(RuntimeError, match="different .*seed"):
+        load_progress(
+            path, model, optimizer, stopper, sampler, parse_args(["--seed", "2"])
+        )
+
+
+def test_a_different_worker_count_is_not_a_different_run(tmp_path):
+    """How many loader processes a machine spares says nothing about the run."""
+    path = tmp_path / "run_progress.pt"
+    model, optimizer, stopper, sampler = resumable()
+    save_progress(path, 3, model, optimizer, stopper, sampler, parse_args([]))
+
+    done = load_progress(
+        path,
+        model,
+        optimizer,
+        stopper,
+        sampler,
+        parse_args(["--num-workers", "0"]),
+    )
+
+    assert done == 3
