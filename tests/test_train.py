@@ -234,6 +234,31 @@ def test_the_measured_baseline_curve_would_not_stop_early():
     assert stopper.best_loss == 0.6294
 
 
+def test_a_run_that_peaked_early_is_not_reported_as_still_improving():
+    """The epoch budget running out is not evidence of anything.
+
+    With patience as large as the budget, patience can never run out, so the
+    loop finishing says nothing about whether the run was still gaining. The
+    count of epochs since the best one is what does.
+    """
+    stopper = EarlyStopping(patience=15)
+    stopper.improved(1.0)
+    for _ in range(4):
+        stopper.improved(2.0)
+
+    assert not stopper.exhausted
+    assert stopper.epochs_without_improvement == 4
+
+
+def test_a_run_whose_last_epoch_was_its_best_was_still_improving():
+    stopper = EarlyStopping(patience=15)
+    stopper.improved(1.0)
+    stopper.improved(2.0)
+    stopper.improved(0.5)
+
+    assert stopper.epochs_without_improvement == 0
+
+
 def test_an_epoch_leaves_a_frozen_stage_exactly_as_it_found_it():
     """The integration the sweep depends on: freeze applied, epoch run, nothing moved.
 

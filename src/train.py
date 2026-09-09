@@ -675,4 +675,13 @@ if __name__ == "__main__":
             print(f"stopped: {args.patience} epochs without improvement")
             break
     else:
-        print(f"stopped: reached the {args.max_epochs}-epoch cap, still improving")
+        # Reaching the cap says only that patience never ran out, and with a
+        # patience as large as the budget it never can — so the loop finishing
+        # is not evidence that the run was still gaining. Whether it was is a
+        # separate fact, and the stopper already holds it: an epoch count of
+        # zero means the last epoch was the best one seen.
+        past_best = stopper.epochs_without_improvement
+        state = (
+            "still improving" if past_best == 0 else f"{past_best} epochs past its best"
+        )
+        print(f"stopped: reached the {args.max_epochs}-epoch cap, {state}")
