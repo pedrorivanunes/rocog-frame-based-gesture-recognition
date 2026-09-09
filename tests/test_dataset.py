@@ -5,6 +5,7 @@ import torch
 
 from dataset import (
     TEXTURE_FILLS,
+    Augmentation,
     BackgroundRandomiser,
     CombinedSampler,
     RandomGamma,
@@ -281,9 +282,9 @@ def test_gamma_rejects_an_impossible_range(bad):
 
 def test_train_transform_adds_the_shift_only_when_asked():
     """Omitting it has to reproduce the pipeline every earlier run used."""
-    without = train_transform(photometric=True, geometric=True)
+    without = train_transform(Augmentation(photometric=True, geometric=True))
     with_shift = train_transform(
-        photometric=True, geometric=True, gamma_shift=(1.6, 2.4)
+        Augmentation(photometric=True, geometric=True, gamma_shift=(1.6, 2.4))
     )
 
     kinds = [type(step).__name__ for step in with_shift.transforms]
@@ -297,7 +298,7 @@ def test_the_shift_runs_before_normalising():
     """Gamma after normalisation would act on a signed scale, not on grey levels."""
     kinds = [
         type(step).__name__
-        for step in train_transform(gamma_shift=(1.6, 2.4)).transforms
+        for step in train_transform(Augmentation(gamma_shift=(1.6, 2.4))).transforms
     ]
 
     assert kinds.index("RandomGamma") < kinds.index("Normalize")
@@ -542,3 +543,12 @@ def test_a_combined_epoch_draws_again_every_time():
     )
 
     assert list(combined) != list(combined)
+
+
+def test_a_treatment_is_off_until_a_run_asks_for_it():
+    """An option that arrived on would make every run before it incomparable."""
+    standard = Augmentation()
+
+    assert standard.background == 0.0
+    assert standard.texture == "none"
+    assert standard.gamma_shift is None

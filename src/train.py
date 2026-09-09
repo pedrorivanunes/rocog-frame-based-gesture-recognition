@@ -14,9 +14,11 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from dataset import (
+    DEFAULT_AUGMENTATION,
     SAMPLER_SEED,
     TEXTURE_FILLS,
     TEXTURES,
+    Augmentation,
     BackgroundRandomiser,
     CombinedSampler,
     FrameDataset,
@@ -56,31 +58,13 @@ SEED = 0
 NUM_WORKERS = 12
 MAX_EPOCHS = 15
 PATIENCE = 3
-PHOTOMETRIC = True
-GEOMETRIC = True
-# Off by default: every run measured so far trained on the scenes as
-# rendered, and a default that silently changed the input would make the
-# new runs incomparable to them.
-BACKGROUND = 0.0
-# Off for the same reason as BACKGROUND: every run recorded so far trained
-# against hard targets, and a default that softened them would make the runs
-# after this option incomparable to the ones before it.
+# The rule behind every default below, and behind the ones DEFAULT_AUGMENTATION
+# carries: an option arrives off. Each run recorded so far was made without it,
+# and a default that turned it on would make every run after the option
+# incomparable to every run before it. Turning one on is therefore always a
+# deliberate act, visible in the command that made the run.
 LABEL_SMOOTHING = 0.0
-# None, not a range: every run recorded so far left tone to the symmetric
-# jitter, and a default range would silently make them incomparable.
-GAMMA_SHIFT = None
-# Same reason once more: every run recorded so far trained the whole network,
-# and freezing by default would make the runs after this option incomparable to
-# the ones before it.
 FREEZE = "none"
-# And again: every run recorded so far met the person as rendered, so replacing
-# its appearance by default would make the runs after this option incomparable
-# to the ones before it.
-TEXTURE = "none"
-TEXTURE_FILL = "both"
-# And once more: every run recorded so far trained on the whole annotated
-# window, so narrowing it by default would make the runs after this option
-# incomparable to the ones before it.
 WINDOW = "full"
 CHECKPOINT_NAME = "syn_ground_train.pt"
 MANIFEST = "syn_ground_train.csv"
@@ -193,19 +177,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--photometric",
         action=argparse.BooleanOptionalAction,
-        default=PHOTOMETRIC,
+        default=DEFAULT_AUGMENTATION.photometric,
         help="jitter brightness and contrast while training",
     )
     parser.add_argument(
         "--geometric",
         action=argparse.BooleanOptionalAction,
-        default=GEOMETRIC,
+        default=DEFAULT_AUGMENTATION.geometric,
         help="flip and vary the crop scale while training",
     )
     parser.add_argument(
         "--background",
         type=float,
-        default=BACKGROUND,
+        default=DEFAULT_AUGMENTATION.background,
         metavar="PROBABILITY",
         help="chance of replacing a training frame's scene with a random solid "
         "colour or noise, from 0 to 1; evaluation is never composited",
@@ -214,7 +198,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--gamma-shift",
         type=float,
         nargs=2,
-        default=GAMMA_SHIFT,
+        default=DEFAULT_AUGMENTATION.gamma_shift,
         metavar=("LOW", "HIGH"),
         help="draw a gamma exponent from this range while training, on top of "
         "the jitter. Above 1 darkens the midtones, which is where the rendered "
@@ -244,7 +228,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--texture",
         choices=TEXTURES,
-        default=TEXTURE,
+        default=DEFAULT_AUGMENTATION.texture,
         metavar="MODE",
         help="replace what the person is made of while training: blend mixes "
         "the person toward a random fill by a random amount, replace always "
@@ -255,7 +239,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--texture-fill",
         choices=sorted(TEXTURE_FILLS),
-        default=TEXTURE_FILL,
+        default=DEFAULT_AUGMENTATION.texture_fill,
         metavar="KIND",
         help="what the replacement is made of: both draws between a flat "
         "colour and pixel noise, and naming one alone asks which of the two "
@@ -345,12 +329,7 @@ def build_loaders(
     num_workers: int = NUM_WORKERS,
     frames_per_epoch: int = FRAMES_PER_EPOCH,
     idle_frames_per_epoch: int = IDLE_FRAMES_PER_EPOCH,
-    photometric: bool = PHOTOMETRIC,
-    geometric: bool = GEOMETRIC,
-    background: float = BACKGROUND,
-    texture: str = TEXTURE,
-    texture_fill: str = TEXTURE_FILL,
-    gamma_shift: tuple[float, float] | None = GAMMA_SHIFT,
+    augmentation: Augmentation = DEFAULT_AUGMENTATION,
     seed: int = SEED,
 ) -> tuple[DataLoader, DataLoader]:
     """Build the training and evaluation loaders from two sets of manifest rows.
@@ -375,25 +354,11 @@ def build_loaders(
         frames_per_epoch: Frames drawn from each training video per epoch. The
             sampler shuffles, so the loader must not — passing a sampler and
             ``shuffle=True`` together is rejected by the DataLoader.
-        photometric: Whether training jitters brightness and contrast. Only the
-            training pipeline is affected; evaluation stays fixed, so successive
-            runs are measured against the same images.
-        geometric: Whether training flips and varies the crop's scale. Same
-            restriction — training only.
-        background: Chance of replacing a training frame's scene, 0 to 1. Zero
-            builds no randomiser at all, so a run that does not ask for this
-            never reads a silhouette. Evaluation is never composited: the real
-            test footage has no segmentation, and a model has to meet its scenes
-            as they are.
-        texture: Which replacement the training pipeline applies inside the
-            person, or ``none`` to leave the person as rendered. Training only,
-            and for the same reason as the background: it needs a silhouette,
-            and the real footage has none.
-        texture_fill: Which fills the replacement draws between. Separating them
-            is how a run asks which of the two a result rests on.
-        gamma_shift: Range the training pipeline draws a gamma exponent from,
-            or ``None`` to leave tone to the jitter. Training only, like the
-            rest: evaluation meets its frames as they are.
+        augmentation: What training does to a frame before the model sees it.
+            The training loader alone reads it; evaluation meets its frames as
+            they are, so that successive runs are measured against the same
+            images. Two of its treatments need a silhouette, which the real
+            footage has none of — a second reason they never reach evaluation.
         seed: Which repetition of a configuration this is. Offsets the sampler's
             own seed rather than replacing it, so that seed 0 keeps drawing the
             frames earlier runs drew and stays comparable to them.
@@ -404,11 +369,17 @@ def build_loaders(
     train_dataset = FrameDataset(
         train_manifest,
         data_root,
-        transform=train_transform(photometric, geometric, gamma_shift),
-        background=BackgroundRandomiser(background) if background else None,
+        transform=train_transform(augmentation),
+        background=(
+            BackgroundRandomiser(augmentation.background)
+            if augmentation.background
+            else None
+        ),
         texture=(
-            TextureRandomiser(texture, kinds=TEXTURE_FILLS[texture_fill])
-            if texture != "none"
+            TextureRandomiser(
+                augmentation.texture, kinds=TEXTURE_FILLS[augmentation.texture_fill]
+            )
+            if augmentation.texture != "none"
             else None
         ),
     )
@@ -613,6 +584,15 @@ if __name__ == "__main__":
         train_manifest = add_idle_rows(train_manifest, idle_train)
         num_classes = IDLE_LABEL + 1
 
+    augmentation = Augmentation(
+        photometric=args.photometric,
+        geometric=args.geometric,
+        background=args.background,
+        texture=args.texture,
+        texture_fill=args.texture_fill,
+        gamma_shift=args.gamma_shift,
+    )
+
     print(f"manifest {args.manifest}  validation groups: {' '.join(held_out)}")
     print(
         f"train {train_manifest['video_id'].nunique()} videos / "
@@ -621,12 +601,13 @@ if __name__ == "__main__":
     )
     best_name = checkpoint_name(args.checkpoint_name, args.seed)
     print(
-        f"seed {args.seed}  photometric {args.photometric}  "
-        f"geometric {args.geometric}  background {args.background}  "
+        f"seed {args.seed}  photometric {augmentation.photometric}  "
+        f"geometric {augmentation.geometric}  "
+        f"background {augmentation.background}  "
         f"label smoothing {args.label_smoothing}  "
-        f"gamma shift {args.gamma_shift}  "
+        f"gamma shift {augmentation.gamma_shift}  "
         f"freeze {args.freeze}  "
-        f"texture {args.texture}/{args.texture_fill}  "
+        f"texture {augmentation.texture}/{augmentation.texture_fill}  "
         f"window {args.window} ({len(train_manifest)} training frames)  "
         f"idle {args.idle_manifest or 'off'} ({num_classes} classes)  "
         f"lr {args.lr}  "
@@ -641,12 +622,7 @@ if __name__ == "__main__":
         eval_manifest,
         PROJECT_ROOT,
         args.num_workers,
-        photometric=args.photometric,
-        geometric=args.geometric,
-        background=args.background,
-        texture=args.texture,
-        texture_fill=args.texture_fill,
-        gamma_shift=args.gamma_shift,
+        augmentation=augmentation,
         seed=args.seed,
     )
 

@@ -7,6 +7,7 @@ the manifest is how a run picks a domain, a split, a viewpoint or a subset.
 """
 
 from pathlib import Path
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -188,6 +189,53 @@ TEXTURES = ("none", "blend", "replace", "everywhere")
 TEXTURE_FILLS = {"both": ("solid", "noise"), "solid": ("solid",), "noise": ("noise",)}
 
 
+class Augmentation(NamedTuple):
+    """What training does to a frame before the model sees it.
+
+    These travel together and always have. Every one of them is read by the
+    training pipeline and by none of the evaluation one, which meets its frames
+    as they are so that successive runs are measured against the same images.
+    Carrying them as one value is what keeps a new treatment to a field added
+    here, rather than to a parameter threaded through the command line, the
+    loader builder and the transform that finally reads it.
+
+    **Every treatment is off by default, and for a single reason:** each run
+    recorded so far met its frames without it, and a default that applied it
+    would make the runs after the option incomparable to the ones before. The
+    jitter pair is on because it was on before either was an option, which is
+    the same rule seen from the other side.
+
+    Attributes:
+        photometric: Whether to jitter brightness, contrast, saturation and hue.
+        geometric: Whether to flip horizontally and vary the crop's scale. The
+            fixed-size random crop is replaced rather than added to, so that
+            exactly one crop happens either way.
+        background: Chance of replacing the scene behind the person, 0 to 1.
+            Zero builds no randomiser at all, so a run that does not ask for
+            this never reads a silhouette.
+        texture: Which replacement to apply inside the person, or ``none`` to
+            leave the person as rendered. Needs a silhouette, like the
+            background.
+        texture_fill: What that replacement draws between. Separating it from
+            the mode is how a run asks which of the two a result rests on.
+        gamma_shift: Range the gamma exponent is drawn from, or ``None`` to
+            leave tone to the jitter alone.
+    """
+
+    photometric: bool = True
+    geometric: bool = True
+    background: float = 0.0
+    texture: str = "none"
+    texture_fill: str = "both"
+    gamma_shift: tuple[float, float] | None = None
+
+
+# The standard run: the jitter pair and nothing else. Named so that a caller can
+# take it without restating it, and so that "the default" is one value with one
+# place to read it rather than a row of arguments repeated at every call.
+DEFAULT_AUGMENTATION = Augmentation()
+
+
 class TextureRandomiser:
     """Replace the appearance inside the person, some of the time.
 
@@ -364,9 +412,7 @@ class RandomGamma:
 
 
 def train_transform(
-    photometric: bool = True,
-    geometric: bool = False,
-    gamma_shift: tuple[float, float] | None = None,
+    augmentation: Augmentation = DEFAULT_AUGMENTATION,
 ) -> v2.Transform:
     """Pipeline used while training: the crop position is drawn at random.
 
@@ -395,32 +441,32 @@ def train_transform(
     and exactly one thing changes against the runs it is compared to. See
     ``RandomGamma`` for why.
 
+    The background and texture treatments are not built here. Both composite a
+    frame against its silhouette, which is a second file the transform is never
+    handed — ``FrameDataset`` reads it and applies them before this pipeline
+    runs. They are still part of the same value because they are part of the
+    same question: what a training frame looks like.
+
     Args:
-        photometric: Whether to jitter brightness, contrast, saturation and hue.
-            Off reproduces the earlier runs, which is what makes them comparable.
-        geometric: Whether to flip horizontally and vary the crop's scale. The
-            fixed-size random crop is replaced rather than added to, so that
-            exactly one crop happens either way.
-        gamma_shift: Range the gamma exponent is drawn from, or ``None`` to
-            leave tone to the jitter alone, which is what every run before this
-            option did.
+        augmentation: What to apply. The default applies the jitter pair alone,
+            which is what every run did before any of the rest was an option.
 
     Returns:
         The pipeline, ready to apply to a frame.
     """
     crop = (
         v2.RandomResizedCrop(CROP_SIZE, scale=GEOMETRIC_SCALE, ratio=GEOMETRIC_RATIO)
-        if geometric
+        if augmentation.geometric
         else v2.RandomCrop(CROP_SIZE)
     )
 
     steps = [v2.ToImage(), crop]
-    if geometric:
+    if augmentation.geometric:
         steps.append(v2.RandomHorizontalFlip())
-    if photometric:
+    if augmentation.photometric:
         steps.append(v2.ColorJitter(**PHOTOMETRIC_JITTER))
-    if gamma_shift:
-        steps.append(RandomGamma(gamma_shift))
+    if augmentation.gamma_shift:
+        steps.append(RandomGamma(augmentation.gamma_shift))
     steps += [
         v2.ToDtype(torch.float32, scale=True),
         v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
