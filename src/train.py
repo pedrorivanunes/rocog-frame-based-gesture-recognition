@@ -14,6 +14,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from dataset import (
+    CROP_SIZE,
     DEFAULT_AUGMENTATION,
     SAMPLER_SEED,
     TEXTURE_FILLS,
@@ -237,6 +238,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "to the person is the point. Needs silhouettes, so training only",
     )
     parser.add_argument(
+        "--crop-size",
+        type=int,
+        default=CROP_SIZE,
+        metavar="PIXELS",
+        help="side the crop takes from each stored frame. Follows the tree the "
+        "manifest points at, leaving the same margin the default leaves on a "
+        "256-pixel frame; a crop that is not a margin on those frames is "
+        "refused rather than trained on",
+    )
+    parser.add_argument(
         "--texture-fill",
         choices=sorted(TEXTURE_FILLS),
         default=DEFAULT_AUGMENTATION.texture_fill,
@@ -330,6 +341,7 @@ def build_loaders(
     frames_per_epoch: int = FRAMES_PER_EPOCH,
     idle_frames_per_epoch: int = IDLE_FRAMES_PER_EPOCH,
     augmentation: Augmentation = DEFAULT_AUGMENTATION,
+    crop_size: int = CROP_SIZE,
     seed: int = SEED,
 ) -> tuple[DataLoader, DataLoader]:
     """Build the training and evaluation loaders from two sets of manifest rows.
@@ -358,7 +370,11 @@ def build_loaders(
             The training loader alone reads it; evaluation meets its frames as
             they are, so that successive runs are measured against the same
             images. Two of its treatments need a silhouette, which the real
-            footage has none of — a second reason they never reach evaluation.
+            footage has none of - a second reason they never reach evaluation.
+        crop_size: Side both pipelines crop to. Shared rather than augmented,
+            because it is not a treatment: it says how much of a stored frame
+            the model sees, and training and evaluation have to agree on that
+            or the model meets a field of view it never learnt on.
         seed: Which repetition of a configuration this is. Offsets the sampler's
             own seed rather than replacing it, so that seed 0 keeps drawing the
             frames earlier runs drew and stays comparable to them.
@@ -369,7 +385,7 @@ def build_loaders(
     train_dataset = FrameDataset(
         train_manifest,
         data_root,
-        transform=train_transform(augmentation),
+        transform=train_transform(augmentation, crop_size),
         background=(
             BackgroundRandomiser(augmentation.background)
             if augmentation.background
@@ -383,7 +399,9 @@ def build_loaders(
             else None
         ),
     )
-    eval_dataset = FrameDataset(eval_manifest, data_root, transform=eval_transform())
+    eval_dataset = FrameDataset(
+        eval_manifest, data_root, transform=eval_transform(crop_size)
+    )
 
     # Two draws rather than one when the rows carry both kinds. A video holds a
     # different number of each, so counting them together would refuse to split
@@ -609,6 +627,7 @@ if __name__ == "__main__":
         f"freeze {args.freeze}  "
         f"texture {augmentation.texture}/{augmentation.texture_fill}  "
         f"window {args.window} ({len(train_manifest)} training frames)  "
+        f"crop {args.crop_size}  "
         f"idle {args.idle_manifest or 'off'} ({num_classes} classes)  "
         f"lr {args.lr}  "
         f"max epochs {args.max_epochs}  "
@@ -623,6 +642,7 @@ if __name__ == "__main__":
         PROJECT_ROOT,
         args.num_workers,
         augmentation=augmentation,
+        crop_size=args.crop_size,
         seed=args.seed,
     )
 

@@ -149,6 +149,30 @@ def sized_path_for(frame_path: Path, size: int) -> Path:
     return Path(*parts)
 
 
+def stored_size_for(frame_path: Path) -> int:
+    """Read back the side length a frame was stored at, from where it sits.
+
+    The inverse of ``sized_path_for``, and it exists because the crop a run
+    takes has to be checked against the frame it is taken from. A crop is a
+    margin, not a zoom: 224 out of 256 leaves the subject where it was and
+    trims the border, while 224 out of 640 keeps a third of the width and
+    throws the rest away. The second is what a forgotten option looks like,
+    and nothing downstream would show it — the run would train and score and
+    report a plausible number.
+
+    Args:
+        frame_path: The frame's path, as the manifest stores it.
+
+    Returns:
+        The side length in pixels. A path with no size in it names the tree
+        extraction wrote, which is the default size.
+    """
+    parts = Path(frame_path).parts
+    after_frames = parts[parts.index("frames") + 1]
+
+    return int(after_frames) if after_frames.isdigit() else FRAME_SIZE
+
+
 def with_idle_class(class_names: dict[int, str]) -> dict[int, str]:
     """Add the idle class to a label-to-name mapping.
 

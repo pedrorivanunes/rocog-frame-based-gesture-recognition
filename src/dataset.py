@@ -16,7 +16,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import v2
 
-from manifest import mask_path_for
+from manifest import FRAME_SIZE, mask_path_for, stored_size_for
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -413,6 +413,7 @@ class RandomGamma:
 
 def train_transform(
     augmentation: Augmentation = DEFAULT_AUGMENTATION,
+    crop_size: int = CROP_SIZE,
 ) -> v2.Transform:
     """Pipeline used while training: the crop position is drawn at random.
 
@@ -450,14 +451,17 @@ def train_transform(
     Args:
         augmentation: What to apply. The default applies the jitter pair alone,
             which is what every run did before any of the rest was an option.
+        crop_size: Side the crop takes, in pixels. Follows the size the frames
+            were stored at, leaving the same margin: the stored frame is what
+            decides how much detail there is to crop from.
 
     Returns:
         The pipeline, ready to apply to a frame.
     """
     crop = (
-        v2.RandomResizedCrop(CROP_SIZE, scale=GEOMETRIC_SCALE, ratio=GEOMETRIC_RATIO)
+        v2.RandomResizedCrop(crop_size, scale=GEOMETRIC_SCALE, ratio=GEOMETRIC_RATIO)
         if augmentation.geometric
-        else v2.RandomCrop(CROP_SIZE)
+        else v2.RandomCrop(crop_size)
     )
 
     steps = [v2.ToImage(), crop]
@@ -475,19 +479,67 @@ def train_transform(
     return v2.Compose(steps)
 
 
-def eval_transform() -> v2.Transform:
+def eval_transform(crop_size: int = CROP_SIZE) -> v2.Transform:
     """Pipeline used for validation and testing: the crop is fixed and central.
 
     Evaluation must be reproducible, so nothing here is random.
+
+    Args:
+        crop_size: Side the crop takes, in pixels. Has to match what training
+            used, or the model meets a field of view it never learnt on.
     """
     return v2.Compose(
         [
             v2.ToImage(),
-            v2.CenterCrop(CROP_SIZE),
+            v2.CenterCrop(crop_size),
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
     )
+
+
+# How much of a stored frame a crop may leave behind. The crop is a margin:
+# 224 out of 256 trims the border and leaves the subject where it was. Taking a
+# third of the width instead is not a smaller resolution, it is a different
+# field of view, and it is what naming the wrong tree or forgetting the option
+# looks like — a run that trains, scores and reports a plausible number.
+MINIMUM_CROP_SHARE = 0.5
+
+
+def crop_fits(manifest: pd.DataFrame, transform: v2.Transform) -> None:
+    """Refuse a crop that does not belong to the frames it will be taken from.
+
+    The size a frame was stored at is readable from where it sits, and the size
+    a pipeline crops to is readable from the pipeline, so the one mistake that
+    nothing downstream would reveal can be caught before the first read rather
+    than after the last epoch.
+
+    Args:
+        manifest: The rows about to be served. Only the first path is read.
+        transform: The pipeline about to be applied. A pipeline holding no crop
+            at all is left alone — the check is about disagreement, not about
+            requiring one.
+
+    Raises:
+        ValueError: If the crop keeps less of the stored frame than
+            ``MINIMUM_CROP_SHARE``, or is larger than the frame itself.
+    """
+    crops = [
+        step.size[0]
+        for step in getattr(transform, "transforms", [])
+        if isinstance(step, (v2.RandomCrop, v2.CenterCrop, v2.RandomResizedCrop))
+    ]
+    if not crops or manifest.empty:
+        return
+
+    crop, stored = crops[0], stored_size_for(manifest["path"].iloc[0])
+    if not stored * MINIMUM_CROP_SHARE <= crop <= stored:
+        raise ValueError(
+            f"a crop of {crop} does not belong to frames stored at {stored}: "
+            f"the manifest points at data/frames"
+            f"{'/' + str(stored) if stored != FRAME_SIZE else ''}/, "
+            f"so the crop should be about {round(stored * CROP_SIZE / FRAME_SIZE)}"
+        )
 
 
 class FrameDataset(Dataset):
@@ -533,7 +585,13 @@ class FrameDataset(Dataset):
             texture: Replaces the appearance inside the person on some frames.
                 ``None`` for the same reason and with the same restriction: it
                 needs a silhouette, and evaluation has none.
+
+        Raises:
+            ValueError: If the transform's crop is not a margin on the frames
+                this manifest points at. See ``crop_fits``.
         """
+        crop_fits(manifest, transform)
+
         self.data_frame = manifest.reset_index(drop=True)
         self.data_root = data_root
         self.transform = transform

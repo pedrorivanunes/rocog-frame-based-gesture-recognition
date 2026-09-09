@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from manifest import mask_path_for, video_metadata, with_idle_class
+from manifest import (
+    FRAME_SIZE,
+    mask_path_for,
+    sized_path_for,
+    stored_size_for,
+    video_metadata,
+    with_idle_class,
+)
 
 
 def test_synthetic_scene_number_determines_view():
@@ -64,3 +71,16 @@ def test_adding_the_idle_class_leaves_the_mapping_it_was_given():
     with_idle_class(seven)
 
     assert seven == {0: "Advance", 1: "Attention"}
+
+
+def test_a_size_reads_back_from_where_the_frame_sits():
+    """Naming a tree is how a run picks a resolution, so the path is the record."""
+    frame = Path("data/frames/syn/Advance/Scene1_Advance_f0007.jpg")
+
+    assert stored_size_for(sized_path_for(frame, 640)) == 640
+
+
+def test_a_path_without_a_size_names_the_tree_extraction_wrote():
+    frame = Path("data/frames/syn/Advance/Scene1_Advance_f0007.jpg")
+
+    assert stored_size_for(frame) == FRAME_SIZE

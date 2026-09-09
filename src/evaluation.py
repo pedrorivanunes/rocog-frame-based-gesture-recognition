@@ -16,6 +16,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
+# The one runtime import not left to the main block below, because parse_args
+# has to name its default and parse_args is read at import time.
+from dataset import CROP_SIZE
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BATCH_SIZE = 64
 
@@ -42,7 +46,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ``manifest`` (a file name under data/manifests/), ``validation_split``
         (score only the manifest's held-out scenes, not all of it), ``output``
         (the table's name under data/predictions/, or ``None`` to derive it from
-        the checkpoint and manifest) and ``num_workers``.
+        the checkpoint and manifest), ``crop_size`` (the side to crop each
+        stored frame to) and ``num_workers``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -64,6 +69,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--output",
         help="table name under data/predictions/; derived from the checkpoint "
         "and manifest when omitted",
+    )
+    parser.add_argument(
+        "--crop-size",
+        type=int,
+        default=CROP_SIZE,
+        metavar="PIXELS",
+        help="side the crop takes from each stored frame. Has to be the one the "
+        "checkpoint was trained with, or the model meets a field of view it "
+        "never learnt on; a crop that is not a margin on these frames is "
+        "refused rather than scored",
     )
     parser.add_argument(
         "--num-workers",
@@ -237,7 +252,7 @@ if __name__ == "__main__":
     model.load_state_dict(weights)
 
     loader = DataLoader(
-        FrameDataset(manifest, PROJECT_ROOT, eval_transform()),
+        FrameDataset(manifest, PROJECT_ROOT, eval_transform(args.crop_size)),
         batch_size=BATCH_SIZE,
         shuffle=False,
         num_workers=args.num_workers,

@@ -2,8 +2,10 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
+from torchvision.transforms import v2
 
 from dataset import (
+    CROP_SIZE,
     TEXTURE_FILLS,
     Augmentation,
     BackgroundRandomiser,
@@ -11,6 +13,8 @@ from dataset import (
     RandomGamma,
     SegmentSampler,
     TextureRandomiser,
+    crop_fits,
+    eval_transform,
     noise_background,
     solid_background,
     train_transform,
@@ -552,3 +556,40 @@ def test_a_treatment_is_off_until_a_run_asks_for_it():
     assert standard.background == 0.0
     assert standard.texture == "none"
     assert standard.gamma_shift is None
+
+
+def sized_manifest(size):
+    """One row pointing into the tree a given size is stored in."""
+    tree = "data/frames" if size == 256 else f"data/frames/{size}"
+
+    return pd.DataFrame({"path": [f"{tree}/syn/Halt/Scene1_Halt_f0007.jpg"]})
+
+
+def test_the_crop_the_stored_frames_expect_is_accepted():
+    crop_fits(sized_manifest(256), eval_transform(CROP_SIZE))
+    crop_fits(sized_manifest(640), eval_transform(560))
+
+
+def test_a_crop_that_zooms_instead_of_trimming_is_refused():
+    """224 out of 640 keeps a third of the width, not a margin.
+
+    That is what forgetting the option looks like, and the run would train,
+    score and report a plausible number either way.
+    """
+    with pytest.raises(ValueError, match="stored at 640"):
+        crop_fits(sized_manifest(640), eval_transform(CROP_SIZE))
+
+
+def test_a_crop_larger_than_the_stored_frame_is_refused():
+    with pytest.raises(ValueError):
+        crop_fits(sized_manifest(256), eval_transform(560))
+
+
+def test_the_refusal_names_the_crop_the_tree_expects():
+    with pytest.raises(ValueError, match="should be about 560"):
+        crop_fits(sized_manifest(640), eval_transform(CROP_SIZE))
+
+
+def test_a_pipeline_with_no_crop_is_left_alone():
+    """The check is about disagreement, not about requiring a crop."""
+    crop_fits(sized_manifest(640), v2.Compose([v2.ToImage()]))
