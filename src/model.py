@@ -7,10 +7,19 @@ backbone against cheaper ones is a choice about the model, not about the loop
 that consumes it.
 """
 
+from collections.abc import Iterable
+
+import torch
 from torch import nn
 from torchvision.models import ResNet18_Weights, resnet18
 
 NUM_CLASSES = 7
+
+# The layers that carry a running mean and variance. Listed by their public
+# classes rather than by the private base they share, because the list is also
+# the claim: these are the only places a domain's statistics are stored, so
+# these are the only places re-estimating them can reach.
+NORMALISATION_LAYERS = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
 
 
 def build_model(num_classes: int = NUM_CLASSES) -> nn.Module:
@@ -80,3 +89,77 @@ def freeze(model: nn.Module, depth: str) -> list[nn.Module]:
         for parameter in stage.parameters():
             parameter.requires_grad_(False)
     return stages
+
+
+def adapt_batchnorm(model: nn.Module, batches: Iterable, device: torch.device) -> int:
+    """Re-estimate the normalisation statistics on frames from another domain.
+
+    A batch normalisation layer standardises its input by a mean and variance it
+    accumulated while training. Those describe the domain it was trained on, and
+    a model carried to a different one keeps applying them to features that no
+    longer have those moments. Re-estimating them is the cheapest correction
+    there is: no gradient, no optimiser, no parameter added, and no label read —
+    the frames are pushed through and the layers write down what they see.
+
+    ``freeze`` is the same mechanism seen from the other side. There the running
+    statistics are held still so they cannot drift onto the training domain;
+    here they are deliberately moved onto another one.
+
+    The momentum is set aside for the duration, not merely reset. A layer with a
+    momentum weights recent batches more heavily than early ones, which would
+    make the result depend on the order the loader happened to serve — with it
+    cleared, PyTorch averages every batch equally instead. It is put back
+    afterwards so a model adapted here can still be trained later.
+
+    ⚠️ Equal weight per *batch*, not per frame: a short final batch counts as
+    much as a full one. With frames in the thousands and batches in the dozens
+    the difference is far below the noise of any comparison this feeds, and
+    dropping the short batch would discard target frames to fix it.
+
+    ⚠️ This reads data from the domain being scored, so a result it produces is
+    not *source-only* and cannot be set against a source-only baseline. Which
+    frames it saw is the whole protocol question, and it belongs beside the
+    number.
+
+    Args:
+        model: The network to adapt, modified in place. Left in evaluation mode,
+            ready to score.
+        batches: Anything yielding batches whose first element is a tensor of
+            frames — a ``DataLoader`` over the target's frames in practice, and
+            the labels it also serves are ignored on purpose.
+        device: Where the forward pass runs.
+
+    Returns:
+        How many frames the statistics were estimated from, so a caller can
+        report the size of what it adapted on.
+
+    Raises:
+        ValueError: If no frames arrived. The layers are reset before the pass,
+            so returning quietly would hand back a model normalising by a mean
+            of zero and a variance of one — worse than the one that came in, and
+            wrong in a way no later number would reveal.
+    """
+    layers = [
+        module for module in model.modules() if isinstance(module, NORMALISATION_LAYERS)
+    ]
+    momenta = [layer.momentum for layer in layers]
+    for layer in layers:
+        layer.reset_running_stats()
+        layer.momentum = None
+
+    model.train()
+    frames_seen = 0
+    with torch.no_grad():
+        for batch in batches:
+            frames = batch[0]
+            model(frames.to(device))
+            frames_seen += len(frames)
+
+    for layer, momentum in zip(layers, momenta, strict=True):
+        layer.momentum = momentum
+    model.eval()
+
+    if frames_seen == 0:
+        raise ValueError("no frames to adapt on; the statistics would stay reset")
+
+    return frames_seen

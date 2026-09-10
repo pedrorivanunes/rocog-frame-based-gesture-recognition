@@ -17,8 +17,24 @@ def test_parse_args_leaves_the_optional_settings_alone():
     assert args.checkpoint == Path("checkpoints/syn_ground_train.pt")
     assert args.manifest == "real_ground_test.csv"
     assert args.validation_split is False
+    assert args.adapt_bn is None
     assert args.output is None
     assert args.num_workers == 12
+
+
+def test_parse_args_takes_a_manifest_to_adapt_the_statistics_on():
+    """Off by default, because every table written before it was scored without."""
+    adapted = parse_args(
+        [
+            "checkpoints/idle_s0.pt",
+            "--manifest",
+            "real_ground_test.csv",
+            "--adapt-bn",
+            "real_ground_train.csv",
+        ]
+    )
+
+    assert adapted.adapt_bn == "real_ground_train.csv"
 
 
 def test_parse_args_takes_the_validation_split():

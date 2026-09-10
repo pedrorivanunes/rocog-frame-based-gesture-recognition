@@ -44,10 +44,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     Returns:
         A namespace with ``checkpoint`` (path to the trained weights),
         ``manifest`` (a file name under data/manifests/), ``validation_split``
-        (score only the manifest's held-out scenes, not all of it), ``output``
-        (the table's name under data/predictions/, or ``None`` to derive it from
-        the checkpoint and manifest), ``crop_size`` (the side to crop each
-        stored frame to) and ``num_workers``.
+        (score only the manifest's held-out scenes, not all of it), ``adapt_bn``
+        (a manifest to re-estimate the normalisation statistics on first, or
+        ``None`` to score the checkpoint as it was trained), ``output`` (the
+        table's name under data/predictions/, or ``None`` to derive it from the
+        checkpoint and manifest), ``crop_size`` (the side to crop each stored
+        frame to) and ``num_workers``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -64,6 +66,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--validation-split",
         action="store_true",
         help="score only the held-out validation scenes of the manifest",
+    )
+    parser.add_argument(
+        "--adapt-bn",
+        metavar="MANIFEST",
+        help="re-estimate the batch normalisation statistics on these frames "
+        "before scoring, a file name under data/manifests/. Reads no label, but "
+        "reads the target domain: a result produced this way is not source-only "
+        "and its baseline is the published adaptation row, not the source-only "
+        "one. Naming the target's training split keeps the scored subjects "
+        "unseen; naming the scored manifest itself is the transductive variant",
     )
     parser.add_argument(
         "--output",
@@ -221,7 +233,7 @@ if __name__ == "__main__":
     from dataset import FrameDataset, eval_transform
     from device import describe, pick_device
     from manifest import load_class_names, with_idle_class
-    from model import build_model
+    from model import adapt_batchnorm, build_model
     from splits import split_by_scene
 
     args = parse_args()
@@ -251,21 +263,43 @@ if __name__ == "__main__":
     model = build_model(num_classes).to(device)
     model.load_state_dict(weights)
 
-    loader = DataLoader(
-        FrameDataset(manifest, PROJECT_ROOT, eval_transform(args.crop_size)),
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
+    def frame_loader(rows: pd.DataFrame) -> DataLoader:
+        """Serve a manifest's frames exactly as scoring will meet them.
 
-    logits, labels, video_ids = predict(model, loader, device)
+        Used for the adaptation pass as well as for scoring, and that is the
+        point: statistics estimated from augmented frames would describe images
+        the model never sees at evaluation.
+        """
+        return DataLoader(
+            FrameDataset(rows, PROJECT_ROOT, eval_transform(args.crop_size)),
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+
+    if args.adapt_bn:
+        adaptation_rows = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.adapt_bn)
+        seen = adapt_batchnorm(model, frame_loader(adaptation_rows), device)
+        transductive = args.adapt_bn == args.manifest and not args.validation_split
+        print(
+            f"batch norm re-estimated on {seen} frames from {args.adapt_bn}"
+            + ("  (transductive: the scored rows themselves)" if transductive else "")
+        )
+
+    logits, labels, video_ids = predict(model, frame_loader(manifest), device)
     loss, accuracy = frame_metrics(logits, labels, nn.CrossEntropyLoss())
     table = probability_table(logits, video_ids, manifest, class_names)
 
     predictions_dir = PROJECT_ROOT / "data" / "predictions"
     predictions_dir.mkdir(parents=True, exist_ok=True)
+    # An adapted model is a different model, so its table must not land on the
+    # name the unadapted one already wrote. Where the statistics came from goes
+    # into the name too: the inductive and transductive variants differ in
+    # nothing else, and a name that hid it would let one silently overwrite the
+    # other.
+    adapted = f"_adabn_{Path(args.adapt_bn).stem}" if args.adapt_bn else ""
     output = predictions_dir / (
-        args.output or f"{args.checkpoint.stem}__{split_name}.csv"
+        args.output or f"{args.checkpoint.stem}{adapted}__{split_name}.csv"
     )
     table.to_csv(output, index=False)
 
