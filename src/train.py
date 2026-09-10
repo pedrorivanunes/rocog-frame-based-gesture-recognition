@@ -31,7 +31,14 @@ from dataset import (
 from device import describe, pick_device
 from evaluation import frame_metrics, predict
 from manifest import IDLE_LABEL
-from model import FROZEN_STAGES, NUM_CLASSES, build_model, freeze
+from model import (
+    BACKBONES,
+    DEFAULT_BACKBONE,
+    FROZEN_STAGES,
+    NUM_CLASSES,
+    build_model,
+    freeze,
+)
 from splits import (
     WINDOWS,
     add_idle_rows,
@@ -214,6 +221,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="mass moved off the true class and spread over the other six "
         "while training, from 0 to 1. Validation is always scored against hard "
         "targets, so its loss stays comparable across values",
+    )
+    parser.add_argument(
+        "--backbone",
+        choices=BACKBONES,
+        default=DEFAULT_BACKBONE,
+        help="which ResNet18 to train. Both cost the same per frame and carry "
+        "the same parameter count; the ibn variant normalises half of each "
+        "shallow stage's channels by the instance instead of the batch, which "
+        "drops appearance statistics the batch would have kept",
     )
     parser.add_argument(
         "--freeze",
@@ -781,7 +797,7 @@ if __name__ == "__main__":
 
     device = pick_device()
     print(f"device: {describe(device)}")
-    model = build_model(num_classes).to(device)
+    model = build_model(num_classes, args.backbone).to(device)
     frozen = freeze(model, args.freeze)
     criterion, validation_criterion = build_criteria(args.label_smoothing)
     # Only the parameters that still train. Adam would skip a frozen one anyway,

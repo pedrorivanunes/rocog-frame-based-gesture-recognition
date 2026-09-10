@@ -233,7 +233,7 @@ if __name__ == "__main__":
     from dataset import FrameDataset, eval_transform
     from device import describe, pick_device
     from manifest import load_class_names, with_idle_class
-    from model import adapt_batchnorm, build_model
+    from model import DEFAULT_BACKBONE, adapt_batchnorm, backbone_of, build_model
     from splits import split_by_scene
 
     args = parse_args()
@@ -260,8 +260,14 @@ if __name__ == "__main__":
     num_classes = len(weights["fc.bias"])
     if num_classes > len(class_names):
         class_names = with_idle_class(class_names)
-    model = build_model(num_classes).to(device)
+    # Which backbone wrote the file is read off the file for the same reason the
+    # head's width is: a caller asked to remember would eventually pair the
+    # wrong two, and the failure is a shape mismatch at best.
+    backbone = backbone_of(weights)
+    model = build_model(num_classes, backbone).to(device)
     model.load_state_dict(weights)
+    if backbone != DEFAULT_BACKBONE:
+        print(f"backbone: {backbone}")
 
     def frame_loader(rows: pd.DataFrame) -> DataLoader:
         """Serve a manifest's frames exactly as scoring will meet them.

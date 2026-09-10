@@ -7,13 +7,31 @@ backbone against cheaper ones is a choice about the model, not about the loop
 that consumes it.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 
 import torch
 from torch import nn
 from torchvision.models import ResNet18_Weights, resnet18
 
 NUM_CLASSES = 7
+
+# The backbones a run may train. Both are ResNet18: the same stage names, the
+# same arithmetic per frame, and — once the head is resized to seven or eight
+# outputs — the same 11.18 M parameters. They differ in one thing, which is why
+# the second is here at all: it normalises half of each shallow stage's channels
+# by the instance rather than the batch, which removes appearance statistics a
+# batch would have preserved. The cost argument the project rests on survives
+# the swap untouched.
+DEFAULT_BACKBONE = "resnet18"
+BACKBONES = ("resnet18", "resnet18_ibn_a")
+
+# Where the second one comes from, and what its weights carry that torchvision's
+# do not. Reading the marker back off a file is how a checkpoint says which
+# backbone wrote it, the same way ``fc.bias`` says how wide its head is — a
+# caller that had to remember would eventually pair the wrong two.
+IBN_HUB_REPOSITORY = "XingangPan/IBN-Net"
+IBN_MARKER = ".IN."
 
 # The layers that carry a running mean and variance. Listed by their public
 # classes rather than by the private base they share, because the list is also
@@ -22,7 +40,37 @@ NUM_CLASSES = 7
 NORMALISATION_LAYERS = (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)
 
 
-def build_model(num_classes: int = NUM_CLASSES) -> nn.Module:
+@contextmanager
+def _weights_landing_on_the_cpu():
+    """Force every ``torch.load`` inside the block onto the CPU.
+
+    Needed for one backbone and worth the intrusion. The IBN authors' entry
+    point fetches its own weights without naming a map location, and the file
+    they published was saved from a CUDA device — so on a host with no GPU it
+    raises rather than loading. This module promises a network on the CPU
+    whatever the host has, and the two places that promise is about to be
+    collected on are a laptop with no CUDA and a prototype expected to run on
+    one.
+
+    Narrower than it looks: the patch lives only for the call it wraps, and it
+    overrides the argument rather than filling it in, because the caller being
+    corrected passes it explicitly as ``None``.
+    """
+    original = torch.load
+
+    def on_the_cpu(*args, **keywords):
+        return original(*args, **{**keywords, "map_location": "cpu"})
+
+    torch.load = on_the_cpu
+    try:
+        yield
+    finally:
+        torch.load = original
+
+
+def build_model(
+    num_classes: int = NUM_CLASSES, backbone: str = DEFAULT_BACKBONE
+) -> nn.Module:
     """Build a ResNet18 with ImageNet weights and a fresh classification head.
 
     The convolutional layers keep what they learned on ImageNet — edges, textures,
@@ -30,15 +78,60 @@ def build_model(num_classes: int = NUM_CLASSES) -> nn.Module:
     to the gesture classes instead of ImageNet's 1000 categories. That mapping is
     what training has to learn.
 
+    ⚠️ The IBN variant is fetched from its authors' repository through
+    ``torch.hub`` and cached under ``~/.cache/torch``, so the first build of it
+    needs a network and later ones do not. Its weights are ImageNet's, trained by
+    them; nothing here retrains it.
+
     Args:
         num_classes: Outputs the head produces, one per gesture.
+        backbone: Which of ``BACKBONES`` to build.
 
     Returns:
         The network, on the CPU. Moving it to a device is the caller's job.
+
+    Raises:
+        ValueError: If the backbone is not one this project knows how to build.
     """
-    model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    if backbone not in BACKBONES:
+        raise ValueError(f"unknown backbone {backbone!r}; expected one of {BACKBONES}")
+
+    if backbone == DEFAULT_BACKBONE:
+        model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    else:
+        with _weights_landing_on_the_cpu():
+            model = torch.hub.load(
+                IBN_HUB_REPOSITORY,
+                backbone,
+                pretrained=True,
+                trust_repo=True,
+                verbose=False,
+            )
+
     model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
+
+
+def backbone_of(weights: Mapping[str, object]) -> str:
+    """Read which backbone wrote a checkpoint, off the checkpoint itself.
+
+    Scoring a file with the wrong architecture fails on a shape mismatch if the
+    project is lucky and on a wrong number if it is not, and a caller asked to
+    remember which run wrote which file will eventually pair the wrong two. The
+    file already says: an instance-normalised stage carries parameters a
+    torchvision ResNet18 has no name for.
+
+    Args:
+        weights: A checkpoint's state dictionary, or anything with its keys.
+
+    Returns:
+        The name of the backbone to hand ``build_model``.
+    """
+    return (
+        "resnet18_ibn_a"
+        if any(IBN_MARKER in key for key in weights)
+        else DEFAULT_BACKBONE
+    )
 
 
 # How far into the network a run holds the pretrained weights. Named in stages
