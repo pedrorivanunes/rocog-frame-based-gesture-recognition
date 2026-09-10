@@ -37,6 +37,7 @@ def test_parse_args_with_no_arguments_is_the_standard_run():
     assert args.label_smoothing == 0.0
     assert args.freeze == "none"
     assert args.initial_weights is None
+    assert args.exclude_groups is None
     assert args.fraction == 1.0
     assert args.texture == "none"
     assert args.texture_fill == "both"
@@ -462,3 +463,10 @@ def test_parse_args_takes_a_fraction_of_the_training_videos():
     args = parse_args(["--fraction", "0.05"])
 
     assert args.fraction == 0.05
+
+
+def test_parse_args_takes_groups_to_exclude_entirely():
+    """Distinct from --validation-groups: an excluded group shapes nothing."""
+    args = parse_args(["--exclude-groups", "S05", "S07"])
+
+    assert args.exclude_groups == ["S05", "S07"]

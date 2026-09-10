@@ -225,6 +225,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "targets, so its loss stays comparable across values",
     )
     parser.add_argument(
+        "--exclude-groups",
+        nargs="+",
+        metavar="GROUP",
+        help="drop these groups from the manifest before anything else, so they "
+        "reach neither training nor validation. Distinct from "
+        "--validation-groups, which holds a group out of training but still "
+        "lets it choose the stopping epoch: a group meant to be scored as "
+        "unseen must not do that, or it has shaped the run it is measuring",
+    )
+    parser.add_argument(
         "--initial-weights",
         metavar="CHECKPOINT",
         help="start from these weights instead of ImageNet's, e.g. "
@@ -744,6 +754,12 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
 
     manifest = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.manifest)
+    # Dropped before the split rather than after, so the excluded rows are absent
+    # from both sides. split_by_group is reused for the checking it already does:
+    # a name absent from the manifest stops the run instead of silently
+    # excluding nothing.
+    if args.exclude_groups:
+        manifest, _ = split_by_group(manifest, args.exclude_groups)
     train_manifest, eval_manifest = (
         split_by_group(manifest, args.validation_groups)
         if args.validation_groups
@@ -797,7 +813,11 @@ if __name__ == "__main__":
         gamma_shift=args.gamma_shift,
     )
 
-    print(f"manifest {args.manifest}  validation groups: {' '.join(held_out)}")
+    excluded = " ".join(args.exclude_groups) if args.exclude_groups else "none"
+    print(
+        f"manifest {args.manifest}  validation groups: {' '.join(held_out)}  "
+        f"excluded: {excluded}"
+    )
     print(
         f"fraction {args.fraction:g} -> "
         f"train {train_manifest['video_id'].nunique()} videos / "
