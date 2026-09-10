@@ -245,3 +245,67 @@ def add_idle_rows(gesture: pd.DataFrame, idle: pd.DataFrame) -> pd.DataFrame:
         [gesture, idle.assign(label=IDLE_LABEL, class_name=IDLE_CLASS_NAME)],
         ignore_index=True,
     )
+
+
+def sample_videos(
+    manifest: pd.DataFrame,
+    fraction: float,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """Keep a fraction of the videos, drawn so the fractions nest.
+
+    Whole videos, never a fraction of each one's frames. Dropping frames leaves
+    every video still represented and measures something else entirely — how
+    densely a gesture is sampled, not how many gestures were collected. The
+    question a fraction is asked here is what a smaller collection effort would
+    have bought, and a collection effort yields videos.
+
+    Drawn per class, because the fractions that matter are small: a twentieth of
+    two hundred videos is ten, and ten drawn without regard to class can leave a
+    gesture with no examples at all, which turns a data-quantity curve into a
+    curve about which classes survived the draw. Subject is deliberately not
+    stratified on — ten videos cannot cover seven classes across six people, and
+    a missing class is fatal to the measurement where a missing person is only
+    less variety.
+
+    The draw nests: each class is shuffled once and the fractions take prefixes
+    of that order, so everything a run at five percent sees, the same run at ten
+    percent sees too. Without that, two points on the curve could differ by
+    which videos they happened to get rather than by how many.
+
+    ⚠️ The order depends on the seed, which is this project's label for a
+    repetition. So three seeds of one fraction see three different draws, and
+    the spread across them includes the luck of the draw — which is the honest
+    error bar for a curve about data quantity, and larger than the spread of
+    three seeds that differ only in initialisation.
+
+    ⚠️ Every class keeps at least one video however small the fraction, so the
+    smallest points hold slightly more data than their name suggests. Callers
+    should report the video count they actually got, not the fraction they
+    asked for.
+
+    Args:
+        manifest: Rows to sample from, one per frame.
+        fraction: Share of each class's videos to keep, 0 to 1.
+        seed: Chooses the shuffle, so a fraction is reproducible.
+
+    Returns:
+        The rows of the videos that were kept, in the manifest's own order.
+
+    Raises:
+        ValueError: If the fraction is not in ``(0, 1]``. Zero would hand back
+            an empty manifest, which fails later and further from the cause.
+    """
+    if not 0 < fraction <= 1:
+        raise ValueError(f"fraction must be in (0, 1], got {fraction}")
+    if fraction == 1:
+        return manifest
+
+    generator = np.random.default_rng(seed)
+    kept: list[str] = []
+    for label in sorted(manifest["label"].unique()):
+        videos = manifest.loc[manifest["label"] == label, "video_id"].unique()
+        order = generator.permutation(videos)
+        kept.extend(order[: max(1, round(fraction * len(videos)))])
+
+    return manifest[manifest["video_id"].isin(kept)]

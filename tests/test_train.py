@@ -36,6 +36,8 @@ def test_parse_args_with_no_arguments_is_the_standard_run():
     assert args.save_every_epoch is False
     assert args.label_smoothing == 0.0
     assert args.freeze == "none"
+    assert args.initial_weights is None
+    assert args.fraction == 1.0
     assert args.texture == "none"
     assert args.texture_fill == "both"
     assert args.window == "full"
@@ -447,3 +449,16 @@ def test_a_different_worker_count_is_not_a_different_run(tmp_path):
     )
 
     assert done == 3
+
+
+def test_parse_args_takes_a_checkpoint_to_start_from():
+    """Fine-tuning is the one regime that does not begin at ImageNet."""
+    args = parse_args(["--initial-weights", "checkpoints/idle_s0.pt"])
+
+    assert args.initial_weights == "checkpoints/idle_s0.pt"
+
+
+def test_parse_args_takes_a_fraction_of_the_training_videos():
+    args = parse_args(["--fraction", "0.05"])
+
+    assert args.fraction == 0.05

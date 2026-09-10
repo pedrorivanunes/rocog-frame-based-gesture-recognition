@@ -5,6 +5,7 @@ import pytest
 from splits import (
     EDGE_FRAMES,
     add_idle_rows,
+    sample_videos,
     select_frames,
     split_by_group,
     split_by_scene,
@@ -328,3 +329,65 @@ def test_adding_idle_rows_leaves_the_table_it_was_given():
     add_idle_rows(labelled_rows("v0", 4, "Halt", 3, 0.5), idle)
 
     assert list(idle["label"]) == [4, 4]
+
+
+class TestSampleVideos:
+    """Keeping a fraction of the videos, drawn so the fractions nest."""
+
+    @staticmethod
+    def manifest(videos_per_class=20, classes=7, frames=3):
+        return pd.DataFrame(
+            [
+                {
+                    "video_id": f"c{label}_v{video}",
+                    "label": label,
+                    "group_id": f"S{video % 4}",
+                    "frame_number": frame,
+                }
+                for label in range(classes)
+                for video in range(videos_per_class)
+                for frame in range(frames)
+            ]
+        )
+
+    def test_it_keeps_whole_videos(self):
+        """A share of each video's frames would measure something else entirely."""
+        rows = self.manifest()
+        kept = sample_videos(rows, 0.5, seed=0)
+
+        counts = kept.groupby("video_id").size()
+        assert set(counts) == {3}
+
+    def test_every_class_survives_the_smallest_fraction(self):
+        """A draw that loses a gesture turns a data curve into a curve about luck."""
+        rows = self.manifest()
+        kept = sample_videos(rows, 0.01, seed=0)
+
+        assert sorted(kept["label"].unique()) == list(range(7))
+
+    def test_the_fractions_nest(self):
+        """Everything a run at a tenth sees, the same run at a fifth sees too."""
+        rows = self.manifest()
+        small = set(sample_videos(rows, 0.1, seed=3)["video_id"])
+        large = set(sample_videos(rows, 0.2, seed=3)["video_id"])
+
+        assert small < large
+
+    def test_a_different_seed_draws_differently(self):
+        """The spread across seeds has to include the luck of the draw."""
+        rows = self.manifest()
+        first = set(sample_videos(rows, 0.25, seed=0)["video_id"])
+        second = set(sample_videos(rows, 0.25, seed=1)["video_id"])
+
+        assert first != second
+
+    def test_the_whole_thing_comes_back_untouched(self):
+        rows = self.manifest()
+
+        assert sample_videos(rows, 1.0).equals(rows)
+
+    @pytest.mark.parametrize("fraction", [0.0, -0.1, 1.5])
+    def test_a_fraction_outside_the_range_is_refused(self, fraction):
+        """Zero would hand back nothing and fail later, further from the cause."""
+        with pytest.raises(ValueError, match="fraction must be"):
+            sample_videos(self.manifest(), fraction)

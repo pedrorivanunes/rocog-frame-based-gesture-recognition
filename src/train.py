@@ -36,12 +36,14 @@ from model import (
     DEFAULT_BACKBONE,
     FROZEN_STAGES,
     NUM_CLASSES,
+    backbone_of,
     build_model,
     freeze,
 )
 from splits import (
     WINDOWS,
     add_idle_rows,
+    sample_videos,
     select_frames,
     split_by_group,
     split_by_scene,
@@ -221,6 +223,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="mass moved off the true class and spread over the other six "
         "while training, from 0 to 1. Validation is always scored against hard "
         "targets, so its loss stays comparable across values",
+    )
+    parser.add_argument(
+        "--initial-weights",
+        metavar="CHECKPOINT",
+        help="start from these weights instead of ImageNet's, e.g. "
+        "checkpoints/idle_s0.pt. The head's width and the backbone are read "
+        "from the file rather than asked for, so a fine-tuning run cannot be "
+        "paired with an architecture it was not written by",
+    )
+    parser.add_argument(
+        "--fraction",
+        type=float,
+        default=1.0,
+        metavar="SHARE",
+        help="train on this share of the TRAINING videos, drawn per class so "
+        "that no gesture disappears and so that the fractions nest. Validation "
+        "is never sampled. Whole videos, never a share of each one's frames",
     )
     parser.add_argument(
         "--backbone",
@@ -735,6 +754,11 @@ if __name__ == "__main__":
     # was scored on, so narrowing it here would move the measurement along with
     # the treatment, and scoring on frames the model no longer trains on is the
     # honest question anyway.
+    # Sampled before the frames are narrowed, and on the training side alone:
+    # validation has to stay the same set of videos across the whole curve or
+    # the points are scored against different questions.
+    if args.fraction < 1:
+        train_manifest = sample_videos(train_manifest, args.fraction, args.seed)
     train_manifest = select_frames(train_manifest, args.window, args.seed)
 
     held_out = sorted(eval_manifest["group_id"].unique())
@@ -751,6 +775,19 @@ if __name__ == "__main__":
         train_manifest = add_idle_rows(train_manifest, idle_train)
         num_classes = IDLE_LABEL + 1
 
+    # Both read off the file rather than asked for, the way evaluation.py already
+    # reads them: a fine-tuning run that met the wrong architecture would fail on
+    # a shape mismatch at best, and a caller told to remember which checkpoint
+    # carries which head will eventually pair the wrong two.
+    initial_weights = None
+    backbone = args.backbone
+    if args.initial_weights:
+        initial_weights = torch.load(
+            PROJECT_ROOT / args.initial_weights, map_location="cpu"
+        )
+        num_classes = len(initial_weights["fc.bias"])
+        backbone = backbone_of(initial_weights)
+
     augmentation = Augmentation(
         photometric=args.photometric,
         geometric=args.geometric,
@@ -762,6 +799,7 @@ if __name__ == "__main__":
 
     print(f"manifest {args.manifest}  validation groups: {' '.join(held_out)}")
     print(
+        f"fraction {args.fraction:g} -> "
         f"train {train_manifest['video_id'].nunique()} videos / "
         f"validation {eval_manifest['video_id'].nunique()} videos "
         f"({len(eval_manifest) / len(manifest):.1%} of frames)"
@@ -797,7 +835,12 @@ if __name__ == "__main__":
 
     device = pick_device()
     print(f"device: {describe(device)}")
-    model = build_model(num_classes, args.backbone).to(device)
+    model = build_model(num_classes, backbone).to(device)
+    if initial_weights is not None:
+        model.load_state_dict(initial_weights)
+        print(
+            f"starting from {args.initial_weights}  ({backbone}, {num_classes} outputs)"
+        )
     frozen = freeze(model, args.freeze)
     criterion, validation_criterion = build_criteria(args.label_smoothing)
     # Only the parameters that still train. Adam would skip a frozen one anyway,
