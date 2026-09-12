@@ -1,0 +1,64 @@
+name: CI
+
+# Work happens directly on main, so a push is the event that matters. Pull
+# requests are listed for the day that changes, and cost nothing until then.
+on:
+  push:
+  pull_request:
+
+# Only the newest push to a branch deserves an answer: a run still going for
+# an older commit is describing a tree that no longer exists.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# The workflow reads the tree and writes nothing back to the repository.
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          # The version both development environments are built on. The project
+          # runs on one Python across two machines, so a matrix would spend
+          # twice the time covering a combination nobody uses.
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # The opencv wheel links libGL for the window functions this project never
+      # calls, and a headless runner carries no graphics stack to satisfy it.
+      # Without this, importing cv2 fails before a single test is collected.
+      - name: Install the system libraries opencv links against
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes libgl1
+
+      # requirements.txt is the laptop's lockfile, where torch is a CPU build
+      # already because Apple silicon has no CUDA to offer. The same pin
+      # resolves on Linux to a wheel that drags the CUDA runtime along, for a
+      # runner with no card to run it on. So the versions come from the file and
+      # the builds come from the CPU index; requirements-rocm.txt names its own
+      # index for the same reason.
+      - name: Install dependencies
+        run: |
+          pip install --requirement requirements.txt \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Check formatting
+        run: ruff format --check .
+
+      # Every test runs on the CPU and reaches no network: the models they build
+      # are unweighted, and the dataset paths they exercise are strings the
+      # manifest parses, never files on disk.
+      - name: Test
+        run: pytest
