@@ -1,17 +1,21 @@
 import pytest
 import torch
 from torch import nn
-from torchvision.models import resnet18
+from torchvision.models import mobilenet_v3_small, resnet18
 
+import model as model_module
 from model import (
     BACKBONES,
     DEFAULT_BACKBONE,
     FROZEN_STAGES,
+    HEAD_PATHS,
     NORMALISATION_LAYERS,
+    TORCHVISION_BACKBONES,
     adapt_batchnorm,
     backbone_of,
     build_model,
     freeze,
+    head_width,
 )
 
 # Weights are irrelevant to what these tests check — which parameters carry a
@@ -222,3 +226,76 @@ def test_the_cpu_loading_patch_is_put_back_even_after_a_failure():
     with pytest.raises(RuntimeError), _weights_landing_on_the_cpu():
         raise RuntimeError("as a download would")
     assert torch.load is original
+
+
+# --- the cost curve's backbones ------------------------------------------------
+#
+# A ResNet18 is a 2015 design, so every cost figure the project quotes is about
+# that network rather than about frame classification. These three answer the
+# same task at 11.18, 4.02 and 1.53 M parameters, which is what makes the
+# comparison a curve. They differ in where they keep the layer that names the
+# classes, and that difference is the whole of what the code had to learn.
+
+
+@pytest.fixture
+def offline_backbones(monkeypatch):
+    """Build the torchvision backbones unweighted, so the suite stays offline.
+
+    ``build_model`` asks for published weights, which would reach the network on
+    a machine that has not cached them. What these tests check — where the head
+    lands and how wide it is — does not depend on a single weight.
+    """
+    monkeypatch.setattr(
+        model_module,
+        "TORCHVISION_BACKBONES",
+        {name: (builder, None) for name, (builder, _) in TORCHVISION_BACKBONES.items()},
+    )
+
+
+@pytest.mark.parametrize("backbone", sorted(TORCHVISION_BACKBONES))
+def test_every_backbone_gets_a_head_of_the_width_it_was_asked_for(
+    offline_backbones, backbone
+):
+    """Two of them keep a second Linear earlier in the classifier.
+
+    MobileNetV3 runs its features through a Linear, an activation and a dropout
+    before the layer that names the classes, so replacing the first one found
+    would leave a network still answering ImageNet's thousand categories.
+    """
+    built = build_model(8, backbone)
+
+    assert built(torch.randn(2, 3, 224, 224)).shape == (2, 8)
+
+
+@pytest.mark.parametrize("backbone", sorted(TORCHVISION_BACKBONES))
+def test_each_backbone_reads_back_off_its_own_checkpoint(offline_backbones, backbone):
+    """Which architecture wrote a file is the file's to say, not the caller's."""
+    weights = build_model(8, backbone).state_dict()
+
+    assert backbone_of(weights) == backbone
+    assert head_width(weights) == 8
+
+
+def test_the_head_width_comes_from_the_file_rather_than_a_default(offline_backbones):
+    """A run trained with the idle class carries an output the dataset lacks."""
+    seven = build_model(7, "efficientnet_b0").state_dict()
+    eight = build_model(8, "efficientnet_b0").state_dict()
+
+    assert (head_width(seven), head_width(eight)) == (7, 8)
+
+
+def test_a_checkpoint_naming_no_head_this_project_builds_is_refused():
+    """Silence here would build the wrong network and score it anyway."""
+    with pytest.raises(ValueError, match="names no head"):
+        backbone_of({"features.0.weight": torch.zeros(3)})
+
+
+def test_freezing_is_refused_on_a_backbone_with_no_stages_to_freeze():
+    """The stage names are the ResNets'. Inventing a mapping would be a guess."""
+    with pytest.raises(ValueError, match="--freeze is only"):
+        freeze(mobilenet_v3_small(weights=None), "early")
+
+
+def test_every_backbone_offered_knows_where_it_keeps_its_head():
+    """``BACKBONES`` is what the command line accepts; a gap there is a crash."""
+    assert set(HEAD_PATHS) == set(BACKBONES)

@@ -233,7 +233,13 @@ if __name__ == "__main__":
     from dataset import FrameDataset, eval_transform
     from device import describe, pick_device
     from manifest import load_class_names, with_idle_class
-    from model import DEFAULT_BACKBONE, adapt_batchnorm, backbone_of, build_model
+    from model import (
+        DEFAULT_BACKBONE,
+        adapt_batchnorm,
+        backbone_of,
+        build_model,
+        head_width,
+    )
     from splits import split_by_scene
 
     args = parse_args()
@@ -257,7 +263,7 @@ if __name__ == "__main__":
     # vocabulary has no name for, and building the network at the wrong width
     # fails on a shape mismatch rather than on a wrong number.
     weights = torch.load(args.checkpoint, map_location=device)
-    num_classes = len(weights["fc.bias"])
+    num_classes = head_width(weights)
     if num_classes > len(class_names):
         class_names = with_idle_class(class_names)
     # Which backbone wrote the file is read off the file for the same reason the

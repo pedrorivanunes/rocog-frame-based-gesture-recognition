@@ -39,6 +39,7 @@ from model import (
     backbone_of,
     build_model,
     freeze,
+    head_width,
 )
 from splits import (
     WINDOWS,
@@ -255,10 +256,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--backbone",
         choices=BACKBONES,
         default=DEFAULT_BACKBONE,
-        help="which ResNet18 to train. Both cost the same per frame and carry "
-        "the same parameter count; the ibn variant normalises half of each "
-        "shallow stage's channels by the instance instead of the batch, which "
-        "drops appearance statistics the batch would have kept",
+        help="which network to train. The two ResNet18s cost the same per frame "
+        "and carry the same parameter count; the ibn variant normalises half of "
+        "each shallow stage's channels by the instance instead of the batch, "
+        "which drops appearance statistics the batch would have kept. The other "
+        "two answer the same task at a fraction of the arithmetic per frame, "
+        "which is what turns one cost figure into a curve. --freeze is defined "
+        "only for the ResNets, whose stage names it addresses",
     )
     parser.add_argument(
         "--freeze",
@@ -801,7 +805,7 @@ if __name__ == "__main__":
         initial_weights = torch.load(
             PROJECT_ROOT / args.initial_weights, map_location="cpu"
         )
-        num_classes = len(initial_weights["fc.bias"])
+        num_classes = head_width(initial_weights)
         backbone = backbone_of(initial_weights)
 
     augmentation = Augmentation(

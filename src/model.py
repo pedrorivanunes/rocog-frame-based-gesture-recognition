@@ -12,19 +12,61 @@ from contextlib import contextmanager
 
 import torch
 from torch import nn
-from torchvision.models import ResNet18_Weights, resnet18
+from torchvision.models import (
+    EfficientNet_B0_Weights,
+    MobileNet_V3_Small_Weights,
+    ResNet18_Weights,
+    efficientnet_b0,
+    mobilenet_v3_small,
+    resnet18,
+)
 
 NUM_CLASSES = 7
 
-# The backbones a run may train. Both are ResNet18: the same stage names, the
-# same arithmetic per frame, and — once the head is resized to seven or eight
-# outputs — the same 11.18 M parameters. They differ in one thing, which is why
-# the second is here at all: it normalises half of each shallow stage's channels
-# by the instance rather than the batch, which removes appearance statistics a
-# batch would have preserved. The cost argument the project rests on survives
-# the swap untouched.
+# The backbones a run may train, in the order the project acquired them. The
+# first two are ResNet18 twice over: the same stage names, the same arithmetic
+# per frame, and — once the head is resized — the same 11.18 M parameters. They
+# differ in one thing, which is why the second is here at all: it normalises
+# half of each shallow stage's channels by the instance rather than the batch,
+# which removes appearance statistics a batch would have preserved.
+#
+# The last two are here for the opposite reason: they change the arithmetic and
+# little else. A cost figure measured on one network is a claim about that
+# network, and the two below were designed later against a different constraint
+# — arithmetic per image — so putting them beside it turns a single point into a
+# comparison. Which way that comparison runs is a question for measurement
+# rather than for this comment.
 DEFAULT_BACKBONE = "resnet18"
-BACKBONES = ("resnet18", "resnet18_ibn_a")
+BACKBONES = (
+    "resnet18",
+    "resnet18_ibn_a",
+    "mobilenet_v3_small",
+    "efficientnet_b0",
+)
+
+# Where each backbone keeps the linear layer that names the classes, as a dotted
+# path. One constant rather than two because the path serves both readings of
+# the same fact: it reaches the module when a head is being replaced, and naming
+# its bias gives the state dictionary key that says how wide a checkpoint's head
+# is. A second constant would be a second place for them to disagree.
+HEAD_PATHS = {
+    "resnet18": "fc",
+    "resnet18_ibn_a": "fc",
+    "mobilenet_v3_small": "classifier.3",
+    "efficientnet_b0": "classifier.1",
+}
+
+# How each torchvision backbone is built with the weights it was published with.
+# The IBN variant is absent on purpose: it does not come from torchvision, and
+# the exception it needs is spelled out in ``build_model``.
+TORCHVISION_BACKBONES = {
+    "resnet18": (resnet18, ResNet18_Weights.IMAGENET1K_V1),
+    "mobilenet_v3_small": (
+        mobilenet_v3_small,
+        MobileNet_V3_Small_Weights.IMAGENET1K_V1,
+    ),
+    "efficientnet_b0": (efficientnet_b0, EfficientNet_B0_Weights.IMAGENET1K_V1),
+}
 
 # Where the second one comes from, and what its weights carry that torchvision's
 # do not. Reading the marker back off a file is how a checkpoint says which
@@ -96,8 +138,9 @@ def build_model(
     if backbone not in BACKBONES:
         raise ValueError(f"unknown backbone {backbone!r}; expected one of {BACKBONES}")
 
-    if backbone == DEFAULT_BACKBONE:
-        model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+    if backbone in TORCHVISION_BACKBONES:
+        builder, published = TORCHVISION_BACKBONES[backbone]
+        model = builder(weights=published)
     else:
         with _weights_landing_on_the_cpu():
             model = torch.hub.load(
@@ -108,8 +151,51 @@ def build_model(
                 verbose=False,
             )
 
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
+    path = HEAD_PATHS[backbone]
+    head = _module_at(model, path)
+    _replace_module_at(model, path, nn.Linear(head.in_features, num_classes))
     return model
+
+
+def _module_at(model: nn.Module, path: str) -> nn.Module:
+    """Follow a dotted path of attribute names and sequence positions.
+
+    Two of the four backbones keep their classifier inside a ``Sequential``, so
+    reaching it means indexing as well as attribute lookup. Spelling both in one
+    string is what lets ``HEAD_PATHS`` hold a single entry per backbone rather
+    than a name and a position that could drift apart.
+    """
+    module = model
+    for step in path.split("."):
+        module = module[int(step)] if step.isdigit() else getattr(module, step)
+    return module
+
+
+def _replace_module_at(model: nn.Module, path: str, layer: nn.Module) -> None:
+    """Put a layer where a dotted path points, inside whatever holds it."""
+    *parents, last = path.split(".")
+    parent = _module_at(model, ".".join(parents)) if parents else model
+    if last.isdigit():
+        parent[int(last)] = layer
+    else:
+        setattr(parent, last, layer)
+
+
+def head_width(weights: Mapping[str, object]) -> int:
+    """How many classes a checkpoint's head names, whichever backbone wrote it.
+
+    The width belongs to the file, not to the run reading it: a checkpoint
+    trained with the idle class carries an eighth output, and a caller that
+    assumed seven would build a network the weights do not fit. Asking the file
+    keeps that from being something anyone has to remember.
+
+    Args:
+        weights: A checkpoint's state dictionary.
+
+    Returns:
+        The number of outputs its classification layer produces.
+    """
+    return len(weights[f"{HEAD_PATHS[backbone_of(weights)]}.bias"])
 
 
 def backbone_of(weights: Mapping[str, object]) -> str:
@@ -127,10 +213,18 @@ def backbone_of(weights: Mapping[str, object]) -> str:
     Returns:
         The name of the backbone to hand ``build_model``.
     """
-    return (
-        "resnet18_ibn_a"
-        if any(IBN_MARKER in key for key in weights)
-        else DEFAULT_BACKBONE
+    if any(IBN_MARKER in key for key in weights):
+        return "resnet18_ibn_a"
+
+    # Every remaining backbone is told apart by where it keeps its head, and the
+    # ResNet the IBN variant shares ``fc`` with has already been ruled out above.
+    for name, path in HEAD_PATHS.items():
+        if name != "resnet18_ibn_a" and f"{path}.bias" in weights:
+            return name
+
+    raise ValueError(
+        "the checkpoint names no head this project knows how to build; "
+        f"expected one of {sorted(set(HEAD_PATHS.values()))}"
     )
 
 
@@ -176,6 +270,18 @@ def freeze(model: nn.Module, depth: str) -> list[nn.Module]:
         The frozen stages, for the caller to put back into evaluation mode after
         each ``model.train()``. Empty for ``"none"``.
     """
+    # Only the ResNets name their stages this way. Refusing a backbone that does
+    # not is deliberate: the alternative is inventing a mapping for a network
+    # whose blocks divide differently, on an axis the project measured and
+    # closed as negative. Failing here is cheaper than a silently different
+    # experiment.
+    missing = [name for name in FROZEN_STAGES[depth] if not hasattr(model, name)]
+    if missing:
+        raise ValueError(
+            f"this backbone has no stages named {missing}; --freeze is only "
+            "defined for the ResNet backbones"
+        )
+
     stages = [getattr(model, name) for name in FROZEN_STAGES[depth]]
     for stage in stages:
         stage.eval()
