@@ -138,7 +138,13 @@ def predict(
     with torch.no_grad():
         for frames, batch_labels, batch_video_ids in loader:
             logits.append(model(frames.to(device)).cpu())
-            labels.append(batch_labels)
+            # Copied off the shared memory the workers hand it over on. A
+            # loader with workers backs every batch it serves by a file
+            # descriptor, and keeping the tensor keeps the descriptor: a split
+            # of a quarter of a million frames is four thousand batches, which
+            # is past the usual open-file limit. The scores do not need this
+            # because moving them off the device allocates afresh.
+            labels.append(batch_labels.clone())
             video_ids.extend(batch_video_ids)
 
     return torch.cat(logits), torch.cat(labels), video_ids

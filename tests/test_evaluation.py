@@ -174,3 +174,40 @@ def test_probability_table_rejects_scores_out_of_order():
             gesture_manifest(),
             {0: "Halt", 1: "Rally"},
         )
+
+
+def test_predict_does_not_hold_on_to_the_batches_it_was_served():
+    """A loader with workers backs each batch by a file descriptor.
+
+    Keeping the tensor keeps the descriptor, so a split of a quarter of a
+    million frames — four thousand batches — runs past the open-file limit
+    before it finishes. The check has to happen while the loop is still
+    running: by the time predict returns, its own list is out of scope and a
+    leak would look identical to none.
+    """
+    import gc
+    import weakref
+
+    still_held = []
+
+    def loader():
+        # The batch two iterations back is the one to ask about: predict's own
+        # loop variable still points at the most recent one, whether or not it
+        # also kept a copy, so checking that one would fail either way.
+        references = []
+        for _ in range(4):
+            labels = torch.tensor([0, 1])
+            references.append(weakref.ref(labels))
+            yield torch.zeros(2, 3, 2, 2), labels, ["a", "b"]
+            del labels
+            gc.collect()
+            if len(references) >= 2:
+                still_held.append(references[-2]() is not None)
+
+    class _Flat(nn.Module):
+        def forward(self, batch):
+            return batch.flatten(1)[:, :7]
+
+    predict(_Flat(), loader(), torch.device("cpu"))
+
+    assert still_held and not any(still_held)
