@@ -132,7 +132,7 @@ def build_model(
     to the gesture classes instead of ImageNet's 1000 categories. That mapping is
     what training has to learn.
 
-    ⚠️ The IBN variant is fetched from its authors' repository through
+    The IBN variant is fetched from its authors' repository through
     ``torch.hub`` and cached under ``~/.cache/torch``, so the first build of it
     needs a network and later ones do not. Its weights are ImageNet's, trained by
     them; nothing here retrains it.
@@ -187,7 +187,7 @@ def widen_stem(model: nn.Module, backbone: str, in_channels: int) -> None:
     expecting three. Rebuilding it wholesale would throw away what ImageNet
     taught the only layer that looks at raw pixels.
 
-    ⚠️ THE EXTRA CHANNELS START AT ZERO, AND THAT IS THE EXPERIMENT'S CONTROL.
+    The extra channels start at zero, and that is the experiment's control.
     A model whose new weights are zero computes, on its first step, exactly
     what the unmodified model computes: the extra input is multiplied away.
     So the run begins at the base rather than somewhere near it, and whatever
@@ -425,12 +425,12 @@ def adapt_batchnorm(model: nn.Module, batches: Iterable, device: torch.device) -
     cleared, PyTorch averages every batch equally instead. It is put back
     afterwards so a model adapted here can still be trained later.
 
-    ⚠️ Equal weight per *batch*, not per frame: a short final batch counts as
+    Equal weight per *batch*, not per frame: a short final batch counts as
     much as a full one. With frames in the thousands and batches in the dozens
     the difference is far below the noise of any comparison this feeds, and
     dropping the short batch would discard target frames to fix it.
 
-    ⚠️ This reads data from the domain being scored, so a result it produces is
+    This reads data from the domain being scored, so a result it produces is
     not *source-only* and cannot be set against a source-only baseline. Which
     frames it saw is the whole protocol question, and it belongs beside the
     number.

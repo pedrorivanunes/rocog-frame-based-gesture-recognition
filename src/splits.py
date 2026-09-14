@@ -148,7 +148,7 @@ def with_neighbour(
     serve every spacing: the column is recomputed in seconds, the frames are
     not re-read.
 
-    ⚠️ THE NEIGHBOUR IS LOOKED UP SOMEWHERE ELSE THAN IT IS ATTACHED, and that
+    The neighbour is looked up somewhere else than it is attached, and that
     separation is what keeps a comparison honest. The rows a run trains on are
     two dozen a video, spread apart; the neighbour of one of them is almost
     never another of them. So the lookup happens in the dense manifest while
@@ -342,13 +342,13 @@ def sample_videos(
     percent sees too. Without that, two points on the curve could differ by
     which videos they happened to get rather than by how many.
 
-    ⚠️ The order depends on the seed, which is this project's label for a
+    The order depends on the seed, which is this project's label for a
     repetition. So three seeds of one fraction see three different draws, and
     the spread across them includes the luck of the draw — which is the honest
     error bar for a curve about data quantity, and larger than the spread of
     three seeds that differ only in initialisation.
 
-    ⚠️ Every class keeps at least one video however small the fraction, so the
+    Every class keeps at least one video however small the fraction, so the
     smallest points hold slightly more data than their name suggests. Callers
     should report the video count they actually got, not the fraction they
     asked for.

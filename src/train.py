@@ -819,7 +819,7 @@ if __name__ == "__main__":
     if args.idle_manifest:
         idle = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.idle_manifest)
         idle_train, _ = split_by_group(idle, held_out)
-        # ⚠️ The eighth class is trained on too, so its rows need neighbours
+        # The eighth class is trained on too, so its rows need neighbours
         # like any other. Leaving them without would mix three-channel and
         # six-channel frames in one batch; giving them a neighbour of
         # themselves would be worse, because a difference of exactly zero is a

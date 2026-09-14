@@ -254,7 +254,7 @@ class TextureRandomiser:
     restriction to the silhouette is what matters, the two must come apart, and
     if any perturbation of this size would have done, they will not.
 
-    ⚠️ ``everywhere`` is the stronger perturbation, not an equal one applied
+    ``everywhere`` is the stronger perturbation, not an equal one applied
     elsewhere — it covers the person as well as the scene. A draw near total
     leaves a frame with little left to read, which happens on a small share of
     the frames it fires on. That cost falls on the control, so it biases the
@@ -634,7 +634,7 @@ class FrameDataset(Dataset):
         if "neighbour_path" not in row:
             return self._prepare(row["path"]), row["label"], row["video_id"]
 
-        # ⚠️ THE PAIR SHARES EVERY DRAW, AND THAT IS THE WHOLE DESIGN. A
+        # The pair shares every draw, and that is the whole design. A
         # difference between two frames augmented independently measures the
         # augmentation, not the movement: a different crop shifts the entire
         # image and swamps a moving arm; a different background fill replaces

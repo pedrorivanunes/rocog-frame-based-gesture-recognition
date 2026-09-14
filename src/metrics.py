@@ -520,7 +520,7 @@ def format_delta(
     is worth seeing — and the ones whose difference exceeds ``threshold`` times
     its own standard error carry a mark.
 
-    ⚠️ The mark is a screening aid, not a test. With three repetitions the error
+    The mark is a screening aid, not a test. With three repetitions the error
     rests on two degrees of freedom, and "twice the standard error" is nowhere
     near a p-value. It says where to look, not what to conclude.
 

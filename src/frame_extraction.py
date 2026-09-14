@@ -377,7 +377,7 @@ def extract_all_idle_frames(video_path: Path) -> list[SampledFrame]:
     the eighth class is trained on too. Four idle frames a video have no
     neighbours among themselves.
 
-    ⚠️ Giving those rows a neighbour of themselves instead would be worse than
+    Giving those rows a neighbour of themselves instead would be worse than
     leaving them out. Their difference would be exactly zero, and exactly zero
     is a label: the network would read the eighth class off the arithmetic
     rather than off the picture.

@@ -12,7 +12,7 @@ A small head then learns to turn a sequence of those vectors into one answer.
 Because the features are fixed, any difference between an order-aware head and
 an order-blind one is order, and nothing else.
 
-⚠️ THE CONTROL IS THE POINT, AND IT IS NOT THE LINEAR HEAD. A recurrent head
+The control is the point, and it is not the linear head. A recurrent head
 carries far more parameters than a linear one, so beating the linear head would
 confound order with capacity. The control that isolates order is the same
 recurrent head fed the same frames **shuffled**: identical architecture,
@@ -20,7 +20,7 @@ identical capacity, identical training, with only the sequence destroyed. The
 linear head is kept as a second, weaker reference — it says what a sequence
 model buys over no sequence model at all.
 
-⚠️ THE HEAD TRAINS ON EXACTLY WHAT THE ORIGINAL HEAD TRAINED ON. The classifier
+The head trains on exactly what the original head trained on. The classifier
 this replaces was fitted, jointly with the backbone, on the synthetic training
 split and stopped on the held-out scenes. Giving the new head less would not
 make the comparison cleaner; it would hand the treatment a handicap the control
