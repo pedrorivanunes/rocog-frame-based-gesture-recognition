@@ -45,6 +45,7 @@ import numpy as np
 
 from frame_extraction import (
     SampledFrame,
+    extract_all_frames,
     extract_frames,
     extract_idle_frames,
     read_metadata,
@@ -96,6 +97,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--idle",
         action="store_true",
         help="sample the stretch before each gesture instead of the gesture itself",
+    )
+    parser.add_argument(
+        "--dense",
+        action="store_true",
+        help="keep every frame of the gesture window instead of sampling a "
+        "fixed number. Experiments that need neighbouring frames — a "
+        "difference between them, a clip read in order — cannot be served by "
+        "frames spread across the gesture at any spacing.",
     )
     return parser.parse_args(argv)
 
@@ -295,9 +304,26 @@ if __name__ == "__main__":
     # they are told apart by the frames they name: a run over the gesture never
     # picks a number a run before it could pick. Separate manifests keep each one
     # a table of whole videos, which is what resuming counts on.
-    sample_frames = extract_idle_frames if args.idle else extract_frames
-    frames_per_video = NUM_IDLE_FRAMES if args.idle else NUM_FRAMES
-    manifest_name = args.annotations.stem + ("_idle" if args.idle else "")
+    if args.idle and args.dense:
+        raise SystemExit("--idle and --dense cover different parts of a video")
+
+    def dense_frames(video_path, _frames_per_video, _rng):
+        """A dense pass chooses nothing: the window decides how many frames."""
+        return extract_all_frames(video_path)
+
+    if args.dense:
+        # None, because windows differ in length and no single count says a
+        # video is finished. Each video writes its own in ``window_frames``.
+        sample_frames, frames_per_video, suffix = dense_frames, None, "_dense"
+    elif args.idle:
+        sample_frames, frames_per_video, suffix = (
+            extract_idle_frames,
+            NUM_IDLE_FRAMES,
+            "_idle",
+        )
+    else:
+        sample_frames, frames_per_video, suffix = extract_frames, NUM_FRAMES, ""
+    manifest_name = args.annotations.stem + suffix
 
     manifest_path = PROJECT_ROOT / "data" / "manifests" / f"{manifest_name}.csv"
     dropped_rows = drop_incomplete_videos(manifest_path, frames_per_video)
@@ -347,6 +373,10 @@ if __name__ == "__main__":
                     "position": sampled.position,
                     "path": frame_path.relative_to(PROJECT_ROOT),
                 }
+                if args.dense:
+                    # What a finished video looks like, carried by the rows
+                    # themselves, since the pass has no fixed count to check.
+                    row["window_frames"] = len(frames)
                 rows.append(row)
 
             append_rows(rows, manifest_path)

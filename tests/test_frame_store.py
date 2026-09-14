@@ -161,3 +161,31 @@ def test_a_frame_without_a_path_to_write_to_is_refused(tmp_path):
     """Silently dropping one would leave a manifest row with no file."""
     with pytest.raises(ValueError):
         save_frames([gradient(320), gradient(320)], [tmp_path / "one.jpg"], 256)
+
+
+def _dense_manifest(path, groups):
+    """Write a manifest where each video declares how long its window is."""
+    rows = [
+        {"video_id": video, "window_frames": declared, "frame_number": index}
+        for video, declared, written in groups
+        for index in range(written)
+    ]
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def test_a_dense_video_is_finished_when_it_has_the_rows_it_declared(tmp_path):
+    """Windows differ in length, so no single count says a video is done."""
+    path = tmp_path / "dense.csv"
+    _dense_manifest(path, [("a", 31, 31), ("b", 244, 244), ("c", 97, 12)])
+
+    assert completed_videos(path, None) == {"a", "b"}
+
+
+def test_a_dense_pass_trims_back_the_video_it_was_cut_off_writing(tmp_path):
+    path = tmp_path / "dense.csv"
+    _dense_manifest(path, [("a", 31, 31), ("c", 97, 12)])
+
+    dropped = drop_incomplete_videos(path, None)
+
+    assert dropped == 12
+    assert set(pd.read_csv(path)["video_id"]) == {"a"}

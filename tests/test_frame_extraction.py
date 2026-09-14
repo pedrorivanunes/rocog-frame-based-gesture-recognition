@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from frame_extraction import (
+    extract_all_frames,
     extract_frames,
     extract_idle_frames,
     gesture_window,
@@ -339,3 +340,27 @@ def test_the_dropped_first_frame_is_not_counted_as_available(tmp_path):
 
     with pytest.raises(RuntimeError, match="3 frames before the gesture"):
         extract_idle_frames(video_path, 4, np.random.default_rng(0))
+
+
+def test_a_dense_pass_keeps_every_frame_of_the_window(video):
+    """The whole point: frames next to each other, which sampling cannot give."""
+    frames = extract_all_frames(video)
+
+    assert len(frames) == 8
+    assert [frame.frame_number for frame in frames] == list(range(8))
+
+
+def test_a_dense_pass_reads_each_frame_where_it_says_it_did(video):
+    """Sequential decoding is an optimisation; it must not shift the images."""
+    frames = extract_all_frames(video)
+    shades = [int(frame.frame[0, 0, 0]) for frame in frames]
+
+    assert shades == [10, 40, 70, 100, 130, 160, 190, 220]
+
+
+def test_a_dense_pass_spans_the_window_from_zero_to_one(video):
+    """Position means the same thing here as everywhere else in the record."""
+    frames = extract_all_frames(video)
+
+    assert frames[0].position == pytest.approx(0.0)
+    assert frames[-1].position == pytest.approx(1.0)

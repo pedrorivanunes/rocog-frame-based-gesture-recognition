@@ -307,6 +307,51 @@ def extract_frames(
     return frames
 
 
+def extract_all_frames(video_path: Path) -> list[SampledFrame]:
+    """Read every frame of a video's gesture window, in order.
+
+    The counterpart to ``extract_frames``: that one chooses which frames to
+    keep and this one chooses nothing. What it is for is the experiments that
+    need frames next to each other — a difference between neighbours, a clip a
+    temporal model reads — which a sampled set of two dozen spread across the
+    gesture cannot supply at any spacing.
+
+    It decodes forward from one seek rather than seeking per frame. Seeking is
+    what ``_read_at`` does, and it is the right thing for two dozen scattered
+    numbers; for a hundred consecutive ones it re-decodes from the nearest
+    keyframe over and over, and the pass is several times slower for nothing.
+
+    Args:
+        video_path: Path to the ``.mp4`` to read.
+
+    Returns:
+        One ``SampledFrame`` per frame of the window, in increasing frame
+        order. ``position`` runs 0.0 to 1.0 across the window, as everywhere
+        else.
+
+    Raises:
+        RuntimeError: If the video cannot be opened, or a frame cannot be read.
+    """
+    video, gesture_start_frame, gesture_end_frame = _open_at_gesture(video_path)
+    span = max(gesture_end_frame - gesture_start_frame, 1)
+
+    try:
+        video.set(cv2.CAP_PROP_POS_FRAMES, gesture_start_frame)
+        frames = []
+        for frame_number in range(gesture_start_frame, gesture_end_frame + 1):
+            ok, frame = video.read()
+            if not ok:
+                raise RuntimeError(
+                    f"{video_path.name}: failure when reading frame {frame_number}"
+                )
+            position = (frame_number - gesture_start_frame) / span
+            frames.append(SampledFrame(frame_number, position, frame))
+    finally:
+        video.release()
+
+    return frames
+
+
 def extract_idle_frames(
     video_path: Path,
     num_frames: int,

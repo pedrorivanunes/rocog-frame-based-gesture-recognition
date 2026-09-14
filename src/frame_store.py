@@ -63,7 +63,7 @@ def save_frames(
             raise RuntimeError(f"could not write frame to {path}")
 
 
-def drop_incomplete_videos(manifest_path: Path, frames_per_video: int) -> int:
+def drop_incomplete_videos(manifest_path: Path, frames_per_video: int | None) -> int:
     """Trim a manifest back to whole videos, before a pass resumes into it.
 
     A pass cut off while writing leaves a short group of rows behind. That video
@@ -83,7 +83,10 @@ def drop_incomplete_videos(manifest_path: Path, frames_per_video: int) -> int:
     Args:
         manifest_path: Manifest to trim in place. Missing or empty is left
             alone, there being nothing to trim.
-        frames_per_video: How many rows a finished video contributes.
+        frames_per_video: How many rows a finished video contributes, or
+            ``None`` when each video declares its own in a ``window_frames``
+            column — which is what a dense pass over whole windows needs, since
+            the windows are not all the same length.
 
     Returns:
         How many rows were dropped.
@@ -93,7 +96,13 @@ def drop_incomplete_videos(manifest_path: Path, frames_per_video: int) -> int:
 
     written = pd.read_csv(manifest_path, float_precision="round_trip")
     rows_per_video = written["video_id"].map(written["video_id"].value_counts())
-    whole = written[rows_per_video == frames_per_video]
+    # A dense pass keeps every frame of the gesture window, and windows differ
+    # in length, so there is no one number a finished video must match. The
+    # count it should have travels with the rows instead.
+    expected = (
+        written["window_frames"] if frames_per_video is None else frames_per_video
+    )
+    whole = written[rows_per_video == expected]
 
     if len(whole) < len(written):
         whole.to_csv(manifest_path, index=False)
@@ -101,7 +110,7 @@ def drop_incomplete_videos(manifest_path: Path, frames_per_video: int) -> int:
     return len(written) - len(whole)
 
 
-def completed_videos(manifest_path: Path, frames_per_video: int) -> set[str]:
+def completed_videos(manifest_path: Path, frames_per_video: int | None) -> set[str]:
     """Read back which videos a previous pass finished.
 
     A pass over the synthetic subset runs for hours and this machine has lost
@@ -124,13 +133,24 @@ def completed_videos(manifest_path: Path, frames_per_video: int) -> set[str]:
     Args:
         manifest_path: Manifest a previous pass wrote. Missing or empty means
             nothing is done yet.
-        frames_per_video: How many rows a finished video contributes.
+        frames_per_video: How many rows a finished video contributes, or
+            ``None`` when each video declares its own in a ``window_frames``
+            column — which is what a dense pass over whole windows needs, since
+            the windows are not all the same length.
 
     Returns:
         The ids of the videos that need not be extracted again.
     """
     if not manifest_path.exists() or manifest_path.stat().st_size == 0:
         return set()
+
+    if frames_per_video is None:
+        manifest = pd.read_csv(manifest_path, usecols=["video_id", "window_frames"])
+        rows_per_video = manifest["video_id"].value_counts()
+        expected = manifest.groupby("video_id")["window_frames"].first()
+        return set(
+            rows_per_video.index[rows_per_video == expected[rows_per_video.index]]
+        )
 
     rows_per_video = pd.read_csv(manifest_path, usecols=["video_id"])[
         "video_id"
