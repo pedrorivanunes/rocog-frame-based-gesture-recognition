@@ -9,6 +9,7 @@ from splits import (
     select_frames,
     split_by_group,
     split_by_scene,
+    with_neighbour,
 )
 
 REAL_SHAPE = [7, 7, 7, 5, 6, 8]
@@ -391,3 +392,59 @@ class TestSampleVideos:
         """Zero would hand back nothing and fail later, further from the cause."""
         with pytest.raises(ValueError, match="fraction must be"):
             sample_videos(self.manifest(), fraction)
+
+
+def _dense(videos=2, frames=6, start=10):
+    """A dense manifest: contiguous frame numbers, one path each."""
+    return pd.DataFrame(
+        {
+            "video_id": [f"v{v}" for v in range(videos) for _ in range(frames)],
+            "frame_number": list(range(start, start + frames)) * videos,
+            "path": [
+                f"frames/v{v}_f{n:04d}.jpg"
+                for v in range(videos)
+                for n in range(start, start + frames)
+            ],
+        }
+    )
+
+
+def test_a_neighbour_sits_the_asked_stride_back():
+    annotated = with_neighbour(_dense(), stride=2)
+
+    row = annotated[annotated["frame_number"] == 14].iloc[0]
+    assert row["neighbour_path"].endswith("_f0012.jpg")
+
+
+def test_a_neighbour_before_the_window_falls_back_to_its_first_frame():
+    """The first frame then points at itself, and its difference is zero.
+
+    That is the honest reading: no earlier frame exists, so no movement was
+    measured — rather than a difference against some other video's frame.
+    """
+    annotated = with_neighbour(_dense(start=10), stride=3)
+    early = annotated[annotated["frame_number"] < 13]
+
+    assert set(early["neighbour_path"]) == {
+        path for path in early["path"] if path.endswith("_f0010.jpg")
+    }
+
+
+def test_a_neighbour_never_comes_from_another_video():
+    annotated = with_neighbour(_dense(), stride=4)
+
+    for _, row in annotated.iterrows():
+        assert row["neighbour_path"].split("_f")[0].endswith(row["video_id"])
+
+
+def test_a_stride_below_one_is_refused():
+    with pytest.raises(ValueError, match="at least 1"):
+        with_neighbour(_dense(), stride=0)
+
+
+def test_a_repeated_frame_number_is_refused():
+    """A dense pass never writes one, and it would make the neighbour ambiguous."""
+    doubled = pd.concat([_dense(videos=1), _dense(videos=1)])
+
+    with pytest.raises(ValueError, match="same frame number twice"):
+        with_neighbour(doubled, stride=1)

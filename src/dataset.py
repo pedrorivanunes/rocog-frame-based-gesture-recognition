@@ -622,20 +622,51 @@ class FrameDataset(Dataset):
         Returns:
             The transformed frame as a ``(3, 224, 224)`` float tensor, the class
             label, and the ``video_id`` needed to group predictions by video.
+            When the manifest names a neighbour, the frame comes back as six
+            channels instead of three: the frame itself, then what changed
+            since its neighbour.
 
         Raises:
             RuntimeError: If a frame, or a silhouette a background swap needs,
                 is missing from disk.
         """
         row = self.data_frame.iloc[index]
-        frame_path = self.data_root / row["path"]
+        if "neighbour_path" not in row:
+            return self._prepare(row["path"]), row["label"], row["video_id"]
+
+        # ⚠️ THE PAIR SHARES EVERY DRAW, AND THAT IS THE WHOLE DESIGN. A
+        # difference between two frames augmented independently measures the
+        # augmentation, not the movement: a different crop shifts the entire
+        # image and swamps a moving arm; a different background fill replaces
+        # everything the person is not. Every randomiser and every transform
+        # here draws through torch's generator, so replaying its state around
+        # the second frame reproduces the first frame's draws exactly — crop,
+        # flip, jitter, gamma, background kind and colour, texture and fill —
+        # without any of them needing to know a pair exists.
+        state = torch.get_rng_state()
+        frame = self._prepare(row["path"])
+        torch.set_rng_state(state)
+        neighbour = self._prepare(row["neighbour_path"])
+
+        # The difference is taken after the pipeline, not before, so that what
+        # is subtracted is what the network would actually have seen. It is
+        # taken in normalised space, where a still background cancels to zero.
+        return (
+            torch.cat([frame, frame - neighbour]),
+            row["label"],
+            row["video_id"],
+        )
+
+    def _prepare(self, path: str):
+        """One frame, from the image on disk to the tensor the model reads."""
+        frame_path = self.data_root / path
         frame = cv2.imread(str(frame_path))
         if frame is None:
             raise RuntimeError(f"could not read frame {frame_path}")
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         if self.background is not None or self.texture is not None:
-            silhouette_path = self.data_root / mask_path_for(row["path"])
+            silhouette_path = self.data_root / mask_path_for(path)
             silhouette = cv2.imread(str(silhouette_path), cv2.IMREAD_GRAYSCALE)
             if silhouette is None:
                 raise RuntimeError(f"could not read silhouette {silhouette_path}")
@@ -645,8 +676,7 @@ class FrameDataset(Dataset):
             if self.texture is not None:
                 frame = self.texture(frame, person)
 
-        frame = self.transform(frame)
-        return frame, row["label"], row["video_id"]
+        return self.transform(frame)
 
 
 class SegmentSampler(Sampler[int]):

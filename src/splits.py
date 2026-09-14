@@ -137,6 +137,56 @@ def split_by_scene(
     return split_by_group(manifest, held_out)
 
 
+def with_neighbour(manifest: pd.DataFrame, stride: int) -> pd.DataFrame:
+    """Name, for every frame, the frame it should be differenced against.
+
+    A difference between neighbouring frames says where the person moved and
+    where nothing did. Which frame counts as the neighbour is a choice, and
+    keeping it here rather than in the extraction is what lets one dense pass
+    serve every spacing: the column is recomputed in seconds, the frames are
+    not re-read.
+
+    ⚠️ This wants the DENSE manifest, before any frame selection. The neighbour
+    of a frame chosen for training is almost never itself chosen, so annotating
+    a selection would find nothing to point at.
+
+    Frames whose neighbour falls before the window fall back to the earliest
+    frame the video has. The first frame of all then points at itself and its
+    difference is exactly zero, which is the honest reading: no earlier frame
+    exists, so no movement was measured.
+
+    Args:
+        manifest: Dense manifest, one row per frame of each gesture window.
+        stride: How many frames back the neighbour sits. Small values measure
+            local movement; large ones measure the gesture changing shape.
+
+    Returns:
+        The manifest with a ``neighbour_path`` column added.
+
+    Raises:
+        ValueError: If the stride is not positive, or if a video carries the
+            same frame number twice — which a dense pass never writes, and
+            which would make the neighbour of that frame ambiguous.
+    """
+    if stride < 1:
+        raise ValueError(f"stride must be at least 1, got {stride}")
+
+    keys = ["video_id", "frame_number"]
+    if manifest.duplicated(keys).any():
+        raise ValueError("a video carries the same frame number twice")
+
+    lookup = manifest.set_index(keys)["path"]
+    earliest = manifest.groupby("video_id")["frame_number"].transform("min")
+    wanted = (manifest["frame_number"] - stride).clip(lower=earliest)
+
+    annotated = manifest.copy()
+    annotated["neighbour_path"] = lookup.reindex(
+        pd.MultiIndex.from_arrays([manifest["video_id"], wanted])
+    ).to_numpy()
+
+    return annotated
+
+
 def select_frames(
     manifest: pd.DataFrame,
     window: str = "full",

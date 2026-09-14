@@ -1,3 +1,4 @@
+import cv2
 import numpy as np
 import pandas as pd
 import pytest
@@ -10,6 +11,7 @@ from dataset import (
     Augmentation,
     BackgroundRandomiser,
     CombinedSampler,
+    FrameDataset,
     RandomGamma,
     SegmentSampler,
     TextureRandomiser,
@@ -593,3 +595,80 @@ def test_the_refusal_names_the_crop_the_tree_expects():
 def test_a_pipeline_with_no_crop_is_left_alone():
     """The check is about disagreement, not about requiring a crop."""
     crop_fits(sized_manifest(640), v2.Compose([v2.ToImage()]))
+
+
+def _paired_manifest(tmp_path, neighbour_is_self: bool):
+    """Two frames on disk, and a manifest that pairs the first with one of them."""
+    paths = []
+    for index, shade in enumerate((60, 200)):
+        image = np.full((256, 256, 3), shade, dtype=np.uint8)
+        image[40:80, 40:80] = 255 - shade
+        directory = tmp_path / "frames"
+        directory.mkdir(exist_ok=True)
+        path = directory / f"frame_{index}.jpg"
+        cv2.imwrite(str(path), image)
+        paths.append(str(path.relative_to(tmp_path)))
+
+    return pd.DataFrame(
+        {
+            "video_id": ["v0"],
+            "frame_number": [1],
+            "label": [0],
+            "path": [paths[0]],
+            "neighbour_path": [paths[0] if neighbour_is_self else paths[1]],
+        }
+    )
+
+
+def test_a_paired_manifest_is_served_as_six_channels(tmp_path):
+    """The frame, then what changed since its neighbour."""
+    manifest = _paired_manifest(tmp_path, neighbour_is_self=False)
+    dataset = FrameDataset(manifest, tmp_path, eval_transform())
+
+    frame, _, _ = dataset[0]
+
+    assert frame.shape == (6, 224, 224)
+
+
+def test_a_manifest_without_a_neighbour_is_served_as_three(tmp_path):
+    manifest = _paired_manifest(tmp_path, neighbour_is_self=False).drop(
+        columns=["neighbour_path"]
+    )
+    dataset = FrameDataset(manifest, tmp_path, eval_transform())
+
+    frame, _, _ = dataset[0]
+
+    assert frame.shape == (3, 224, 224)
+
+
+def test_a_frame_paired_with_itself_differs_from_itself_by_exactly_nothing(tmp_path):
+    """The property the whole design rests on.
+
+    It is checked under the augmentation that would break it. Two frames
+    augmented independently differ by the augmentation rather than by any
+    movement: a different crop shifts the whole image, a different fill
+    replaces everything the person is not. Measured on real frames that noise
+    runs twenty to a hundred times larger than the movement being looked for,
+    and it would have arrived silently. A frame paired with itself is the case
+    whose answer is known to be zero, so it is the case that catches it.
+    """
+    manifest = _paired_manifest(tmp_path, neighbour_is_self=True)
+    dataset = FrameDataset(
+        manifest,
+        tmp_path,
+        train_transform(Augmentation(photometric=True, geometric=True)),
+    )
+
+    for _ in range(5):
+        frame, _, _ = dataset[0]
+        assert torch.equal(frame[3:], torch.zeros_like(frame[3:]))
+
+
+def test_a_frame_paired_with_another_does_differ(tmp_path):
+    """The companion check: zero everywhere would mean the pair never loaded."""
+    manifest = _paired_manifest(tmp_path, neighbour_is_self=False)
+    dataset = FrameDataset(manifest, tmp_path, eval_transform())
+
+    frame, _, _ = dataset[0]
+
+    assert frame[3:].abs().sum() > 0
