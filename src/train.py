@@ -48,6 +48,7 @@ from splits import (
     select_frames,
     split_by_group,
     split_by_scene,
+    with_neighbour,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -157,6 +158,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ``save_every_epoch``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--neighbour-stride",
+        type=int,
+        default=None,
+        help="hand the network, alongside each frame, what changed since the "
+        "frame this many back. Needs the dense manifest of the same split to "
+        "look the neighbour up in; the frames trained on stay the ones this "
+        "run's own manifest names.",
+    )
     parser.add_argument(
         "--idle-manifest",
         default=None,
@@ -788,10 +798,34 @@ if __name__ == "__main__":
     # meant. The held-out groups are named rather than drawn again: the two
     # manifests cover the same videos, and a second draw could put a scene on
     # opposite sides of the boundary in the two of them.
+    # After every selection, and on both sides of the split: what a frame is
+    # differenced against is a property of the frame, so it travels with the row
+    # rather than being decided per dataset. The lookup happens in the dense
+    # manifest while the column lands on the rows served, so a run reading
+    # differences trains on exactly the frames a run without them trains on.
+    def differenced(rows: pd.DataFrame, manifest_name: str) -> pd.DataFrame:
+        """Name each row's neighbour, looked up in that split's dense pass."""
+        dense_name = Path(manifest_name).stem + "_dense.csv"
+        dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
+        return with_neighbour(rows, args.neighbour_stride, dense)
+
+    reads_neighbours = args.neighbour_stride is not None
+    in_channels = 6 if reads_neighbours else 3
+    if reads_neighbours:
+        train_manifest = differenced(train_manifest, args.manifest)
+        eval_manifest = differenced(eval_manifest, args.manifest)
+
     num_classes = NUM_CLASSES
     if args.idle_manifest:
         idle = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.idle_manifest)
         idle_train, _ = split_by_group(idle, held_out)
+        # ⚠️ The eighth class is trained on too, so its rows need neighbours
+        # like any other. Leaving them without would mix three-channel and
+        # six-channel frames in one batch; giving them a neighbour of
+        # themselves would be worse, because a difference of exactly zero is a
+        # label, and the network would read the class off the arithmetic.
+        if reads_neighbours:
+            idle_train = differenced(idle_train, args.idle_manifest)
         train_manifest = add_idle_rows(train_manifest, idle_train)
         num_classes = IDLE_LABEL + 1
 
@@ -859,7 +893,7 @@ if __name__ == "__main__":
 
     device = pick_device()
     print(f"device: {describe(device)}")
-    model = build_model(num_classes, backbone).to(device)
+    model = build_model(num_classes, backbone, in_channels).to(device)
     if initial_weights is not None:
         model.load_state_dict(initial_weights)
         print(

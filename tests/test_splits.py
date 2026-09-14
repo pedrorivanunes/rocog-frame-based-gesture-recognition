@@ -448,3 +448,32 @@ def test_a_repeated_frame_number_is_refused():
 
     with pytest.raises(ValueError, match="same frame number twice"):
         with_neighbour(doubled, stride=1)
+
+
+def test_a_neighbour_is_looked_up_somewhere_other_than_it_lands():
+    """Their neighbours are not among the rows a run trains on.
+
+    Looking up in the dense pass while attaching to the served rows is what
+    lets a run reading differences train on exactly the frames a run without
+    them trains on.
+    """
+    dense = _dense(videos=1, frames=20, start=0)
+    chosen = dense[dense["frame_number"].isin([5, 12])]
+
+    annotated = with_neighbour(chosen, stride=2, dense=dense)
+
+    assert list(annotated["path"]) == list(chosen["path"])
+    assert [p.rsplit("_f", 1)[1] for p in annotated["neighbour_path"]] == [
+        "0003.jpg",
+        "0010.jpg",
+    ]
+
+
+def test_rows_whose_neighbour_is_nowhere_are_refused():
+    """Silently dropping them would leave a run short of frames it asked for."""
+    dense = _dense(videos=1, frames=5, start=0)
+    stranger = dense.copy()
+    stranger["video_id"] = "elsewhere"
+
+    with pytest.raises(ValueError, match="no neighbour for"):
+        with_neighbour(stranger, stride=1, dense=dense)

@@ -69,6 +69,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="score only the held-out validation scenes of the manifest",
     )
     parser.add_argument(
+        "--neighbour-stride",
+        type=int,
+        default=None,
+        help="how many frames back the difference channels were taken from, "
+        "for a checkpoint trained to read them. Asked for rather than read off "
+        "the file because a plain state dict has nowhere to record it; scoring "
+        "such a checkpoint without it is refused rather than guessed.",
+    )
+    parser.add_argument(
         "--features",
         action="store_true",
         help="write the penultimate features instead of class probabilities, "
@@ -290,8 +299,9 @@ if __name__ == "__main__":
         backbone_of,
         build_model,
         head_width,
+        stem_width,
     )
-    from splits import split_by_scene
+    from splits import split_by_scene, with_neighbour
 
     args = parse_args()
     print(
@@ -321,7 +331,19 @@ if __name__ == "__main__":
     # head's width is: a caller asked to remember would eventually pair the
     # wrong two, and the failure is a shape mismatch at best.
     backbone = backbone_of(weights)
-    model = build_model(num_classes, backbone).to(device)
+    in_channels = stem_width(weights)
+    if in_channels > 3:
+        if args.neighbour_stride is None:
+            raise SystemExit(
+                f"{args.checkpoint.name} reads {in_channels} channels; "
+                "--neighbour-stride says which frame the extra ones came from"
+            )
+        dense_name = Path(args.manifest).stem + "_dense.csv"
+        dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
+        manifest = with_neighbour(manifest, args.neighbour_stride, dense)
+        print(f"differencing against the frame {args.neighbour_stride} back")
+
+    model = build_model(num_classes, backbone, in_channels).to(device)
     model.load_state_dict(weights)
     if backbone != DEFAULT_BACKBONE:
         print(f"backbone: {backbone}")

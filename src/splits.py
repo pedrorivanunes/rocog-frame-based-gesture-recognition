@@ -137,7 +137,9 @@ def split_by_scene(
     return split_by_group(manifest, held_out)
 
 
-def with_neighbour(manifest: pd.DataFrame, stride: int) -> pd.DataFrame:
+def with_neighbour(
+    manifest: pd.DataFrame, stride: int, dense: pd.DataFrame | None = None
+) -> pd.DataFrame:
     """Name, for every frame, the frame it should be differenced against.
 
     A difference between neighbouring frames says where the person moved and
@@ -146,9 +148,14 @@ def with_neighbour(manifest: pd.DataFrame, stride: int) -> pd.DataFrame:
     serve every spacing: the column is recomputed in seconds, the frames are
     not re-read.
 
-    ⚠️ This wants the DENSE manifest, before any frame selection. The neighbour
-    of a frame chosen for training is almost never itself chosen, so annotating
-    a selection would find nothing to point at.
+    ⚠️ THE NEIGHBOUR IS LOOKED UP SOMEWHERE ELSE THAN IT IS ATTACHED, and that
+    separation is what keeps a comparison honest. The rows a run trains on are
+    two dozen a video, spread apart; the neighbour of one of them is almost
+    never another of them. So the lookup happens in the dense manifest while
+    the column lands on the rows being served — which means a run reading
+    differences trains on exactly the frames the run without them trains on,
+    and the two differ in the extra channels rather than in which frames they
+    saw.
 
     Frames whose neighbour falls before the window fall back to the earliest
     frame the video has. The first frame of all then points at itself and its
@@ -159,6 +166,9 @@ def with_neighbour(manifest: pd.DataFrame, stride: int) -> pd.DataFrame:
         manifest: Dense manifest, one row per frame of each gesture window.
         stride: How many frames back the neighbour sits. Small values measure
             local movement; large ones measure the gesture changing shape.
+        dense: Where to look the neighbour up, every frame of every window.
+            Defaults to ``manifest`` itself, which is right only when that is
+            already dense.
 
     Returns:
         The manifest with a ``neighbour_path`` column added.
@@ -171,18 +181,27 @@ def with_neighbour(manifest: pd.DataFrame, stride: int) -> pd.DataFrame:
     if stride < 1:
         raise ValueError(f"stride must be at least 1, got {stride}")
 
+    source = manifest if dense is None else dense
     keys = ["video_id", "frame_number"]
-    if manifest.duplicated(keys).any():
+    if source.duplicated(keys).any():
         raise ValueError("a video carries the same frame number twice")
 
-    lookup = manifest.set_index(keys)["path"]
-    earliest = manifest.groupby("video_id")["frame_number"].transform("min")
+    lookup = source.set_index(keys)["path"]
+    starts = source.groupby("video_id")["frame_number"].min()
+    earliest = manifest["video_id"].map(starts)
     wanted = (manifest["frame_number"] - stride).clip(lower=earliest)
 
     annotated = manifest.copy()
     annotated["neighbour_path"] = lookup.reindex(
         pd.MultiIndex.from_arrays([manifest["video_id"], wanted])
     ).to_numpy()
+
+    if annotated["neighbour_path"].isna().any():
+        missing = annotated.loc[annotated["neighbour_path"].isna(), "video_id"]
+        raise ValueError(
+            f"no neighbour for {missing.nunique()} video(s), starting with "
+            f"{missing.iloc[0]}: is this the dense manifest for these rows?"
+        )
 
     return annotated
 
