@@ -1,0 +1,15 @@
+# Extra dependencies for src/benchmark.py only.
+#
+# The latency table compares this project's frame-based networks against the
+# clip-based baselines the dataset's paper reports. Those two architectures are
+# not in torchvision, and nothing else in this repository needs them, so they
+# are kept out of requirements.txt: the training and evaluation pipeline
+# installs and runs without anything here.
+#
+# Neither package pins torch, so installing them leaves an existing build —
+# including a ROCm or MPS one — alone.
+#
+#   pip install -r requirements-benchmark.txt
+#
+pytorchvideo==0.1.5
+fvcore==0.1.5.post20221221
