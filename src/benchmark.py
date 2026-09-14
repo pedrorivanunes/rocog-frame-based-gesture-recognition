@@ -141,7 +141,14 @@ ENTRIES: tuple[Entry, ...] = (
         "ours",
     ),
     Entry("i3d_r50", _pytorchvideo("i3d_r50"), 256, 16, "baseline"),
-    Entry("x3d_m", _pytorchvideo("x3d_m"), 224, 16, "baseline"),
+    # X3D-M appears at two sizes because its own and the paper's disagree. The
+    # architecture was published at 224 and its cost figures are quoted there;
+    # the dataset's paper states 256 for every baseline it ran. Timing both
+    # costs seconds and removes the ambiguity, and the 256 row is the one the
+    # comparison against this project is read from, since that is the protocol
+    # the accuracies being compared were produced under.
+    Entry("x3d_m_256", _pytorchvideo("x3d_m"), 256, 16, "baseline"),
+    Entry("x3d_m_224", _pytorchvideo("x3d_m"), 224, 16, "baseline"),
 )
 
 
@@ -327,6 +334,7 @@ def rows_for(
             "source": entry.source,
             "level": "forward",
             "frames": entry.clip or 1,
+            "crop": entry.crop,
             "median_ms": level.median_ms,
             "iqr_ms": level.iqr_ms,
             "min_ms": level.min_ms,
@@ -351,6 +359,7 @@ def rows_for(
                 "source": entry.source,
                 "level": "decision",
                 "frames": count,
+                "crop": entry.crop,
                 "median_ms": decision.median_ms,
                 "iqr_ms": decision.iqr_ms,
                 "min_ms": decision.min_ms,
