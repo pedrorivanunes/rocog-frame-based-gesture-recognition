@@ -6,6 +6,7 @@ import pytest
 
 from frame_extraction import (
     extract_all_frames,
+    extract_all_idle_frames,
     extract_frames,
     extract_idle_frames,
     gesture_window,
@@ -364,3 +365,26 @@ def test_a_dense_pass_spans_the_window_from_zero_to_one(video):
 
     assert frames[0].position == pytest.approx(0.0)
     assert frames[-1].position == pytest.approx(1.0)
+
+
+def test_a_dense_idle_pass_reads_the_stretch_before_the_gesture(video, monkeypatch):
+    """The eighth class is trained on too, so its frames need neighbours."""
+    monkeypatch.setattr(
+        "frame_extraction._open_at_gesture",
+        lambda path: (cv2.VideoCapture(str(path)), 4, 7),
+    )
+
+    frames = extract_all_idle_frames(video)
+
+    assert [frame.frame_number for frame in frames] == [1, 2, 3]
+    assert all(frame.position < 0 for frame in frames)
+
+
+def test_a_dense_idle_pass_refuses_a_gesture_that_starts_at_once(video, monkeypatch):
+    monkeypatch.setattr(
+        "frame_extraction._open_at_gesture",
+        lambda path: (cv2.VideoCapture(str(path)), 1, 7),
+    )
+
+    with pytest.raises(RuntimeError, match="no frames before the gesture"):
+        extract_all_idle_frames(video)

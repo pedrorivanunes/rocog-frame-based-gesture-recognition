@@ -46,6 +46,7 @@ import numpy as np
 from frame_extraction import (
     SampledFrame,
     extract_all_frames,
+    extract_all_idle_frames,
     extract_frames,
     extract_idle_frames,
     read_metadata,
@@ -304,16 +305,24 @@ if __name__ == "__main__":
     # they are told apart by the frames they name: a run over the gesture never
     # picks a number a run before it could pick. Separate manifests keep each one
     # a table of whole videos, which is what resuming counts on.
-    if args.idle and args.dense:
-        raise SystemExit("--idle and --dense cover different parts of a video")
-
     def dense_frames(video_path, _frames_per_video, _rng):
         """A dense pass chooses nothing: the window decides how many frames."""
         return extract_all_frames(video_path)
 
-    if args.dense:
-        # None, because windows differ in length and no single count says a
-        # video is finished. Each video writes its own in ``window_frames``.
+    def dense_idle_frames(video_path, _frames_per_video, _rng):
+        """The same, for the stretch before the gesture."""
+        return extract_all_idle_frames(video_path)
+
+    # None for either dense pass, because the stretches differ in length and no
+    # single count says a video is finished. Each writes its own in
+    # ``window_frames``.
+    if args.idle and args.dense:
+        sample_frames, frames_per_video, suffix = (
+            dense_idle_frames,
+            None,
+            "_idle_dense",
+        )
+    elif args.dense:
         sample_frames, frames_per_video, suffix = dense_frames, None, "_dense"
     elif args.idle:
         sample_frames, frames_per_video, suffix = (

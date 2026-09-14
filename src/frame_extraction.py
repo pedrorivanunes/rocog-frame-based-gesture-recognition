@@ -307,6 +307,41 @@ def extract_frames(
     return frames
 
 
+def _read_range(
+    video: cv2.VideoCapture,
+    video_path: Path,
+    first: int,
+    last: int,
+    gesture_start_frame: int,
+    gesture_end_frame: int,
+) -> list[SampledFrame]:
+    """Decode a run of consecutive frames from one seek.
+
+    ``_read_at`` seeks per frame, which is the right thing for two dozen
+    scattered numbers and the wrong thing for a hundred consecutive ones: it
+    re-decodes from the nearest keyframe over and over, and the pass is several
+    times slower for nothing.
+
+    Position is measured against the gesture, as everywhere else, so a frame
+    from before it lands below zero and the two kinds of frame stay told apart
+    once they meet in one table.
+    """
+    span = max(gesture_end_frame - gesture_start_frame, 1)
+
+    video.set(cv2.CAP_PROP_POS_FRAMES, first)
+    frames = []
+    for frame_number in range(first, last + 1):
+        ok, frame = video.read()
+        if not ok:
+            raise RuntimeError(
+                f"{video_path.name}: failure when reading frame {frame_number}"
+            )
+        position = (frame_number - gesture_start_frame) / span
+        frames.append(SampledFrame(frame_number, position, frame))
+
+    return frames
+
+
 def extract_all_frames(video_path: Path) -> list[SampledFrame]:
     """Read every frame of a video's gesture window, in order.
 
@@ -316,40 +351,56 @@ def extract_all_frames(video_path: Path) -> list[SampledFrame]:
     temporal model reads — which a sampled set of two dozen spread across the
     gesture cannot supply at any spacing.
 
-    It decodes forward from one seek rather than seeking per frame. Seeking is
-    what ``_read_at`` does, and it is the right thing for two dozen scattered
-    numbers; for a hundred consecutive ones it re-decodes from the nearest
-    keyframe over and over, and the pass is several times slower for nothing.
-
     Args:
         video_path: Path to the ``.mp4`` to read.
 
     Returns:
         One ``SampledFrame`` per frame of the window, in increasing frame
-        order. ``position`` runs 0.0 to 1.0 across the window, as everywhere
-        else.
+        order. ``position`` runs 0.0 to 1.0 across the window.
 
     Raises:
         RuntimeError: If the video cannot be opened, or a frame cannot be read.
     """
-    video, gesture_start_frame, gesture_end_frame = _open_at_gesture(video_path)
-    span = max(gesture_end_frame - gesture_start_frame, 1)
-
+    video, start, end = _open_at_gesture(video_path)
     try:
-        video.set(cv2.CAP_PROP_POS_FRAMES, gesture_start_frame)
-        frames = []
-        for frame_number in range(gesture_start_frame, gesture_end_frame + 1):
-            ok, frame = video.read()
-            if not ok:
-                raise RuntimeError(
-                    f"{video_path.name}: failure when reading frame {frame_number}"
-                )
-            position = (frame_number - gesture_start_frame) / span
-            frames.append(SampledFrame(frame_number, position, frame))
+        return _read_range(video, video_path, start, end, start, end)
     finally:
         video.release()
 
-    return frames
+
+def extract_all_idle_frames(video_path: Path) -> list[SampledFrame]:
+    """Read every frame of the stretch before the gesture, in order.
+
+    The dense counterpart to ``extract_idle_frames``, and it exists for one
+    reason: a run that hands the network what changed since a frame's
+    neighbour needs that neighbour to exist for every frame it trains on, and
+    the eighth class is trained on too. Four idle frames a video have no
+    neighbours among themselves.
+
+    ⚠️ Giving those rows a neighbour of themselves instead would be worse than
+    leaving them out. Their difference would be exactly zero, and exactly zero
+    is a label: the network would read the eighth class off the arithmetic
+    rather than off the picture.
+
+    Args:
+        video_path: Path to the ``.mp4`` to read.
+
+    Returns:
+        One ``SampledFrame`` per frame before the gesture, in increasing frame
+        order. ``position`` is negative throughout, as it is for the sampled
+        idle frames.
+
+    Raises:
+        RuntimeError: If the video cannot be opened, if a frame cannot be read,
+            or if no frame sits before the gesture.
+    """
+    video, start, end = _open_at_gesture(video_path)
+    try:
+        if start - FIRST_USABLE_FRAME < 1:
+            raise RuntimeError(f"{video_path.name}: no frames before the gesture")
+        return _read_range(video, video_path, FIRST_USABLE_FRAME, start - 1, start, end)
+    finally:
+        video.release()
 
 
 def extract_idle_frames(
