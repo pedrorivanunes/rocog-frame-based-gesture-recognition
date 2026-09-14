@@ -49,6 +49,16 @@ BACKBONES = (
 # the same fact: it reaches the module when a head is being replaced, and naming
 # its bias gives the state dictionary key that says how wide a checkpoint's head
 # is. A second constant would be a second place for them to disagree.
+# Where each backbone takes its input. Named for the same reason HEAD_PATHS is:
+# a run that feeds the network more than three channels has to reach the layer
+# that reads them, and the four architectures spell its location differently.
+STEM_PATHS = {
+    "resnet18": "conv1",
+    "resnet18_ibn_a": "conv1",
+    "mobilenet_v3_small": "features.0.0",
+    "efficientnet_b0": "features.0.0",
+}
+
 HEAD_PATHS = {
     "resnet18": "fc",
     "resnet18_ibn_a": "fc",
@@ -111,7 +121,9 @@ def _weights_landing_on_the_cpu():
 
 
 def build_model(
-    num_classes: int = NUM_CLASSES, backbone: str = DEFAULT_BACKBONE
+    num_classes: int = NUM_CLASSES,
+    backbone: str = DEFAULT_BACKBONE,
+    in_channels: int = 3,
 ) -> nn.Module:
     """Build a ResNet18 with ImageNet weights and a fresh classification head.
 
@@ -128,6 +140,10 @@ def build_model(
     Args:
         num_classes: Outputs the head produces, one per gesture.
         backbone: Which of ``BACKBONES`` to build.
+        in_channels: Channels the first convolution reads. Three is the frame
+            as published; more is a run that hands the network something
+            alongside it, and the extra weights start at zero so that the model
+            begins as the unmodified one. See ``widen_stem``.
 
     Returns:
         The network, on the CPU. Moving it to a device is the caller's job.
@@ -154,7 +170,79 @@ def build_model(
     path = HEAD_PATHS[backbone]
     head = _module_at(model, path)
     _replace_module_at(model, path, nn.Linear(head.in_features, num_classes))
+
+    # After the head, not before, so that widening consumes no draw the head
+    # would otherwise have taken. A run with extra channels and a run without
+    # then start from the same head under the same seed, and differ in the one
+    # thing the experiment is about.
+    widen_stem(model, backbone, in_channels)
     return model
+
+
+def widen_stem(model: nn.Module, backbone: str, in_channels: int) -> None:
+    """Let the first convolution read more channels than the three it was given.
+
+    A run that hands the network a frame and what changed since its neighbour
+    is handing it six channels, and the layer that meets them was published
+    expecting three. Rebuilding it wholesale would throw away what ImageNet
+    taught the only layer that looks at raw pixels.
+
+    ⚠️ THE EXTRA CHANNELS START AT ZERO, AND THAT IS THE EXPERIMENT'S CONTROL.
+    A model whose new weights are zero computes, on its first step, exactly
+    what the unmodified model computes: the extra input is multiplied away.
+    So the run begins at the base rather than somewhere near it, and whatever
+    it gains it gained from the signal rather than from a different starting
+    point. Zero does not stop it learning — a gradient depends on the input,
+    which is not zero — it only stops it from starting anywhere else.
+
+    Copying the published weights into the new channels instead would seed the
+    difference as though it were a photograph, which it is not: it is signed,
+    centred near zero, and dark where nothing happened.
+
+    Args:
+        model: Network to modify in place.
+        backbone: Which one it is, to find where its first convolution sits.
+        in_channels: How many channels the run will feed it. Three leaves the
+            model exactly as it was.
+
+    Raises:
+        ValueError: If asked for fewer channels than the published layer reads,
+            which would silently discard part of a pretrained kernel.
+    """
+    stem = _module_at(model, STEM_PATHS[backbone])
+    if in_channels == stem.in_channels:
+        return
+    if in_channels < stem.in_channels:
+        raise ValueError(
+            f"{backbone} reads {stem.in_channels} channels; "
+            f"{in_channels} would drop part of its pretrained kernel"
+        )
+
+    widened = nn.Conv2d(
+        in_channels,
+        stem.out_channels,
+        kernel_size=stem.kernel_size,
+        stride=stem.stride,
+        padding=stem.padding,
+        bias=stem.bias is not None,
+    )
+    with torch.no_grad():
+        widened.weight.zero_()
+        widened.weight[:, : stem.in_channels] = stem.weight
+        if stem.bias is not None:
+            widened.bias.copy_(stem.bias)
+
+    _replace_module_at(model, STEM_PATHS[backbone], widened)
+
+
+def stem_width(weights: Mapping[str, object]) -> int:
+    """Read how many channels a checkpoint's first convolution expects.
+
+    Read off the file for the same reason the head's width is: a run scoring a
+    checkpoint should not have to be told how it was built, and being told
+    wrongly fails on a shape mismatch at best.
+    """
+    return weights[f"{STEM_PATHS[backbone_of(weights)]}.weight"].shape[1]
 
 
 def strip_head(model: nn.Module, backbone: str = DEFAULT_BACKBONE) -> int:

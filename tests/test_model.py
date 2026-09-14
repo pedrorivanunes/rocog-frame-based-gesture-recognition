@@ -16,6 +16,7 @@ from model import (
     build_model,
     freeze,
     head_width,
+    stem_width,
     strip_head,
 )
 
@@ -318,3 +319,76 @@ def test_every_backbone_can_be_stripped():
         model = build_model(8, backbone)
         width = strip_head(model, backbone)
         assert model(torch.zeros(1, 3, 224, 224)).shape == (1, width)
+
+
+def test_a_widened_stem_ignores_its_new_channels_until_it_learns_to():
+    """The control the experiment rests on: the run starts at the base.
+
+    Weights of zero multiply the extra input away, so whatever the run gains
+    it gained from the signal and not from having started somewhere else.
+    """
+    model = build_model(8, "resnet18", in_channels=6).eval()
+    frame = torch.randn(2, 3, 224, 224)
+
+    with torch.no_grad():
+        with_noise = model(torch.cat([frame, torch.randn(2, 3, 224, 224) * 5], 1))
+        with_nothing = model(torch.cat([frame, torch.zeros(2, 3, 224, 224)], 1))
+
+    assert torch.equal(with_noise, with_nothing)
+
+
+def test_a_widened_model_answers_exactly_what_the_base_answers():
+    """Same seed, same head, same numbers — they differ in one thing only.
+
+    Widening happens after the head is replaced so that it consumes no draw
+    the head would have taken; otherwise the two would start from different
+    classifiers and the comparison would carry that difference too.
+    """
+    torch.manual_seed(0)
+    base = build_model(8, "resnet18").eval()
+    torch.manual_seed(0)
+    widened = build_model(8, "resnet18", in_channels=6).eval()
+    frame = torch.randn(2, 3, 224, 224)
+
+    with torch.no_grad():
+        plain = base(frame)
+        paired = widened(torch.cat([frame, torch.randn(2, 3, 224, 224)], 1))
+
+    assert torch.equal(plain, paired)
+
+
+def test_a_widened_stem_keeps_the_kernel_imagenet_taught_it():
+    base = build_model(8, "resnet18")
+    widened = build_model(8, "resnet18", in_channels=6)
+    assert torch.equal(widened.conv1.weight[:, :3], base.conv1.weight)
+    assert torch.equal(widened.conv1.weight[:, 3:], torch.zeros(64, 3, 7, 7))
+
+
+def test_the_new_channels_can_still_be_learned():
+    """Zero weights do not stop a gradient: it depends on the input, not them."""
+    model = build_model(8, "resnet18", in_channels=6)
+
+    model(torch.randn(1, 6, 224, 224)).sum().backward()
+
+    assert model.conv1.weight.grad[:, 3:].abs().sum() > 0
+
+
+def test_asking_for_fewer_channels_than_published_is_refused():
+    """It would quietly discard part of a pretrained kernel."""
+    with pytest.raises(ValueError, match="drop part of its pretrained kernel"):
+        build_model(8, "resnet18", in_channels=1)
+
+
+@pytest.mark.parametrize("backbone", ["mobilenet_v3_small", "efficientnet_b0"])
+def test_every_backbone_can_read_a_pair(backbone):
+    """The cost curve's networks have to survive the option too."""
+    model = build_model(8, backbone, in_channels=6).eval()
+
+    assert model(torch.zeros(1, 6, 224, 224)).shape == (1, 8)
+
+
+def test_how_many_channels_a_checkpoint_expects_is_read_off_the_file():
+    widened = build_model(8, "resnet18", in_channels=6)
+
+    assert stem_width(widened.state_dict()) == 6
+    assert stem_width(build_model(8, "resnet18").state_dict()) == 3
