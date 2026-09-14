@@ -157,6 +157,33 @@ def build_model(
     return model
 
 
+def strip_head(model: nn.Module, backbone: str = DEFAULT_BACKBONE) -> int:
+    """Replace the classifier with a pass-through, so the model emits features.
+
+    What comes out is the vector the classifier would have read: the pooled
+    output of the last stage, before anything maps it onto gesture names. A
+    head that reads a sequence of those is reading what the network saw, rather
+    than what it concluded, and that is a wider signal — seven probabilities
+    carry only the conclusion.
+
+    The model is modified in place, which is why nothing here loads weights:
+    the caller loads the trained network first and strips it afterwards, so the
+    features are the ones that checkpoint produces.
+
+    Args:
+        model: A network built by ``build_model``, modified in place.
+        backbone: Which one it is, to find where its head lives.
+
+    Returns:
+        How wide the feature vector is.
+    """
+    head = _module_at(model, HEAD_PATHS[backbone])
+    width = head.in_features
+    _replace_module_at(model, HEAD_PATHS[backbone], nn.Identity())
+
+    return width
+
+
 def _module_at(model: nn.Module, path: str) -> nn.Module:
     """Follow a dotted path of attribute names and sequence positions.
 

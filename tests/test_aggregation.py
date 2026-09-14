@@ -9,6 +9,7 @@ from aggregation import (
     accuracy_curve,
     aggregate_mean,
     aggregate_vote,
+    cube_by_video,
     parse_args,
     probability_cube,
     random_indices,
@@ -213,3 +214,32 @@ def test_parse_args_takes_several_tables():
 def test_parse_args_requires_at_least_one_table():
     with pytest.raises(SystemExit):
         parse_args([])
+
+
+def test_cube_by_video_stacks_whichever_columns_it_is_given():
+    """Split out so features and probabilities share one set of checks."""
+    table = pd.DataFrame(
+        {
+            "video_id": ["a", "a", "b", "b"],
+            "label": [0, 0, 1, 1],
+            "f_0": [1.0, 2.0, 3.0, 4.0],
+            "f_1": [5.0, 6.0, 7.0, 8.0],
+        }
+    )
+
+    cube, labels, ids = cube_by_video(table, ["f_0", "f_1"])
+
+    assert cube.shape == (2, 2, 2)
+    assert cube[0, 1, 1] == 6.0
+    assert labels.tolist() == [0, 1]
+    assert ids == ["a", "b"]
+
+
+def test_cube_by_video_refuses_videos_of_different_lengths():
+    """Stacking regardless would misalign every frame after the first video."""
+    table = pd.DataFrame(
+        {"video_id": ["a", "a", "b"], "label": [0, 0, 1], "f_0": [1.0, 2.0, 3.0]}
+    )
+
+    with pytest.raises(ValueError, match="frame counts"):
+        cube_by_video(table, ["f_0"])

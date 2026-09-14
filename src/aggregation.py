@@ -123,6 +123,31 @@ def probability_cube(table: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[
     if not class_columns:
         raise ValueError("no p_<class> columns; is this a probability table?")
 
+    return cube_by_video(table, class_columns)
+
+
+def cube_by_video(
+    table: pd.DataFrame, columns: list[str]
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Stack a per-frame table into one array per video, checking it can be.
+
+    Split out of ``probability_cube`` when a second caller appeared: a temporal
+    head reads penultimate features rather than class probabilities, and the
+    two differ only in which columns are stacked. The alignment checks are the
+    part worth having once, not twice.
+
+    Args:
+        table: One row per frame, carrying ``video_id`` and ``label``.
+        columns: The per-frame columns to stack, in the order wanted.
+
+    Returns:
+        The ``(videos, frames, columns)`` array, each video's label, and the
+        video ids, all in the same order.
+
+    Raises:
+        ValueError: If the videos carry different frame counts, or if a video's
+            rows disagree about its label.
+    """
     grouped = table.groupby("video_id", sort=False)
 
     frame_counts = grouped.size().unique()
@@ -139,9 +164,9 @@ def probability_cube(table: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[
 
     video_ids = list(grouped.groups)
     cube = (
-        table[class_columns]
+        table[columns]
         .to_numpy()
-        .reshape(len(video_ids), int(frame_counts[0]), len(class_columns))
+        .reshape(len(video_ids), int(frame_counts[0]), len(columns))
     )
 
     return cube, grouped["label"].first().to_numpy(), video_ids

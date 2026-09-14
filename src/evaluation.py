@@ -11,6 +11,7 @@ figure is what lets the expensive half run once and the cheap half run often.
 import argparse
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from torch import nn
@@ -68,6 +69,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="score only the held-out validation scenes of the manifest",
     )
     parser.add_argument(
+        "--features",
+        action="store_true",
+        help="write the penultimate features instead of class probabilities, "
+        "for a head that reads a sequence of frames rather than one frame.",
+    )
+    parser.add_argument(
         "--adapt-bn",
         metavar="MANIFEST",
         help="re-estimate the batch normalisation statistics on these frames "
@@ -99,6 +106,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="DataLoader subprocesses",
     )
     return parser.parse_args(argv)
+
+
+def feature_cube(
+    features: torch.Tensor, manifest: pd.DataFrame, video_ids: list[str]
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Stack a pass of penultimate features into one array per video.
+
+    The stacking reuses the probability table's own grouping rather than
+    repeating it, by cubing a column of row positions and then gathering. That
+    keeps the checks that matter — equal frame counts, one label per video — in
+    one place, and avoids building a five-hundred-column frame to throw away.
+
+    Args:
+        features: ``(frames, width)`` as returned by ``predict`` on a model
+            whose head was stripped.
+        manifest: The rows that were scored, in the order they were served.
+        video_ids: The video each row came from, used to check the alignment.
+
+    Returns:
+        The ``(videos, frames, width)`` features, each video's label, and the
+        video ids, all in the same order.
+
+    Raises:
+        RuntimeError: If the features are not in the manifest's order.
+    """
+    from aggregation import cube_by_video
+
+    rows = manifest.reset_index(drop=True)
+    if video_ids != rows["video_id"].tolist():
+        raise RuntimeError(
+            "features are out of manifest order; the cube would be wrong"
+        )
+
+    order = rows[["video_id", "label"]].copy()
+    order["row"] = np.arange(len(order))
+    positions, labels, ids = cube_by_video(order, ["row"])
+
+    return features.numpy()[positions[:, :, 0]], labels, ids
 
 
 def predict(
@@ -303,6 +348,26 @@ if __name__ == "__main__":
             f"batch norm re-estimated on {seen} frames from {args.adapt_bn}"
             + ("  (transductive: the scored rows themselves)" if transductive else "")
         )
+
+    if args.features:
+        from model import strip_head
+
+        width = strip_head(model, backbone)
+        features, _, video_ids = predict(model, frame_loader(manifest), device)
+        cube, video_labels, ids = feature_cube(features, manifest, video_ids)
+
+        features_dir = PROJECT_ROOT / "data" / "features"
+        features_dir.mkdir(parents=True, exist_ok=True)
+        output = features_dir / f"{args.checkpoint.stem}__{split_name}.npz"
+        np.savez_compressed(
+            output,
+            features=cube.astype(np.float32),
+            labels=video_labels,
+            video_ids=np.array(ids),
+        )
+        print(f"{cube.shape[0]} videos x {cube.shape[1]} frames x {width} features")
+        print(f"written to {output.relative_to(PROJECT_ROOT)}")
+        raise SystemExit(0)
 
     logits, labels, video_ids = predict(model, frame_loader(manifest), device)
     loss, accuracy = frame_metrics(logits, labels, nn.CrossEntropyLoss())

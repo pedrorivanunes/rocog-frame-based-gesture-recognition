@@ -16,6 +16,7 @@ from model import (
     build_model,
     freeze,
     head_width,
+    strip_head,
 )
 
 # Weights are irrelevant to what these tests check — which parameters carry a
@@ -299,3 +300,21 @@ def test_freezing_is_refused_on_a_backbone_with_no_stages_to_freeze():
 def test_every_backbone_offered_knows_where_it_keeps_its_head():
     """``BACKBONES`` is what the command line accepts; a gap there is a crash."""
     assert set(HEAD_PATHS) == set(BACKBONES)
+
+
+def test_stripping_the_head_leaves_the_features_the_classifier_would_have_read():
+    """A sequence head reads what the network saw, not what it concluded."""
+    model = build_model(8, "resnet18")
+
+    width = strip_head(model, "resnet18")
+
+    assert width == 512
+    assert model(torch.zeros(2, 3, 224, 224)).shape == (2, 512)
+
+
+def test_every_backbone_can_be_stripped():
+    """The option has to survive the cost curve's networks, not only the base."""
+    for backbone in ("mobilenet_v3_small", "efficientnet_b0"):
+        model = build_model(8, backbone)
+        width = strip_head(model, backbone)
+        assert model(torch.zeros(1, 3, 224, 224)).shape == (1, width)
