@@ -206,6 +206,59 @@ def with_neighbour(
     return annotated
 
 
+def with_previous_anchor(manifest: pd.DataFrame) -> pd.DataFrame:
+    """Name, for every frame, the frame served before it in the same video.
+
+    The cheaper arrangement of the same idea. ``with_neighbour`` reaches into
+    the dense pass for a frame at a fixed distance, which is a frame the run
+    reads and never trains on; this one differences a frame against the one the
+    run already holds, so a decision over K frames reads K frames rather than
+    2K. No second pass over storage, and one parameter instead of two: the
+    spacing stops being chosen and becomes a consequence of how many frames
+    were extracted.
+
+    What it gives up is that the spacing is no longer fixed. It is roughly the
+    window divided by the frames stored, so it varies with the length of the
+    video and differs between the two domains — measured at a median of four
+    frames in the source against six in the real clips. Since the stride was
+    measured to matter, that variation is the cost, and comparing the two
+    arrangements is the only way to price it.
+
+    A repeated frame number is skipped rather than differenced against itself.
+    Extraction writes the same frame twice for a small share of rows, and a
+    difference of exactly zero is not a weak signal but a distinctive one: the
+    network could read the class off the arithmetic. The first frame of each
+    video does point at itself, which is the same convention
+    ``with_neighbour`` uses and the honest reading — no earlier frame was
+    served, so no movement was seen.
+
+    Args:
+        manifest: The rows to be served, after every selection. Requires the
+            ``video_id``, ``frame_number`` and ``path`` columns.
+
+    Returns:
+        The manifest with a ``neighbour_path`` column added, in its original
+        row order.
+    """
+    ordered = manifest.sort_values(["video_id", "frame_number"], kind="stable")
+
+    # Shifting within a video names the row before; masking the repeats first
+    # and filling forward is what makes that row the previous *distinct* one,
+    # however many copies sit between them.
+    repeated = ordered["frame_number"].eq(
+        ordered.groupby("video_id")["frame_number"].shift()
+    )
+    distinct = ordered["path"].mask(repeated)
+    within = distinct.groupby(ordered["video_id"])
+    previous = within.shift().groupby(ordered["video_id"]).ffill()
+
+    annotated = manifest.copy()
+    annotated["neighbour_path"] = previous.reindex(manifest.index).fillna(
+        manifest["path"]
+    )
+    return annotated
+
+
 def select_frames(
     manifest: pd.DataFrame,
     window: str = "full",

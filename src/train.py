@@ -49,6 +49,7 @@ from splits import (
     split_by_group,
     split_by_scene,
     with_neighbour,
+    with_previous_anchor,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -158,7 +159,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ``save_every_epoch``.
     """
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
+    neighbours = parser.add_mutually_exclusive_group()
+    neighbours.add_argument(
         "--neighbour-stride",
         type=int,
         default=None,
@@ -166,6 +168,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "frame this many back. Needs the dense manifest of the same split to "
         "look the neighbour up in; the frames trained on stay the ones this "
         "run's own manifest names.",
+    )
+    neighbours.add_argument(
+        "--neighbour-anchor",
+        action="store_true",
+        help="the same, against the frame served before it rather than one at "
+        "a fixed distance. Reads no frame the run does not already train on, "
+        "at the price of a spacing that varies with the length of the video.",
     )
     parser.add_argument(
         "--idle-manifest",
@@ -804,12 +813,14 @@ if __name__ == "__main__":
     # manifest while the column lands on the rows served, so a run reading
     # differences trains on exactly the frames a run without them trains on.
     def differenced(rows: pd.DataFrame, manifest_name: str) -> pd.DataFrame:
-        """Name each row's neighbour, looked up in that split's dense pass."""
+        """Name each row's neighbour, looked up wherever this run takes it from."""
+        if args.neighbour_anchor:
+            return with_previous_anchor(rows)
         dense_name = Path(manifest_name).stem + "_dense.csv"
         dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
         return with_neighbour(rows, args.neighbour_stride, dense)
 
-    reads_neighbours = args.neighbour_stride is not None
+    reads_neighbours = args.neighbour_stride is not None or args.neighbour_anchor
     in_channels = 6 if reads_neighbours else 3
     if reads_neighbours:
         train_manifest = differenced(train_manifest, args.manifest)

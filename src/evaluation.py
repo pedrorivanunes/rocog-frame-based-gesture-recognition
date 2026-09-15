@@ -68,7 +68,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="score only the held-out validation scenes of the manifest",
     )
-    parser.add_argument(
+    neighbours = parser.add_mutually_exclusive_group()
+    neighbours.add_argument(
         "--neighbour-stride",
         type=int,
         default=None,
@@ -76,6 +77,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "for a checkpoint trained to read them. Asked for rather than read off "
         "the file because a plain state dict has nowhere to record it; scoring "
         "such a checkpoint without it is refused rather than guessed.",
+    )
+    neighbours.add_argument(
+        "--neighbour-anchor",
+        action="store_true",
+        help="the same, for a checkpoint trained to difference each frame "
+        "against the one scored before it rather than one a fixed distance "
+        "back. Must match how the checkpoint was trained.",
     )
     parser.add_argument(
         "--features",
@@ -301,7 +309,7 @@ if __name__ == "__main__":
         head_width,
         stem_width,
     )
-    from splits import split_by_scene, with_neighbour
+    from splits import split_by_scene, with_neighbour, with_previous_anchor
 
     args = parse_args()
     print(
@@ -333,15 +341,20 @@ if __name__ == "__main__":
     backbone = backbone_of(weights)
     in_channels = stem_width(weights)
     if in_channels > 3:
-        if args.neighbour_stride is None:
+        if args.neighbour_stride is None and not args.neighbour_anchor:
             raise SystemExit(
                 f"{args.checkpoint.name} reads {in_channels} channels; "
-                "--neighbour-stride says which frame the extra ones came from"
+                "--neighbour-stride or --neighbour-anchor says which frame the "
+                "extra ones came from"
             )
-        dense_name = Path(args.manifest).stem + "_dense.csv"
-        dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
-        manifest = with_neighbour(manifest, args.neighbour_stride, dense)
-        print(f"differencing against the frame {args.neighbour_stride} back")
+        if args.neighbour_anchor:
+            manifest = with_previous_anchor(manifest)
+            print("differencing against the frame scored before it")
+        else:
+            dense_name = Path(args.manifest).stem + "_dense.csv"
+            dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
+            manifest = with_neighbour(manifest, args.neighbour_stride, dense)
+            print(f"differencing against the frame {args.neighbour_stride} back")
 
     model = build_model(num_classes, backbone, in_channels).to(device)
     model.load_state_dict(weights)

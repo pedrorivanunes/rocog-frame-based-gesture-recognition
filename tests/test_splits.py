@@ -10,6 +10,7 @@ from splits import (
     split_by_group,
     split_by_scene,
     with_neighbour,
+    with_previous_anchor,
 )
 
 REAL_SHAPE = [7, 7, 7, 5, 6, 8]
@@ -440,6 +441,67 @@ def test_a_neighbour_never_comes_from_another_video():
 def test_a_stride_below_one_is_refused():
     with pytest.raises(ValueError, match="at least 1"):
         with_neighbour(_dense(), stride=0)
+
+
+def _served(frames):
+    """Rows as a run would be served them: one video, the given frame numbers."""
+    return pd.DataFrame(
+        {
+            "video_id": ["v0"] * len(frames),
+            "frame_number": frames,
+            "path": [f"frames/v0_f{n:04d}.jpg" for n in frames],
+        }
+    )
+
+
+def test_the_previous_anchor_is_the_row_served_before_it():
+    """No dense lookup: the neighbour is a frame the run already holds."""
+    annotated = with_previous_anchor(_served([4, 11, 19]))
+
+    assert list(annotated["neighbour_path"]) == [
+        "frames/v0_f0004.jpg",
+        "frames/v0_f0004.jpg",
+        "frames/v0_f0011.jpg",
+    ]
+
+
+def test_the_first_anchor_points_at_itself():
+    """Same convention as the strided lookup: nothing was served before it."""
+    annotated = with_previous_anchor(_served([4, 11]))
+
+    assert annotated.iloc[0]["neighbour_path"] == annotated.iloc[0]["path"]
+
+
+def test_a_repeated_anchor_is_skipped_rather_than_differenced_against_itself():
+    """The row before the repeat is the one that counts.
+
+    Extraction writes some frames twice, and a difference of exactly zero is
+    not a weak signal but a distinctive one the network could read a class off.
+    """
+    annotated = with_previous_anchor(_served([4, 9, 9, 15]))
+
+    assert list(annotated["neighbour_path"])[3] == "frames/v0_f0009.jpg"
+    assert list(annotated["neighbour_path"])[2] == "frames/v0_f0009.jpg"
+
+
+def test_a_previous_anchor_never_comes_from_another_video():
+    annotated = with_previous_anchor(_dense())
+
+    for _, row in annotated.iterrows():
+        assert row["neighbour_path"].split("_f")[0].endswith(row["video_id"])
+
+
+def test_the_previous_anchor_keeps_the_row_order_it_was_given():
+    """Selection decides the order; naming a neighbour must not re-decide it."""
+    rows = _served([19, 4, 11])
+    annotated = with_previous_anchor(rows)
+
+    assert list(annotated["frame_number"]) == [19, 4, 11]
+    assert list(annotated["neighbour_path"]) == [
+        "frames/v0_f0011.jpg",
+        "frames/v0_f0004.jpg",
+        "frames/v0_f0004.jpg",
+    ]
 
 
 def test_a_repeated_frame_number_is_refused():
