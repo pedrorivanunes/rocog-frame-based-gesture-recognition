@@ -44,6 +44,10 @@ def _clip_entry() -> Entry:
     return Entry("stub_clip", _Counter, 224, 16, "test")
 
 
+def _difference_entry() -> Entry:
+    return Entry("stub_diff", _Counter, 224, None, "test", channels=6)
+
+
 def test_summarise_reports_the_median_not_the_mean():
     """One descheduled run must not move the number the table reports."""
     summary = summarise([10.0, 10.0, 10.0, 10.0, 500.0])
@@ -92,6 +96,48 @@ def test_a_decision_aggregates_the_frames_into_one_answer():
 
     assert answer.shape == (1,)
     assert model.seen == [(8, 3, 224, 224)]
+
+
+def test_a_difference_model_is_fed_the_channels_it_reads():
+    assert forward_input(_difference_entry(), CPU).shape == (1, 6, 224, 224)
+
+
+def test_a_difference_decision_pays_for_two_frames_per_frame_aggregated():
+    """The neighbour is a second frame through the transform, not a free one.
+
+    This is the half of the cost the widened stem does not show. The arithmetic
+    of reading six channels instead of three is a few per cent; putting 2K
+    frames through the evaluation pipeline to aggregate K is not, and it is the
+    part a reader would otherwise have to take on trust.
+    """
+    entry, model = _difference_entry(), _Counter()
+
+    answer = decision_call(entry, model, 8, CPU)()
+
+    assert answer.shape == (1,)
+    assert model.seen == [(8, 6, 224, 224)]
+
+
+def test_a_difference_decision_subtracts_after_the_transform():
+    """Normalised space, matching the dataset: a still background cancels to zero.
+
+    Subtracting the stored frames first would be cheaper and would measure a
+    different arrangement than the one the accuracy was produced under.
+    """
+    entry = _difference_entry()
+
+    class _Keeper(_Counter):
+        def forward(self, batch: torch.Tensor) -> torch.Tensor:
+            self.batch = batch
+            return super().forward(batch)
+
+    model = _Keeper()
+    decision_call(entry, model, 2, CPU)()
+
+    frame, difference = model.batch[:, :3], model.batch[:, 3:]
+    assert not torch.allclose(frame, difference)
+    # Normalised pixels leave zero; raw uint8 ones could not reach it.
+    assert frame.min() < 0
 
 
 def test_a_clip_model_receives_time_as_its_own_axis():

@@ -100,6 +100,10 @@ class Entry:
             reads one frame at a time. A clip length also fixes how many frames
             one decision costs, which is why those rows ignore ``--frames``.
         source: Where the architecture comes from, for the printed provenance.
+        channels: What the first convolution reads. Six means the network is
+            given a frame and what changed since a neighbour, which costs a
+            second frame through the transform for every frame aggregated —
+            the part of that arrangement arithmetic does not show.
     """
 
     name: str
@@ -107,6 +111,7 @@ class Entry:
     crop: int
     clip: int | None
     source: str
+    channels: int = 3
 
 
 def _pytorchvideo(factory: str):
@@ -139,6 +144,35 @@ ENTRIES: tuple[Entry, ...] = (
         224,
         None,
         "ours",
+    ),
+    # The same three again, reading a frame beside what changed since one a few
+    # back. The arithmetic of the widened stem is a rounding error, so what
+    # these rows are really for is the other half of the cost: a decision over
+    # K frames now puts 2K frames through the evaluation transform, and whether
+    # that shows up in the clock is not something arithmetic can be asked.
+    Entry(
+        "resnet18_diff",
+        lambda: build_model(NUM_CLASSES, "resnet18", 6),
+        224,
+        None,
+        "ours",
+        channels=6,
+    ),
+    Entry(
+        "efficientnet_b0_diff",
+        lambda: build_model(NUM_CLASSES, "efficientnet_b0", 6),
+        224,
+        None,
+        "ours",
+        channels=6,
+    ),
+    Entry(
+        "mobilenet_v3_small_diff",
+        lambda: build_model(NUM_CLASSES, "mobilenet_v3_small", 6),
+        224,
+        None,
+        "ours",
+        channels=6,
     ),
     Entry("i3d_r50", _pytorchvideo("i3d_r50"), 256, 16, "baseline"),
     # X3D-M appears at two sizes because its own and the paper's disagree. The
@@ -239,9 +273,9 @@ def time_calls(
 def forward_input(entry: Entry, device: torch.device) -> torch.Tensor:
     """The batch-of-one tensor one forward consumes, already on the device."""
     if entry.clip is None:
-        shape = (1, 3, entry.crop, entry.crop)
+        shape = (1, entry.channels, entry.crop, entry.crop)
     else:
-        shape = (1, 3, entry.clip, entry.crop, entry.crop)
+        shape = (1, entry.channels, entry.clip, entry.crop, entry.crop)
 
     return torch.randn(*shape, device=device)
 
@@ -268,6 +302,12 @@ def decision_call(
     the per-frame probabilities into one answer. The frames themselves are
     prepared outside, since reading them from disk is storage, not inference.
 
+    A row that reads six channels pays for two frames per frame aggregated, and
+    it pays in the same places the dataset does: each of the pair goes through
+    the transform on its own and the difference is taken afterwards, in
+    normalised space. Subtracting before the transform would be cheaper and
+    would not be the same arrangement, so it is not what is timed here.
+
     Args:
         entry: The network's row.
         model: Its built and evaluated instance.
@@ -280,7 +320,8 @@ def decision_call(
     """
     transform = eval_transform(entry.crop)
     count = entry.clip if entry.clip is not None else frames
-    raw = stored_frames(count)
+    pairs = entry.clip is None and entry.channels == 6
+    raw = stored_frames(count * 2 if pairs else count)
 
     def decide() -> torch.Tensor:
         batch = transform(raw).to(device)
@@ -288,6 +329,9 @@ def decision_call(
             # A clip-based network reads (batch, channels, time, height, width),
             # so the frame axis moves from the front to position two.
             batch = batch.permute(1, 0, 2, 3).unsqueeze(0)
+        elif pairs:
+            frame, neighbour = batch[:count], batch[count:]
+            batch = torch.cat([frame, frame - neighbour], dim=1)
         logits = model(batch)
         probabilities = logits.softmax(dim=1)
         if entry.clip is None:
