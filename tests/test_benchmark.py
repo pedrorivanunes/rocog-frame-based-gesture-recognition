@@ -200,6 +200,21 @@ def test_a_path_outside_the_project_keeps_its_full_name():
     assert shorten(Path("/somewhere/else/latency.csv")) == "/somewhere/else/latency.csv"
 
 
+def test_the_rows_run_in_the_order_they_were_asked_for():
+    """Order is a variable here, not a detail.
+
+    A pass runs its rows back to back, so a row near the end meets a machine
+    that has been at full load for minutes. Repeating a pass in one fixed
+    order would reproduce that bias three times rather than average it away,
+    so reversing the order between passes has to actually reverse it.
+    """
+    forwards = parse_args(["--models", "resnet18", "mobilenet_v3_small"]).models
+    backwards = parse_args(["--models", "mobilenet_v3_small", "resnet18"]).models
+
+    assert forwards == ["resnet18", "mobilenet_v3_small"]
+    assert backwards == ["mobilenet_v3_small", "resnet18"]
+
+
 def test_the_default_frame_counts_match_the_accuracy_curve():
     """Both readings share an axis only if they share these values."""
     assert parse_args([]).frames == [1, 4, 8, 16, 24]

@@ -453,7 +453,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--models",
         nargs="+",
         default=[entry.name for entry in ENTRIES],
-        help="Subset of rows to time.",
+        help="Rows to time, in the order given. The order is worth controlling "
+        "rather than accepting: a pass runs the rows back to back, so a row "
+        "near the end meets a machine that has been at full load for minutes, "
+        "and repeating a pass in one order would reproduce that bias rather "
+        "than average it away.",
     )
     parser.add_argument(
         "--output",
@@ -475,10 +479,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(describe(device, args.threads))
     print(f"warmup {args.warmup}, {args.repeats} timed repetitions\n")
 
-    wanted = [entry for entry in ENTRIES if entry.name in args.models]
-    missing = set(args.models) - {entry.name for entry in wanted}
+    known = {entry.name: entry for entry in ENTRIES}
+    missing = [name for name in args.models if name not in known]
     if missing:
         raise SystemExit(f"unknown model(s): {', '.join(sorted(missing))}")
+    # Indexed rather than filtered, so the order asked for is the order run.
+    wanted = [known[name] for name in args.models]
 
     records = []
     for entry in wanted:
