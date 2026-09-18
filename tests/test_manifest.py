@@ -2,6 +2,7 @@ from pathlib import Path
 
 from manifest import (
     FRAME_SIZE,
+    dense_name_for,
     mask_path_for,
     sized_path_for,
     stored_size_for,
@@ -84,3 +85,19 @@ def test_a_path_without_a_size_names_the_tree_extraction_wrote():
     frame = Path("data/frames/syn/Advance/Scene1_Advance_f0007.jpg")
 
     assert stored_size_for(frame) == FRAME_SIZE
+
+
+def test_dense_manifest_is_named_after_the_sparse_one():
+    assert dense_name_for("real_ground_test.csv") == "real_ground_test_dense.csv"
+    assert dense_name_for("syn_ground_train") == "syn_ground_train_dense.csv"
+
+
+def test_a_dense_manifest_is_its_own_neighbour_source():
+    """Appending the suffix twice names a file that does not exist.
+
+    The failure lands at scoring time, after a training run has been paid for.
+    """
+    assert dense_name_for("real_ground_test_dense.csv") == "real_ground_test_dense.csv"
+    assert dense_name_for("syn_ground_train_idle_dense") == (
+        "syn_ground_train_idle_dense.csv"
+    )

@@ -311,7 +311,7 @@ def probability_table(
 if __name__ == "__main__":
     from dataset import FrameDataset, eval_transform
     from device import describe, pick_device
-    from manifest import load_class_names, with_idle_class
+    from manifest import dense_name_for, load_class_names, with_idle_class
     from model import (
         DEFAULT_BACKBONE,
         adapt_batchnorm,
@@ -375,7 +375,7 @@ if __name__ == "__main__":
             manifest = with_previous_anchor(manifest)
             print("differencing against the frame scored before it")
         else:
-            dense_name = Path(args.manifest).stem + "_dense.csv"
+            dense_name = dense_name_for(args.manifest)
             dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
             manifest = with_neighbour(manifest, args.neighbour_stride, dense)
             print(f"differencing against the frame {args.neighbour_stride} back")

@@ -173,6 +173,31 @@ def stored_size_for(frame_path: Path) -> int:
     return int(after_frames) if after_frames.isdigit() else FRAME_SIZE
 
 
+def dense_name_for(manifest_name: str) -> str:
+    """Name the dense manifest a sparse one's neighbours are looked up in.
+
+    A run that differences a frame against one a fixed distance back needs a
+    frame the sparse manifest does not list, so the lookup happens in the dense
+    pass over the same videos. The dense manifest is named for the sparse one
+    it accompanies, which is what lets the name be derived instead of asked
+    for.
+
+    A manifest that is already the dense one is its own source. Appending the
+    suffix a second time would name a file that does not exist, and the failure
+    lands at scoring time, after a training run has already been paid for.
+
+    Args:
+        manifest_name: File name of the manifest being served, with or without
+            its extension.
+
+    Returns:
+        The file name of the manifest to look neighbours up in.
+    """
+    stem = Path(manifest_name).stem
+
+    return f"{stem}.csv" if stem.endswith("_dense") else f"{stem}_dense.csv"
+
+
 def with_idle_class(class_names: dict[int, str]) -> dict[int, str]:
     """Add the idle class to a label-to-name mapping.
 

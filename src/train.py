@@ -30,7 +30,7 @@ from dataset import (
 )
 from device import describe, pick_device
 from evaluation import frame_metrics, predict
-from manifest import IDLE_LABEL
+from manifest import IDLE_LABEL, dense_name_for
 from model import (
     BACKBONES,
     DEFAULT_BACKBONE,
@@ -833,7 +833,7 @@ if __name__ == "__main__":
         """Name each row's neighbour, looked up wherever this run takes it from."""
         if args.neighbour_anchor:
             return with_previous_anchor(rows)
-        dense_name = Path(manifest_name).stem + "_dense.csv"
+        dense_name = dense_name_for(manifest_name)
         dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
         return with_neighbour(rows, args.neighbour_stride, dense)
 
