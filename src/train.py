@@ -830,6 +830,14 @@ if __name__ == "__main__":
     if args.idle_manifest:
         idle = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.idle_manifest)
         idle_train, _ = split_by_group(idle, held_out)
+        # Narrowed to the videos the gesture side actually kept. Holding out
+        # groups puts the two manifests on the same scenes, but --fraction and
+        # --exclude-groups act on the gesture side alone, and the idle rows
+        # would otherwise stay whole while the gestures shrank: at a third of
+        # the videos the eighth class goes from a fifth of the material a batch
+        # is drawn from to better than two fifths of it, which moves the
+        # prediction prior along with whatever the run meant to vary.
+        idle_train = idle_train[idle_train["video_id"].isin(train_manifest["video_id"])]
         # The eighth class is trained on too, so its rows need neighbours
         # like any other. Leaving them without would mix three-channel and
         # six-channel frames in one batch; giving them a neighbour of
