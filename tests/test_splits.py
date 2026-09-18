@@ -5,6 +5,7 @@ import pytest
 from splits import (
     EDGE_FRAMES,
     add_idle_rows,
+    keep_views,
     sample_videos,
     select_frames,
     split_by_group,
@@ -539,3 +540,65 @@ def test_rows_whose_neighbour_is_nowhere_are_refused():
 
     with pytest.raises(ValueError, match="no neighbour for"):
         with_neighbour(stranger, stride=1, dense=dense)
+
+
+def views_manifest(scenes_per_view=4):
+    """Six camera positions with several scenes each, as the real manifest has.
+
+    Scenes come in consecutive blocks of six and the position within a block
+    fixes the viewpoint, which is how ``view`` is derived from the scene index.
+    """
+    scenes = range(6 * scenes_per_view)
+    return pd.DataFrame(
+        {
+            "video_id": [f"Scene{scene}_x" for scene in scenes for _ in range(2)],
+            "group_id": [f"Scene{scene}" for scene in scenes for _ in range(2)],
+            "view": [scene % 6 for scene in scenes for _ in range(2)],
+            "label": [0, 1] * len(scenes),
+        }
+    )
+
+
+def test_keep_views_keeps_only_the_positions_named():
+    kept = keep_views(views_manifest(), [3, 4])
+
+    assert sorted(kept["view"].unique()) == [3, 4]
+    assert kept["group_id"].nunique() == 8
+    assert len(kept) == 16
+
+
+def test_keep_views_refuses_a_position_the_manifest_does_not_have():
+    """An absent name would otherwise hand back fewer rows than asked for.
+
+    On a real manifest, whose viewpoint column is empty, it would hand back
+    none at all and fail much later without saying why.
+    """
+    with pytest.raises(ValueError, match="viewpoints not in the manifest"):
+        keep_views(views_manifest(), [4, 9])
+
+
+def test_keep_views_refuses_an_empty_request():
+    with pytest.raises(ValueError, match="no viewpoints named"):
+        keep_views(views_manifest(), [])
+
+
+def test_keep_views_refuses_a_manifest_with_no_viewpoints():
+    real = views_manifest().assign(view=None)
+
+    with pytest.raises(ValueError, match="viewpoints not in the manifest"):
+        keep_views(real, [3, 4])
+
+
+def test_keep_views_leaves_the_split_able_to_hold_one_scene_per_view():
+    """Filtering runs before the split, so the split sees only what is left.
+
+    Two viewpoints means two held-out scenes rather than six, which is the
+    same share within the views the run actually trains on.
+    """
+    kept = keep_views(views_manifest(), [3, 4])
+
+    train, validation = split_by_scene(kept)
+
+    assert sorted(validation["view"].unique()) == [3, 4]
+    assert validation["group_id"].nunique() == 2
+    assert train.empty or set(train["view"]).issubset({3, 4})

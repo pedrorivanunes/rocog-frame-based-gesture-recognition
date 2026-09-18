@@ -44,6 +44,7 @@ from model import (
 from splits import (
     WINDOWS,
     add_idle_rows,
+    keep_views,
     sample_videos,
     select_frames,
     split_by_group,
@@ -243,6 +244,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="mass moved off the true class and spread over the other six "
         "while training, from 0 to 1. Validation is always scored against hard "
         "targets, so its loss stays comparable across values",
+    )
+    parser.add_argument(
+        "--views",
+        nargs="+",
+        type=int,
+        metavar="VIEW",
+        help="keep only the synthetic camera positions named, before the split "
+        "and on the idle manifest too, so a run is trained and model-selected "
+        "on the same angles. Views 3 and 4 are the frontal ones, the only two "
+        "the real domain shows. Omit to train on all six, which is what the "
+        "published baselines do",
     )
     parser.add_argument(
         "--exclude-groups",
@@ -777,6 +789,11 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
 
     manifest = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.manifest)
+    # Before everything else, including the split: a run trained on a subset of
+    # the camera positions has to choose its checkpoint on the same subset, or
+    # the stopping epoch is picked by performance on angles it never saw.
+    if args.views:
+        manifest = keep_views(manifest, args.views)
     # Dropped before the split rather than after, so the excluded rows are absent
     # from both sides. split_by_group is reused for the checking it already does:
     # a name absent from the manifest stops the run instead of silently
@@ -829,6 +846,11 @@ if __name__ == "__main__":
     num_classes = NUM_CLASSES
     if args.idle_manifest:
         idle = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.idle_manifest)
+        # The same filter, because the idle rows are cut from the same videos:
+        # leaving them unfiltered would put the discarded angles back into
+        # training through the eighth class.
+        if args.views:
+            idle = keep_views(idle, args.views)
         idle_train, _ = split_by_group(idle, held_out)
         # Narrowed to the videos the gesture side actually kept. Holding out
         # groups puts the two manifests on the same scenes, but --fraction and
@@ -871,9 +893,10 @@ if __name__ == "__main__":
     )
 
     excluded = " ".join(args.exclude_groups) if args.exclude_groups else "none"
+    views = " ".join(str(view) for view in args.views) if args.views else "all"
     print(
         f"manifest {args.manifest}  validation groups: {' '.join(held_out)}  "
-        f"excluded: {excluded}"
+        f"excluded: {excluded}  views: {views}"
     )
     print(
         f"fraction {args.fraction:g} -> "

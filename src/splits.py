@@ -81,6 +81,52 @@ def split_by_group(
     return train, validation
 
 
+def keep_views(manifest: pd.DataFrame, views: list[int]) -> pd.DataFrame:
+    """Keep only the rows shot from the named camera positions.
+
+    The synthetic videos are shot from six positions around the subject and the
+    real ones from a single frontal camera, so two thirds of the synthetic
+    material is filmed from an angle the target domain never shows. Whether
+    those two thirds help — more data, and variation that could push the network
+    towards features that do not depend on one camera — or hurt — capacity spent
+    on a condition that is never scored — has not been measured here or in the
+    published baselines, which train on all six.
+
+    Applied before the split rather than after it. A run trained on one set of
+    viewpoints has to be model-selected on the same ones; validating on angles
+    it never trains on would pick a checkpoint by performance on a question the
+    run was never asked.
+
+    Viewpoints are named rather than reduced to a frontal flag because the two
+    frontal positions do not behave alike: a pose detector recovers every arm
+    joint in 98.8% of frames from one of them and 66.7% from the other, so a
+    later run may want one alone.
+
+    Args:
+        manifest: Rows to filter. Requires the ``view`` column, which only the
+            synthetic manifests carry.
+        views: Camera positions to keep.
+
+    Returns:
+        The rows shot from those positions, carrying every column of the input.
+
+    Raises:
+        ValueError: If no viewpoint is named, or if a named one is absent from
+            the manifest. An absent name is worth stopping for: on a real
+            manifest, whose viewpoint column is empty, it would otherwise hand
+            back nothing and fail much later without saying why.
+    """
+    if not views:
+        raise ValueError("no viewpoints named to keep")
+
+    present = set(manifest["view"].dropna().astype(int).unique())
+    missing = sorted(set(views) - present)
+    if missing:
+        raise ValueError(f"viewpoints not in the manifest: {missing}")
+
+    return manifest[manifest["view"].isin(views)].reset_index(drop=True)
+
+
 def split_by_scene(
     manifest: pd.DataFrame,
     scenes_per_view: int = 1,

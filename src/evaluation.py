@@ -68,6 +68,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="score only the held-out validation scenes of the manifest",
     )
+    parser.add_argument(
+        "--views",
+        nargs="+",
+        type=int,
+        metavar="VIEW",
+        help="keep only these synthetic camera positions before scoring, and "
+        "before the validation split so the held-out scenes are the ones the "
+        "matching training run held out. A checkpoint trained on a subset of "
+        "the viewpoints has to be scored on the same subset, or its origin "
+        "figure is read off angles it never saw",
+    )
     neighbours = parser.add_mutually_exclusive_group()
     neighbours.add_argument(
         "--neighbour-stride",
@@ -309,7 +320,12 @@ if __name__ == "__main__":
         head_width,
         stem_width,
     )
-    from splits import split_by_scene, with_neighbour, with_previous_anchor
+    from splits import (
+        keep_views,
+        split_by_scene,
+        with_neighbour,
+        with_previous_anchor,
+    )
 
     args = parse_args()
     print(
@@ -319,6 +335,14 @@ if __name__ == "__main__":
 
     manifest = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.manifest)
     split_name = Path(args.manifest).stem
+    # Before the split, as training does it, so that the held-out scenes are the
+    # ones the matching run held out. The viewpoints go into the table's name for
+    # the same reason --adapt-bn does: the same checkpoint scored on the same
+    # manifest with and without them is two different measurements, and a name
+    # that hid the difference would let one overwrite the other in silence.
+    if args.views:
+        manifest = keep_views(manifest, args.views)
+        split_name = f"{split_name}_views{''.join(str(v) for v in args.views)}"
     if args.validation_split:
         _, manifest = split_by_scene(manifest)
         split_name = f"{split_name}_validation"
