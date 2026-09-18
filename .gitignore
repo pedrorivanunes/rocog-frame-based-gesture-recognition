@@ -1,5 +1,6 @@
 ### Python ###
 .venv/
+.venv-pose/
 __pycache__/ 
 *.pyc
 *.pt

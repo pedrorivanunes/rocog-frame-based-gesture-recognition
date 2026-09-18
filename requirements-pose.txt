@@ -1,0 +1,17 @@
+# Extra dependencies for the pose probe in src/pose.py only.
+#
+# MediaPipe is the one dependency in this project that cannot share an
+# environment with the training stack. It pins numpy below 2, and this
+# repository's lockfile is on numpy 2; installing it alongside would downgrade
+# the array library the ROCm build of torch was resolved against. So the probe
+# gets an environment of its own, and a measurement can never break a run.
+#
+#   python3.12 -m venv .venv-pose
+#   .venv-pose/bin/pip install -r requirements-pose.txt
+#   PYTHONPATH=src .venv-pose/bin/python src/pose.py --manifest <name>.csv
+#
+# Only src/pose.py imports mediapipe, and it does so inside make_detector, so
+# the module still imports and its tests still run in the main environment.
+#
+mediapipe==0.10.21
+pandas==2.2.3
