@@ -69,6 +69,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="score only the held-out validation scenes of the manifest",
     )
     parser.add_argument(
+        "--difference-gain",
+        type=float,
+        default=1.0,
+        metavar="FACTOR",
+        help="multiply each difference channel by this, matching what the "
+        "checkpoint was trained with. A plain state dict has nowhere to record "
+        "it, so it is asked for — and it goes into the table's name, because a "
+        "checkpoint scored at the wrong gain would otherwise write over the "
+        "table scored at the right one",
+    )
+    parser.add_argument(
         "--views",
         nargs="+",
         type=int,
@@ -348,6 +359,11 @@ if __name__ == "__main__":
     if args.validation_split:
         _, manifest = split_by_scene(manifest)
         split_name = f"{split_name}_validation"
+    # The gain leaves no trace in the weights, so it leaves one here. A table
+    # named without it and a table named with it are two measurements, and the
+    # one that would be silently wrong is the one scored at the default.
+    if args.difference_gain != 1.0:
+        split_name = f"{split_name}_gain{args.difference_gain:g}"
 
     class_names = load_class_names(PROJECT_ROOT / "data" / "class_dict.json")
     device = pick_device()
@@ -411,6 +427,7 @@ if __name__ == "__main__":
                 rows,
                 PROJECT_ROOT,
                 eval_transform(args.crop_size),
+                difference_gain=args.difference_gain,
             ),
             batch_size=BATCH_SIZE,
             shuffle=False,

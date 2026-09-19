@@ -249,6 +249,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "targets, so its loss stays comparable across values",
     )
     parser.add_argument(
+        "--difference-gain",
+        type=float,
+        default=1.0,
+        metavar="FACTOR",
+        help="multiply each difference channel by this before the network sees "
+        "it. Widening the stem was measured to help while adding no "
+        "information, which points at how strongly the difference enters "
+        "rather than at capacity; this changes that directly and costs "
+        "nothing in parameters, frames read or inference time",
+    )
+    parser.add_argument(
         "--views",
         nargs="+",
         type=int,
@@ -426,6 +437,7 @@ def build_loaders(
     augmentation: Augmentation = DEFAULT_AUGMENTATION,
     crop_size: int = CROP_SIZE,
     seed: int = SEED,
+    difference_gain: float = 1.0,
 ) -> tuple[DataLoader, DataLoader]:
     """Build the training and evaluation loaders from two sets of manifest rows.
 
@@ -458,6 +470,9 @@ def build_loaders(
             because it is not a treatment: it says how much of a stored frame
             the model sees, and training and evaluation have to agree on that
             or the model meets a field of view it never learnt on.
+        difference_gain: Multiplies each difference channel. Given to both
+            loaders, because the model has to meet the same input scale it was
+            trained on or the validation curve measures a different network.
         seed: Which repetition of a configuration this is. Offsets the sampler's
             own seed rather than replacing it, so that seed 0 keeps drawing the
             frames earlier runs drew and stays comparable to them.
@@ -481,11 +496,13 @@ def build_loaders(
             if augmentation.texture != "none"
             else None
         ),
+        difference_gain=difference_gain,
     )
     eval_dataset = FrameDataset(
         eval_manifest,
         data_root,
         transform=eval_transform(crop_size),
+        difference_gain=difference_gain,
     )
 
     # Two draws rather than one when the rows carry both kinds. A video holds a
@@ -911,6 +928,7 @@ if __name__ == "__main__":
         f"manifest {args.manifest}  validation groups: {' '.join(held_out)}  "
         f"excluded: {excluded}  views: {views}  "
         f"differences: {spacing_names} ({in_channels} channels)"
+        f"  gain: {args.difference_gain:g}"
     )
     print(
         f"fraction {args.fraction:g} -> "
@@ -945,6 +963,7 @@ if __name__ == "__main__":
         augmentation=augmentation,
         crop_size=args.crop_size,
         seed=args.seed,
+        difference_gain=args.difference_gain,
     )
 
     device = pick_device()

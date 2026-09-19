@@ -566,6 +566,7 @@ class FrameDataset(Dataset):
         transform: v2.Transform,
         background: BackgroundRandomiser | None = None,
         texture: TextureRandomiser | None = None,
+        difference_gain: float = 1.0,
     ):
         """Prepare to serve the frames a manifest lists.
 
@@ -583,6 +584,16 @@ class FrameDataset(Dataset):
                 segmentation to composite with, so a model has to meet its
                 scenes intact. Compositing there would also measure the model on
                 inputs no deployment ever produces.
+            difference_gain: Multiplies each difference before it is stacked
+                behind the frame. One leaves the channels exactly as every
+                measured cell of the difference family saw them.
+
+                It exists because widening the stem was measured to help while
+                carrying no new information: three copies of one difference
+                stay bit-identical through training, so what the extra channels
+                add is not capacity but how strongly the difference enters the
+                first convolution. This scales that directly, at no cost in
+                parameters, in frames read or in inference time.
             texture: Replaces the appearance inside the person on some frames.
                 ``None`` for the same reason and with the same restriction: it
                 needs a silhouette, and evaluation has none.
@@ -604,6 +615,7 @@ class FrameDataset(Dataset):
         self.transform = transform
         self.background = background
         self.texture = texture
+        self.difference_gain = difference_gain
 
     def __len__(self) -> int:
         """Count frames, not videos — the manifest holds 24 rows per video."""
@@ -664,7 +676,13 @@ class FrameDataset(Dataset):
         channels = [frame]
         for column in self.neighbours:
             torch.set_rng_state(state)
-            channels.append(frame - self._prepare(row[column]))
+            difference = frame - self._prepare(row[column])
+            # Left alone at one rather than multiplied by it, so that a run
+            # without the option produces the tensor earlier runs produced
+            # rather than one that only rounds to it.
+            if self.difference_gain != 1.0:
+                difference = difference * self.difference_gain
+            channels.append(difference)
 
         return torch.cat(channels), row["label"], row["video_id"]
 

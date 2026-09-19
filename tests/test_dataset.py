@@ -705,3 +705,31 @@ def test_every_spacing_is_augmented_with_the_frame_and_not_after_it(tmp_path):
 
     assert torch.equal(frame[3:6], torch.zeros_like(frame[3:6]))
     assert torch.equal(frame[6:9], torch.zeros_like(frame[6:9]))
+
+
+def test_a_gain_of_one_leaves_the_difference_exactly_as_it_was(tmp_path):
+    """Every measured cell of the difference family saw the unscaled channels.
+
+    Multiplying by one would round to the same tensor rather than be it, and
+    the default has to be the tensor.
+    """
+    manifest = _paired_manifest(tmp_path, neighbour_is_self=False)
+
+    plain = FrameDataset(manifest, tmp_path, eval_transform())[0][0]
+    explicit = FrameDataset(manifest, tmp_path, eval_transform(), difference_gain=1.0)[
+        0
+    ][0]
+
+    assert torch.equal(plain, explicit)
+
+
+def test_the_gain_scales_the_difference_and_not_the_frame(tmp_path):
+    manifest = _paired_manifest(tmp_path, neighbour_is_self=False)
+
+    plain = FrameDataset(manifest, tmp_path, eval_transform())[0][0]
+    louder = FrameDataset(manifest, tmp_path, eval_transform(), difference_gain=3.0)[0][
+        0
+    ]
+
+    assert torch.equal(louder[:3], plain[:3])
+    assert torch.allclose(louder[3:], plain[3:] * 3.0)
