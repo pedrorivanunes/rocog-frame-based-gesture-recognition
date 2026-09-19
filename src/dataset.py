@@ -17,6 +17,7 @@ from torch.utils.data import Dataset, Sampler
 from torchvision.transforms import v2
 
 from manifest import FRAME_SIZE, mask_path_for, stored_size_for
+from splits import neighbours_in
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -593,6 +594,12 @@ class FrameDataset(Dataset):
         crop_fits(manifest, transform)
 
         self.data_frame = manifest.reset_index(drop=True)
+        # Which neighbour columns this manifest carries, settled once rather
+        # than looked for on every read. A run differencing at several spacings
+        # names one column per spacing, and the order they come back in is the
+        # order the channels are stacked in, so it has to be the order the
+        # manifest was built with rather than whatever the columns sort to.
+        self.neighbours = neighbours_in(manifest)
         self.data_root = data_root
         self.transform = transform
         self.background = background
@@ -622,16 +629,17 @@ class FrameDataset(Dataset):
         Returns:
             The transformed frame as a ``(3, 224, 224)`` float tensor, the class
             label, and the ``video_id`` needed to group predictions by video.
-            When the manifest names a neighbour, the frame comes back as six
-            channels instead of three: the frame itself, then what changed
-            since its neighbour.
+            When the manifest names neighbours, the frame comes back with
+            three channels per neighbour on top of its own: the frame itself,
+            then what changed since each of them, in the order the manifest
+            names them.
 
         Raises:
             RuntimeError: If a frame, or a silhouette a background swap needs,
                 is missing from disk.
         """
         row = self.data_frame.iloc[index]
-        if "neighbour_path" not in row:
+        if not self.neighbours:
             return self._prepare(row["path"]), row["label"], row["video_id"]
 
         # The pair shares every draw, and that is the whole design. A
@@ -645,17 +653,20 @@ class FrameDataset(Dataset):
         # without any of them needing to know a pair exists.
         state = torch.get_rng_state()
         frame = self._prepare(row["path"])
-        torch.set_rng_state(state)
-        neighbour = self._prepare(row["neighbour_path"])
 
         # The difference is taken after the pipeline, not before, so that what
         # is subtracted is what the network would actually have seen. It is
         # taken in normalised space, where a still background cancels to zero.
-        return (
-            torch.cat([frame, frame - neighbour]),
-            row["label"],
-            row["video_id"],
-        )
+        # Every neighbour replays the frame's draws, not the previous
+        # neighbour's: each difference has to be against the same augmented
+        # frame, or the spacings would differ in their augmentation as well as
+        # in their distance.
+        channels = [frame]
+        for column in self.neighbours:
+            torch.set_rng_state(state)
+            channels.append(frame - self._prepare(row[column]))
+
+        return torch.cat(channels), row["label"], row["video_id"]
 
     def _prepare(self, path: str):
         """One frame, from the image on disk to the tensor the model reads."""

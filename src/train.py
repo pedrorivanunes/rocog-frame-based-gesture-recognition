@@ -49,7 +49,7 @@ from splits import (
     select_frames,
     split_by_group,
     split_by_scene,
-    with_neighbour,
+    with_neighbours,
     with_previous_anchor,
 )
 
@@ -163,12 +163,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     neighbours = parser.add_mutually_exclusive_group()
     neighbours.add_argument(
         "--neighbour-stride",
+        nargs="+",
         type=int,
         default=None,
-        help="hand the network, alongside each frame, what changed since the "
-        "frame this many back. Needs the dense manifest of the same split to "
-        "look the neighbour up in; the frames trained on stay the ones this "
-        "run's own manifest names.",
+        metavar="STRIDE",
+        help="give the network what changed since the frame this many back, as "
+        "extra channels. Several values stack one difference per spacing, "
+        "which is what lets a run read more than one scale of movement at "
+        "once; the source and the target were measured to prefer different "
+        "ones. Mutually exclusive with --neighbour-anchor",
     )
     neighbours.add_argument(
         "--neighbour-anchor",
@@ -480,7 +483,9 @@ def build_loaders(
         ),
     )
     eval_dataset = FrameDataset(
-        eval_manifest, data_root, transform=eval_transform(crop_size)
+        eval_manifest,
+        data_root,
+        transform=eval_transform(crop_size),
     )
 
     # Two draws rather than one when the rows carry both kinds. A video holds a
@@ -835,10 +840,13 @@ if __name__ == "__main__":
             return with_previous_anchor(rows)
         dense_name = dense_name_for(manifest_name)
         dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
-        return with_neighbour(rows, args.neighbour_stride, dense)
+        return with_neighbours(rows, args.neighbour_stride, dense)
 
     reads_neighbours = args.neighbour_stride is not None or args.neighbour_anchor
-    in_channels = 6 if reads_neighbours else 3
+    # Three of its own plus three per difference. The anchor arm differences
+    # against one frame by construction, so it is always six.
+    spacings = len(args.neighbour_stride) if args.neighbour_stride else 1
+    in_channels = 3 * (1 + spacings) if reads_neighbours else 3
     if reads_neighbours:
         train_manifest = differenced(train_manifest, args.manifest)
         eval_manifest = differenced(eval_manifest, args.manifest)
@@ -894,9 +902,15 @@ if __name__ == "__main__":
 
     excluded = " ".join(args.exclude_groups) if args.exclude_groups else "none"
     views = " ".join(str(view) for view in args.views) if args.views else "all"
+    spacing_names = (
+        " ".join(str(stride) for stride in args.neighbour_stride)
+        if args.neighbour_stride
+        else ("anchor" if args.neighbour_anchor else "none")
+    )
     print(
         f"manifest {args.manifest}  validation groups: {' '.join(held_out)}  "
-        f"excluded: {excluded}  views: {views}"
+        f"excluded: {excluded}  views: {views}  "
+        f"differences: {spacing_names} ({in_channels} channels)"
     )
     print(
         f"fraction {args.fraction:g} -> "

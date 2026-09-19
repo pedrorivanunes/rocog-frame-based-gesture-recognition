@@ -12,6 +12,8 @@ narrows one side and hands back what is left. They are kept together because
 both answer the same question about a result — which frames produced it.
 """
 
+from collections.abc import Sequence
+
 import numpy as np
 import pandas as pd
 
@@ -183,6 +185,11 @@ def split_by_scene(
     return split_by_group(manifest, held_out)
 
 
+# What the column holding a frame's neighbour is called. A run reading several
+# spacings numbers the rest after it.
+NEIGHBOUR_COLUMN = "neighbour_path"
+
+
 def with_neighbour(
     manifest: pd.DataFrame, stride: int, dense: pd.DataFrame | None = None
 ) -> pd.DataFrame:
@@ -248,6 +255,94 @@ def with_neighbour(
             f"no neighbour for {missing.nunique()} video(s), starting with "
             f"{missing.iloc[0]}: is this the dense manifest for these rows?"
         )
+
+    return annotated
+
+
+def neighbour_columns(count: int) -> list[str]:
+    """Name the columns that hold one neighbour per spacing.
+
+    The first keeps the name a single spacing has always written, so every
+    table, checkpoint and reader produced before spacings could be plural goes
+    on meaning what it meant.
+
+    Args:
+        count: How many spacings the run reads.
+
+    Returns:
+        One column name per spacing, in the order the spacings were given.
+    """
+    return [NEIGHBOUR_COLUMN] + [
+        f"{NEIGHBOUR_COLUMN}_{index}" for index in range(1, count)
+    ]
+
+
+def neighbours_in(manifest: pd.DataFrame) -> list[str]:
+    """The neighbour columns a manifest carries, in the order to stack them.
+
+    Asked of the table rather than passed alongside it, because the number of
+    spacings is a property of the rows being served and everything downstream
+    would otherwise have to be told it twice and could be told two different
+    things.
+
+    Args:
+        manifest: Rows to inspect.
+
+    Returns:
+        The names present, first spacing first. Empty when the manifest names
+        no neighbour, which is the plain three-channel case.
+    """
+    present: list[str] = []
+    while neighbour_columns(len(present) + 1)[-1] in manifest.columns:
+        present.append(neighbour_columns(len(present) + 1)[-1])
+
+    return present
+
+
+def with_neighbours(
+    manifest: pd.DataFrame, strides: Sequence[int], dense: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Name one neighbour per spacing, so a frame can be differenced at several.
+
+    One spacing has to choose a scale, and the two domains do not agree on
+    which. Measured over eight spacings, the source keeps improving as the
+    neighbour moves further back while the target turns around between five
+    and eight frames: the movement that survives the crossing is narrow, and
+    the movement the source rewards is not. Giving the network more than one
+    spacing at once is what removes the choice, and it is the second level of
+    the difference design this project took the first level from.
+
+    Each spacing is looked up by the same routine that serves a single one, so
+    a run asking for one gets exactly the table it always got — the column
+    names, their order and their contents are unchanged. That is deliberate:
+    every measured cell of the difference family would otherwise stop being
+    reproducible.
+
+    A repeated spacing is allowed, and it is not a mistake waiting to happen:
+    it is the control this design needs. Adding spacings widens the stem as
+    well as adding scales, so a gain confounds the two; the same spacing
+    stacked as many times carries no second signal and holds the width fixed,
+    which separates them. The spacings a run used are printed in its header,
+    so a repeat that was a typo is visible where the result is.
+
+    Args:
+        manifest: Rows to annotate, as ``with_neighbour`` takes them.
+        strides: How many frames back each neighbour sits.
+        dense: Where to look the neighbours up.
+
+    Returns:
+        The manifest with one neighbour column per spacing.
+
+    Raises:
+        ValueError: If no spacing is named.
+    """
+    if not strides:
+        raise ValueError("no spacings named")
+
+    annotated = manifest
+    for column, stride in zip(neighbour_columns(len(strides)), strides, strict=True):
+        named = with_neighbour(manifest, stride, dense)
+        annotated = annotated.assign(**{column: named[NEIGHBOUR_COLUMN].to_numpy()})
 
     return annotated
 

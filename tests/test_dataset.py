@@ -672,3 +672,36 @@ def test_a_frame_paired_with_another_does_differ(tmp_path):
     frame, _, _ = dataset[0]
 
     assert frame[3:].abs().sum() > 0
+
+
+def test_several_spacings_stack_one_difference_each(tmp_path):
+    """Three of the frame's own channels, then three per neighbour."""
+    manifest = _paired_manifest(tmp_path, neighbour_is_self=False)
+    manifest["neighbour_path_1"] = manifest["path"]
+
+    dataset = FrameDataset(manifest, tmp_path, eval_transform())
+    frame, _, _ = dataset[0]
+
+    assert frame.shape == (9, 224, 224)
+    # The second neighbour is the frame itself, so its difference is exactly
+    # zero — which is what makes this a check on the stacking order rather
+    # than on the arithmetic.
+    assert torch.equal(frame[6:9], torch.zeros_like(frame[6:9]))
+    assert not torch.equal(frame[3:6], torch.zeros_like(frame[3:6]))
+
+
+def test_every_spacing_is_augmented_with_the_frame_and_not_after_it(tmp_path):
+    """Each difference has to be against the same augmented frame.
+
+    Replaying the draws only for the first neighbour would leave the second
+    differing in its augmentation as well as in its distance, and the network
+    would read the augmentation as movement.
+    """
+    manifest = _paired_manifest(tmp_path, neighbour_is_self=True)
+    manifest["neighbour_path_1"] = manifest["neighbour_path"]
+
+    dataset = FrameDataset(manifest, tmp_path, eval_transform())
+    frame, _, _ = dataset[0]
+
+    assert torch.equal(frame[3:6], torch.zeros_like(frame[3:6]))
+    assert torch.equal(frame[6:9], torch.zeros_like(frame[6:9]))

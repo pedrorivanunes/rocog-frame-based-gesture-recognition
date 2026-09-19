@@ -82,8 +82,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     neighbours = parser.add_mutually_exclusive_group()
     neighbours.add_argument(
         "--neighbour-stride",
+        nargs="+",
         type=int,
         default=None,
+        metavar="STRIDE",
         help="how many frames back the difference channels were taken from, "
         "for a checkpoint trained to read them. Asked for rather than read off "
         "the file because a plain state dict has nowhere to record it; scoring "
@@ -323,7 +325,7 @@ if __name__ == "__main__":
     from splits import (
         keep_views,
         split_by_scene,
-        with_neighbour,
+        with_neighbours,
         with_previous_anchor,
     )
 
@@ -377,8 +379,20 @@ if __name__ == "__main__":
         else:
             dense_name = dense_name_for(args.manifest)
             dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
-            manifest = with_neighbour(manifest, args.neighbour_stride, dense)
-            print(f"differencing against the frame {args.neighbour_stride} back")
+            # The count has to match what the stem was widened to, or the
+            # batch and the network disagree on how many channels a frame has.
+            # Checked here rather than left to the shape error, which arrives
+            # after the manifest, the dense pass and the model are all loaded.
+            expected = 3 * (1 + len(args.neighbour_stride))
+            if expected != in_channels:
+                raise SystemExit(
+                    f"{args.checkpoint.name} reads {in_channels} channels, so "
+                    f"it was trained on {in_channels // 3 - 1} spacing(s); "
+                    f"{len(args.neighbour_stride)} were given"
+                )
+            manifest = with_neighbours(manifest, args.neighbour_stride, dense)
+            spacings = " and ".join(str(s) for s in args.neighbour_stride)
+            print(f"differencing against the frames {spacings} back")
 
     model = build_model(num_classes, backbone, in_channels).to(device)
     model.load_state_dict(weights)
@@ -393,7 +407,11 @@ if __name__ == "__main__":
         the model never sees at evaluation.
         """
         return DataLoader(
-            FrameDataset(rows, PROJECT_ROOT, eval_transform(args.crop_size)),
+            FrameDataset(
+                rows,
+                PROJECT_ROOT,
+                eval_transform(args.crop_size),
+            ),
             batch_size=BATCH_SIZE,
             shuffle=False,
             num_workers=args.num_workers,

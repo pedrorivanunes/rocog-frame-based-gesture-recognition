@@ -6,11 +6,13 @@ from splits import (
     EDGE_FRAMES,
     add_idle_rows,
     keep_views,
+    neighbours_in,
     sample_videos,
     select_frames,
     split_by_group,
     split_by_scene,
     with_neighbour,
+    with_neighbours,
     with_previous_anchor,
 )
 
@@ -602,3 +604,66 @@ def test_keep_views_leaves_the_split_able_to_hold_one_scene_per_view():
     assert sorted(validation["view"].unique()) == [3, 4]
     assert validation["group_id"].nunique() == 2
     assert train.empty or set(train["view"]).issubset({3, 4})
+
+
+def dense_run():
+    """One video, six consecutive frames, as a dense pass writes them."""
+    return pd.DataFrame(
+        {
+            "video_id": ["v0"] * 6,
+            "frame_number": list(range(6)),
+            "path": [f"f{index}.jpg" for index in range(6)],
+        }
+    )
+
+
+def test_one_spacing_writes_the_column_a_single_spacing_always_wrote():
+    """Every measured cell of the difference family reads this column.
+
+    Renaming it, or reordering the table around it, would make those cells
+    unreproducible.
+    """
+    rows = dense_run()
+
+    single = with_neighbour(rows, 2)
+    plural = with_neighbours(rows, [2])
+
+    pd.testing.assert_frame_equal(single, plural)
+
+
+def test_each_spacing_gets_a_column_of_its_own():
+    rows = dense_run()
+
+    annotated = with_neighbours(rows, [1, 3])
+
+    assert neighbours_in(annotated) == ["neighbour_path", "neighbour_path_1"]
+    assert annotated["neighbour_path"].tolist() == ["f0.jpg"] + [
+        f"f{index}.jpg" for index in range(5)
+    ]
+    assert annotated["neighbour_path_1"].tolist() == ["f0.jpg"] * 4 + [
+        "f1.jpg",
+        "f2.jpg",
+    ]
+
+
+def test_a_repeated_spacing_is_the_capacity_control_and_is_allowed():
+    """Adding spacings widens the stem as well as adding scales.
+
+    Stacking one spacing as many times carries no second signal and holds the
+    width fixed, which is what separates the two.
+    """
+    annotated = with_neighbours(dense_run(), [2, 2, 2])
+
+    columns = neighbours_in(annotated)
+    assert len(columns) == 3
+    for column in columns[1:]:
+        assert annotated[column].tolist() == annotated[columns[0]].tolist()
+
+
+def test_naming_no_spacing_is_refused():
+    with pytest.raises(ValueError, match="no spacings named"):
+        with_neighbours(dense_run(), [])
+
+
+def test_a_manifest_with_no_neighbour_column_names_none():
+    assert neighbours_in(dense_run()) == []

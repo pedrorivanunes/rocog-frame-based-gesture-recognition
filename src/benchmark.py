@@ -174,6 +174,17 @@ ENTRIES: tuple[Entry, ...] = (
         "ours",
         channels=6,
     ),
+    # And the same network again reading three spacings instead of one. The
+    # row exists because the transform is the cost that scales: four frames
+    # per decision instead of two, which no count of multiply-adds shows.
+    Entry(
+        "resnet18_multi",
+        lambda: build_model(NUM_CLASSES, "resnet18", 12),
+        224,
+        None,
+        "ours",
+        channels=12,
+    ),
     Entry("i3d_r50", _pytorchvideo("i3d_r50"), 256, 16, "baseline"),
     # X3D-M appears at two sizes because its own and the paper's disagree. The
     # architecture was published at 224 and its cost figures are quoted there;
@@ -320,8 +331,12 @@ def decision_call(
     """
     transform = eval_transform(entry.crop)
     count = entry.clip if entry.clip is not None else frames
-    pairs = entry.clip is None and entry.channels == 6
-    raw = stored_frames(count * 2 if pairs else count)
+    # Three channels per block: the frame, then one neighbour per spacing. A
+    # row reading several spacings puts that many times K frames through the
+    # transform, and that is the half of the cost arithmetic cannot be asked.
+    blocks = entry.channels // 3
+    stacked = entry.clip is None and blocks > 1
+    raw = stored_frames(count * blocks if stacked else count)
 
     def decide() -> torch.Tensor:
         batch = transform(raw).to(device)
@@ -329,9 +344,10 @@ def decision_call(
             # A clip-based network reads (batch, channels, time, height, width),
             # so the frame axis moves from the front to position two.
             batch = batch.permute(1, 0, 2, 3).unsqueeze(0)
-        elif pairs:
-            frame, neighbour = batch[:count], batch[count:]
-            batch = torch.cat([frame, frame - neighbour], dim=1)
+        elif stacked:
+            served = torch.split(batch, count)
+            frame = served[0]
+            batch = torch.cat([frame] + [frame - other for other in served[1:]], dim=1)
         logits = model(batch)
         probabilities = logits.softmax(dim=1)
         if entry.clip is None:
