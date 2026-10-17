@@ -21,10 +21,13 @@ from dataset import (
     TEXTURES,
     Augmentation,
     BackgroundRandomiser,
+    ClipSampler,
     CombinedSampler,
     FrameDataset,
     SegmentSampler,
     TextureRandomiser,
+    clip_batches,
+    drawing_sampler,
     eval_transform,
     train_transform,
 )
@@ -401,7 +404,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="also write one checkpoint per epoch, not only the best; for the "
         "epoch-vs-real-accuracy diagnostic. Pair with a patience it never hits.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--clips",
+        type=int,
+        metavar="FRAMES",
+        help="serve each video's frames together, in order, this many per "
+        "clip, instead of shuffling frames from every video into a batch. On "
+        "its own it changes only how batches are composed, which is the "
+        "control the shift is measured against; --tsm needs it",
+    )
+    arguments = parser.parse_args(argv)
+
+    # Refused here rather than left to fail somewhere inside the first forward
+    # pass, which is minutes of loading later and reads as a shape error.
+    if arguments.clips is not None and arguments.clips < 1:
+        parser.error("--clips needs at least one frame")
+
+    return arguments
 
 
 def checkpoint_name(base_name: str, seed: int, epoch: int | None = None) -> str:
@@ -438,6 +457,7 @@ def build_loaders(
     crop_size: int = CROP_SIZE,
     seed: int = SEED,
     difference_gain: float = 1.0,
+    clips: int | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Build the training and evaluation loaders from two sets of manifest rows.
 
@@ -473,6 +493,12 @@ def build_loaders(
         difference_gain: Multiplies each difference channel. Given to both
             loaders, because the model has to meet the same input scale it was
             trained on or the validation curve measures a different network.
+        clips: Frames per clip, or ``None`` to serve frames one at a time as
+            every run before the shift did. A number here changes only how
+            batches are composed — the frames of a video arrive together and in
+            order, so fewer videos share a batch — which is why it is separable
+            from the shift that needs it: on its own it is the control that
+            says what the batching alone was worth.
         seed: Which repetition of a configuration this is. Offsets the sampler's
             own seed rather than replacing it, so that seed 0 keeps drawing the
             frames earlier runs drew and stays comparable to them.
@@ -511,6 +537,64 @@ def build_loaders(
     # is stored least often decide the rate for all of them.
     rows = train_dataset.data_frame
     is_idle = (rows["label"] == IDLE_LABEL).to_numpy()
+
+    if clips:
+        # A clip is one video's frames, in order, so the draw is the same one
+        # and what changes is that it stops before shuffling them apart. The
+        # blocks are cut to the clip length rather than to the epoch's budget,
+        # and how many clips the epoch uses is what keeps the budget: at eight
+        # frames per video per epoch and clips of eight, that is one clip from
+        # every video, which is exactly what the frame-wise draw served.
+        parts = [
+            (
+                SegmentSampler(rows, clips, seed=SAMPLER_SEED + seed, rows=~is_idle),
+                round(
+                    rows.loc[~is_idle, "video_id"].nunique() * frames_per_epoch / clips
+                ),
+            )
+        ]
+        if is_idle.any():
+            # The eighth class is stored four frames to a video, so its clips
+            # are as long as it has frames and cannot be as long as a gesture's.
+            # Keeping the budget then means serving a clip from a quarter of the
+            # videos instead of one frame from all of them: the number of idle
+            # frames an epoch holds, and so the share of the epoch that is a
+            # body at rest, stays what every measured cell saw.
+            stored = rows.loc[is_idle].groupby("video_id", sort=False).size().unique()
+            if len(stored) != 1:
+                raise RuntimeError(f"idle rows hold {sorted(stored)} frames per video")
+            idle_clip = min(clips, int(stored[0]))
+            parts.append(
+                (
+                    SegmentSampler(
+                        rows, idle_clip, seed=SAMPLER_SEED + seed, rows=is_idle
+                    ),
+                    round(
+                        rows.loc[is_idle, "video_id"].nunique()
+                        * idle_frames_per_epoch
+                        / idle_clip
+                    ),
+                )
+            )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=ClipSampler(parts, BATCH_SIZE, seed=SAMPLER_SEED + seed),
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
+            pin_memory=True,
+        )
+        # Grouped rather than drawn, so that the rows come back in the order the
+        # manifest lists them: the probability table is matched to it
+        # positionally and refuses scores that arrived in another order.
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_sampler=clip_batches(eval_manifest, clips, BATCH_SIZE),
+            num_workers=num_workers,
+            persistent_workers=num_workers > 0,
+            pin_memory=True,
+        )
+        return train_loader, eval_loader
+
     sampler = (
         CombinedSampler(
             [
@@ -964,6 +1048,7 @@ if __name__ == "__main__":
         crop_size=args.crop_size,
         seed=args.seed,
         difference_gain=args.difference_gain,
+        clips=args.clips,
     )
 
     device = pick_device()
@@ -996,7 +1081,7 @@ if __name__ == "__main__":
     # so its presence is exactly the statement "this run was cut off".
     progress_path = checkpoint_dir / f"{Path(best_name).stem}_progress.pt"
     epochs_done = load_progress(
-        progress_path, model, optimizer, stopper, train_loader.sampler, args
+        progress_path, model, optimizer, stopper, drawing_sampler(train_loader), args
     )
     if epochs_done:
         print(
@@ -1036,7 +1121,7 @@ if __name__ == "__main__":
             model,
             optimizer,
             stopper,
-            train_loader.sampler,
+            drawing_sampler(train_loader),
             args,
         )
 

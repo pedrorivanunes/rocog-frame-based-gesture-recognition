@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import cv2
 import numpy as np
 import pandas as pd
@@ -10,12 +12,16 @@ from dataset import (
     TEXTURE_FILLS,
     Augmentation,
     BackgroundRandomiser,
+    ClipSampler,
     CombinedSampler,
     FrameDataset,
     RandomGamma,
     SegmentSampler,
     TextureRandomiser,
+    clip_batches,
+    clip_length,
     crop_fits,
+    drawing_sampler,
     eval_transform,
     noise_background,
     solid_background,
@@ -733,3 +739,191 @@ def test_the_gain_scales_the_difference_and_not_the_frame(tmp_path):
 
     assert torch.equal(louder[:3], plain[:3])
     assert torch.allclose(louder[3:], plain[3:] * 3.0)
+
+
+def test_a_clip_is_the_frames_of_one_video_in_the_order_they_were_filmed():
+    """What makes a shift possible: the sequence has to survive the draw."""
+    manifest = frame_manifest(videos=4)
+
+    clips = SegmentSampler(manifest, 8, seed=1).clips()
+
+    assert len(clips) == 4
+    for clip in clips:
+        assert len(clip) == 8
+        rows = manifest.iloc[clip]
+        assert rows["video_id"].nunique() == 1
+        assert rows["frame_number"].tolist() == sorted(rows["frame_number"])
+
+
+def test_grouping_the_draw_does_not_change_the_draw():
+    """Every result on record was drawn frame-wise; the clips are the same draw."""
+    manifest = frame_manifest(videos=5)
+
+    grouped = np.concatenate(SegmentSampler(manifest, 8, seed=4).clips())
+    flat = list(SegmentSampler(manifest, 8, seed=4))
+
+    assert sorted(grouped.tolist()) == sorted(flat)
+
+
+def test_a_clip_batch_holds_whole_clips_of_one_length():
+    manifest = frame_manifest(videos=16)
+
+    sampler = ClipSampler(
+        [(SegmentSampler(manifest, 8, seed=1), 16)], frames_per_batch=64
+    )
+
+    batches = list(sampler)
+    assert len(sampler) == len(batches) == 2
+    for batch in batches:
+        assert len(batch) == 64
+        assert clip_length(manifest.iloc[batch]["video_id"].tolist()) == 8
+
+
+def test_the_two_kinds_of_clip_never_share_a_batch():
+    """They hold different frame counts, so a mixed batch has no clip length."""
+    manifest = mixed_manifest(videos=64, gesture_frames=24, idle_frames=4)
+    is_idle = (manifest["label"] == IDLE_LABEL).to_numpy()
+
+    sampler = ClipSampler(
+        [
+            (SegmentSampler(manifest, 8, seed=1, rows=~is_idle), 64),
+            (SegmentSampler(manifest, 4, seed=1, rows=is_idle), 16),
+        ],
+        frames_per_batch=64,
+    )
+
+    for batch in sampler:
+        labels = manifest.iloc[batch]["label"]
+        assert labels.nunique() == 1 or IDLE_LABEL not in set(labels)
+        assert (labels == IDLE_LABEL).all() or (labels != IDLE_LABEL).all()
+
+
+def test_clips_keep_the_eighth_class_at_the_weight_the_frames_gave_it():
+    """A clip of four idle frames from every video would quadruple the class."""
+    manifest = mixed_manifest(videos=64, gesture_frames=24, idle_frames=4)
+    is_idle = (manifest["label"] == IDLE_LABEL).to_numpy()
+
+    sampler = ClipSampler(
+        [
+            (SegmentSampler(manifest, 8, seed=1, rows=~is_idle), 64),
+            # A quarter of the videos, because each gives four frames instead
+            # of the one the frame-wise draw took.
+            (SegmentSampler(manifest, 4, seed=1, rows=is_idle), 16),
+        ],
+        frames_per_batch=64,
+    )
+
+    served = [position for batch in sampler for position in batch]
+    idle_served = sum(manifest.iloc[served]["label"] == IDLE_LABEL)
+
+    assert idle_served == 64
+    assert idle_served / len(served) == pytest.approx(1 / 9, abs=0.001)
+
+
+def test_a_kind_that_cannot_fill_a_batch_is_refused_rather_than_dropped():
+    """Dropping the remainder is intended; dropping a whole class is not."""
+    manifest = mixed_manifest(videos=8, gesture_frames=24, idle_frames=4)
+    is_idle = (manifest["label"] == IDLE_LABEL).to_numpy()
+
+    with pytest.raises(ValueError, match="none would be served"):
+        ClipSampler(
+            [(SegmentSampler(manifest, 4, seed=1, rows=is_idle), 2)],
+            frames_per_batch=64,
+        )
+
+
+def test_asking_a_video_for_two_clips_an_epoch_is_refused_with_the_arithmetic():
+    """A clip shorter than the epoch's budget per video needs a different draw."""
+    manifest = frame_manifest(videos=8)
+
+    with pytest.raises(ValueError, match="more than once per epoch"):
+        ClipSampler([(SegmentSampler(manifest, 4, seed=1), 16)], frames_per_batch=64)
+
+
+def test_the_rotation_takes_every_video_before_it_repeats_one():
+    """Drawn afresh each epoch, a video could wait many epochs for its turn."""
+    manifest = frame_manifest(videos=32)
+    sampler = ClipSampler(
+        [(SegmentSampler(manifest, 8, seed=1), 8)], frames_per_batch=64
+    )
+
+    seen = []
+    for _ in range(4):
+        for batch in sampler:
+            seen += manifest.iloc[batch]["video_id"].unique().tolist()
+
+    counts = pd.Series(seen).value_counts()
+    assert len(counts) == 32
+    assert counts.max() == counts.min() == 1
+
+
+def test_a_resumed_clip_sampler_carries_on_rather_than_restarts():
+    """The rotation is state: refilled from scratch it would repeat a turn."""
+
+    def sampler():
+        manifest_rows = frame_manifest(videos=32)
+        return ClipSampler(
+            [(SegmentSampler(manifest_rows, 8, seed=1), 16)], frames_per_batch=64
+        )
+
+    cut, resumed = sampler(), sampler()
+    list(cut)
+    resumed.load_state_dict(cut.state_dict())
+
+    assert [list(batch) for batch in cut] == [list(batch) for batch in resumed]
+
+
+def test_evaluation_clips_serve_every_row_in_the_manifest_order():
+    """The probability table is matched positionally and refuses any other order."""
+    manifest = frame_manifest(videos=5)
+
+    batches = clip_batches(manifest, segments=8, frames_per_batch=64)
+
+    served = [position for batch in batches for position in batch]
+    assert served == list(range(len(manifest)))
+
+
+def test_evaluation_clips_never_straddle_two_videos():
+    manifest = frame_manifest(videos=5)
+
+    for batch in clip_batches(manifest, segments=8, frames_per_batch=64):
+        for start in range(0, len(batch), 8):
+            clip = manifest.iloc[batch[start : start + 8]]
+            assert clip["video_id"].nunique() == 1
+
+
+def test_a_clip_length_that_does_not_divide_a_video_is_refused():
+    """Sixteen into twenty-four would leave a clip of eight the shift cannot pair."""
+    manifest = frame_manifest(videos=3)
+
+    with pytest.raises(RuntimeError, match="do not divide"):
+        clip_batches(manifest, segments=16, frames_per_batch=64)
+
+
+def test_the_clip_length_is_counted_from_the_batch():
+    assert clip_length(["a"] * 8 + ["b"] * 8) == 8
+    assert clip_length(["a"] * 4) == 4
+
+
+def test_a_batch_of_unequal_runs_has_no_clip_length():
+    """Equal runs are what the shift's reshape assumes, so the assumption is checked."""
+    with pytest.raises(RuntimeError, match="not whole clips"):
+        clip_length(["a"] * 8 + ["b"] * 4)
+
+
+def test_the_sampler_a_restart_has_to_save_is_the_one_carrying_a_draw():
+    """A loader built with a batch sampler puts a stateless one under .sampler."""
+    manifest = frame_manifest(videos=16)
+    clips = ClipSampler(
+        [(SegmentSampler(manifest, 8, seed=1), 16)], frames_per_batch=64
+    )
+
+    assert drawing_sampler(SimpleNamespace(batch_sampler=clips, sampler=None)) is clips
+
+    frames = SegmentSampler(manifest, 8, seed=1)
+    assert (
+        drawing_sampler(SimpleNamespace(batch_sampler=object(), sampler=frames))
+        is frames
+    )
+    with pytest.raises(RuntimeError, match="no sampler carrying a draw"):
+        drawing_sampler(SimpleNamespace(batch_sampler=object(), sampler=object()))

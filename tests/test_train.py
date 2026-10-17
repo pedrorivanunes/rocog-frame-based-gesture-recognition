@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torchvision.models import resnet18
 
-from dataset import SegmentSampler
+from dataset import ClipSampler, SegmentSampler
 from manifest import IDLE_LABEL
 from model import freeze
 from train import (
@@ -470,3 +470,63 @@ def test_parse_args_takes_groups_to_exclude_entirely():
     args = parse_args(["--exclude-groups", "S05", "S07"])
 
     assert args.exclude_groups == ["S05", "S07"]
+
+
+def test_the_standard_run_serves_frames_rather_than_clips():
+    """Every result on record was drawn frame-wise, so that stays the default."""
+    assert parse_args([]).clips is None
+
+
+def test_parse_args_takes_a_clip_length():
+    assert parse_args(["--clips", "8"]).clips == 8
+
+
+def test_a_clip_of_no_frames_is_refused():
+    with pytest.raises(SystemExit):
+        parse_args(["--clips", "0"])
+
+
+def test_clips_put_the_draw_under_the_batch_sampler(tmp_path):
+    """A loader built with one keeps a stateless sampler under the usual name."""
+    train_rows = pd.concat(
+        [rows_for(f"v{v}", 0, 24) for v in range(16)], ignore_index=True
+    )
+
+    train_loader, _ = build_loaders(
+        train_rows, rows_for("v0", 0, 24), tmp_path, num_workers=0, clips=8
+    )
+
+    assert isinstance(train_loader.batch_sampler, ClipSampler)
+    assert len(train_loader.batch_sampler) == 2
+
+
+def test_clips_keep_the_eighth_class_at_the_weight_the_frames_gave_it(tmp_path):
+    """One idle frame a video became a clip of four from a quarter of them."""
+    train_rows = mixed_rows(videos=64, gesture_frames=24, idle_frames=4)
+
+    train_loader, _ = build_loaders(
+        train_rows, rows_for("v0", 0, 24), tmp_path, num_workers=0, clips=8
+    )
+
+    served = [position for batch in train_loader.batch_sampler for position in batch]
+    idle = sum(train_rows.iloc[served]["label"] == IDLE_LABEL)
+
+    assert idle == 64
+    assert idle / len(served) == pytest.approx(1 / 9, abs=0.001)
+
+
+def test_the_clipped_evaluation_loader_serves_every_row_in_order(tmp_path):
+    """The probability table refuses scores that arrived in another order."""
+    eval_rows = pd.concat(
+        [rows_for(f"v{v}", 0, 24) for v in range(4)], ignore_index=True
+    )
+    train_rows = pd.concat(
+        [rows_for(f"t{v}", 0, 24) for v in range(16)], ignore_index=True
+    )
+
+    _, eval_loader = build_loaders(
+        train_rows, eval_rows, tmp_path, num_workers=0, clips=8
+    )
+
+    served = [position for batch in eval_loader.batch_sampler for position in batch]
+    assert served == list(range(len(eval_rows)))

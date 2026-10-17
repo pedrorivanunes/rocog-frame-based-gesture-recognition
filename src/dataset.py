@@ -799,15 +799,30 @@ class SegmentSampler(Sampler[int]):
         """
         self.rng.bit_generator.state = state
 
+    def clips(self) -> list[np.ndarray]:
+        """Draw this epoch's frames, kept grouped by video and in frame order.
+
+        The same draw ``__iter__`` makes, stopping one step earlier. A run that
+        feeds the network whole clips needs the frames of a video adjacent and
+        in the order they were filmed, which is exactly what the blocks are
+        before they are shuffled together.
+
+        Returns:
+            One array per video, each holding the positions drawn from that
+            video's blocks, in block order.
+        """
+        return [
+            np.array([self.rng.choice(block) for block in video])
+            for video in self.blocks
+        ]
+
     def __iter__(self):
         """Draw one frame from every block of every video, in shuffled order.
 
         The order is shuffled because the blocks are built video by video, and
         batches drawn in that order would hold one gesture at a time.
         """
-        drawn = np.array(
-            [self.rng.choice(block) for video in self.blocks for block in video]
-        )
+        drawn = np.concatenate(self.clips())
         self.rng.shuffle(drawn)
 
         return iter(drawn.tolist())
@@ -879,3 +894,309 @@ class CombinedSampler(Sampler[int]):
         self.rng.shuffle(drawn)
 
         return iter(drawn.tolist())
+
+
+def clip_length(video_ids: list[str]) -> int:
+    """How many frames the clips in a training batch hold, read off the batch.
+
+    A run with the eighth class trains on two kinds of clip in the same epoch,
+    at two lengths, because a video stores twenty-four frames of its gesture and
+    only four of the material before it. The shift has to be told the length
+    before it can move anything along it.
+
+    It is counted rather than configured, and that is the point. The alternative
+    is a second channel of bookkeeping between a sampler running in the main
+    process and batches arriving from worker subprocesses, which is a thing to
+    get wrong silently. Here the batch describes itself: a training batch holds
+    one clip from each of several videos, so a video's frames are one unbroken
+    run and the run is the clip.
+
+    Checking that every run is the same length is the same work as measuring
+    one, so it is done: equal runs are what the shift's reshape assumes, and a
+    batch that broke the assumption would otherwise shift frames of one video
+    into another.
+
+    Args:
+        video_ids: The video each frame of the batch came from, in the order
+            the batch holds them.
+
+    Returns:
+        Frames per clip.
+
+    Raises:
+        RuntimeError: If the batch is empty, or if the runs are not all the same
+            length — which means the batch is not whole clips of one size, and
+            no single answer exists.
+    """
+    if not video_ids:
+        raise RuntimeError("an empty batch holds no clip")
+
+    runs = []
+    length = 1
+    for previous, current in zip(video_ids, video_ids[1:], strict=False):
+        if current == previous:
+            length += 1
+        else:
+            runs.append(length)
+            length = 1
+    runs.append(length)
+
+    if len(set(runs)) != 1:
+        raise RuntimeError(
+            f"batch holds runs of {sorted(set(runs))} frames per video, so it is "
+            "not whole clips of one length"
+        )
+    return runs[0]
+
+
+def clip_batches(
+    manifest: pd.DataFrame,
+    segments: int,
+    frames_per_batch: int,
+) -> list[list[int]]:
+    """Cut every frame a manifest lists into clips, reordering nothing.
+
+    The batches evaluation serves have to stay in the manifest's order, because
+    the probability table is matched back to it positionally and refuses to be
+    built from scores that arrived in another order. So this groups rather than
+    draws: a video's frames are already consecutive and already in frame order,
+    and all this does is decide where the batch boundaries fall so that no clip
+    straddles one.
+
+    Every frame is served, including the ones in a final short batch. Nothing is
+    dropped the way training drops its remainder, because a split has to be
+    scored whole.
+
+    Args:
+        manifest: The rows to serve, in the order they will be scored.
+        segments: Frames per clip.
+        frames_per_batch: Frames in a full batch. Rounded down to a whole number
+            of clips.
+
+    Returns:
+        Positions into the manifest, one list per batch.
+
+    Raises:
+        RuntimeError: If a video's frames do not divide into whole clips, or if
+            a batch cannot hold even one.
+    """
+    clips_per_batch = frames_per_batch // segments
+    if not clips_per_batch:
+        raise RuntimeError(
+            f"a batch of {frames_per_batch} frames holds no clip of {segments}"
+        )
+
+    rows = manifest.reset_index(drop=True)
+    clips: list[list[int]] = []
+    for positions in rows.groupby("video_id", sort=False).indices.values():
+        if len(positions) % segments:
+            raise RuntimeError(
+                f"a video holds {len(positions)} frames, which do not divide "
+                f"into clips of {segments}"
+            )
+        clips.extend(
+            positions[start : start + segments].tolist()
+            for start in range(0, len(positions), segments)
+        )
+
+    return [
+        [
+            position
+            for clip in clips[start : start + clips_per_batch]
+            for position in clip
+        ]
+        for start in range(0, len(clips), clips_per_batch)
+    ]
+
+
+class ClipSampler(Sampler[list[int]]):
+    """Draw whole clips, and keep a batch to one kind of them.
+
+    Training the shift needs the frames of a video to arrive together and in
+    order, which is the one thing ``SegmentSampler`` deliberately destroys: it
+    shuffles its draw so that a batch holds many gestures rather than one. The
+    draw itself is already right, because cutting a video into blocks and taking
+    one frame from each is how a clip is built. So this keeps the draw and moves
+    the shuffling up a level, to the order the batches come in.
+
+    Batches hold one kind of row because the two kinds hold different numbers of
+    frames per clip. That is also why this is a batch sampler rather than a
+    sampler: where the boundaries fall is the whole point, and a sampler that
+    only yields positions leaves that to the loader.
+
+    How many clips of a kind an epoch uses is given rather than derived from the
+    number of videos, and the reason is the eighth class. A video stores four
+    idle frames, so a clip of them uses all four, where the configuration this
+    is compared against drew one frame per video per epoch. Serving a clip from
+    every video would quadruple how much of the epoch is bodies at rest and move
+    the prediction prior along with it. Taking a quarter of the videos instead
+    keeps the frame count, and therefore the class balance, at what every
+    measured cell saw. Which quarter rotates: a queue is drained before it is
+    refilled, so a video waits its turn instead of being drawn afresh and
+    possibly skipped for several epochs.
+    """
+
+    def __init__(
+        self,
+        parts: list[tuple[SegmentSampler, int]],
+        frames_per_batch: int,
+        seed: int = SAMPLER_SEED,
+    ):
+        """Hold the draws an epoch is built from.
+
+        Args:
+            parts: One pair per kind of row: the sampler that draws its clips,
+                and how many of those clips an epoch uses.
+            frames_per_batch: Frames in a batch. Rounded down to a whole number
+                of clips, separately for each kind, so a batch of eight-frame
+                clips and a batch of four-frame clips both fill it.
+            seed: Shuffles the order the batches arrive in. Its own generator,
+                kept apart from the ones the parts draw with, so that changing
+                how the epoch is ordered does not change which frames it holds.
+
+        Raises:
+            ValueError: If a part is asked for more clips than it has videos,
+                for a batch that cannot hold one of its clips, or for fewer
+                clips than fill a single batch. The last one is the dangerous
+                case: dropping the remainder is intended, but a kind whose
+                every clip is remainder would vanish from the epoch without
+                anything saying so, and the run would quietly train on seven
+                classes while reporting eight.
+        """
+        self.parts = list(parts)
+        self.frames_per_batch = frames_per_batch
+        self.rng = np.random.default_rng(seed)
+        self.queues: list[list[int]] = [[] for _ in self.parts]
+
+        for sampler, per_epoch in self.parts:
+            if per_epoch > len(sampler.blocks):
+                # One clip per video per epoch is the ceiling here: a draw hands
+                # back one clip for each video it covers, and the rotation takes
+                # each video at most once. Asking for more is the shape of one
+                # request in particular — a clip shorter than the epoch's frame
+                # budget per video, which would need the same video twice to
+                # keep the budget. Serving that is a change to the draw, not a
+                # number to raise, so it is refused with the arithmetic shown
+                # rather than silently rounded down to a smaller epoch.
+                raise ValueError(
+                    f"asked for {per_epoch} clips of {sampler.frames_per_video} "
+                    f"frames from {len(sampler.blocks)} videos, which needs a "
+                    "video more than once per epoch; either serve one clip per "
+                    "video and accept the smaller epoch, or teach the draw to "
+                    "hand back several clips from one video"
+                )
+            clips_per_batch = frames_per_batch // sampler.frames_per_video
+            if clips_per_batch < 1:
+                raise ValueError(
+                    f"a batch of {frames_per_batch} frames holds no clip of "
+                    f"{sampler.frames_per_video}"
+                )
+            if per_epoch < clips_per_batch:
+                raise ValueError(
+                    f"{per_epoch} clips of {sampler.frames_per_video} frames do "
+                    f"not fill a batch of {clips_per_batch}, so none would be served"
+                )
+
+    def __len__(self) -> int:
+        """Count the batches an epoch yields, which is the length the loader reports."""
+        return sum(
+            per_epoch // (self.frames_per_batch // sampler.frames_per_video)
+            for sampler, per_epoch in self.parts
+        )
+
+    def state_dict(self) -> dict:
+        """Where every draw has got to: this one's shuffle, the queues, and each part's.
+
+        The queues travel because they are the rotation. A resumed run that
+        refilled them from scratch would start the turn order again and show
+        some videos twice before others once.
+        """
+        return {
+            "shuffle": self.rng.bit_generator.state,
+            "queues": [list(queue) for queue in self.queues],
+            "parts": [sampler.state_dict() for sampler, _ in self.parts],
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Put every draw back where it was.
+
+        Args:
+            state: What ``state_dict`` returned.
+        """
+        self.rng.bit_generator.state = state["shuffle"]
+        self.queues = [list(queue) for queue in state["queues"]]
+        for (sampler, _), part in zip(self.parts, state["parts"], strict=True):
+            sampler.load_state_dict(part)
+
+    def _take(self, part: int, videos: int, wanted: int) -> list[int]:
+        """Take the next videos in the turn order, refilling when the queue runs short.
+
+        Args:
+            part: Which part is being served.
+            videos: How many videos it draws from.
+            wanted: How many of them this epoch uses.
+
+        Returns:
+            The positions of the videos whose clips this epoch serves.
+        """
+        taken: list[int] = []
+        while len(taken) < wanted:
+            if not self.queues[part]:
+                order = np.arange(videos)
+                self.rng.shuffle(order)
+                self.queues[part] = order.tolist()
+            room = wanted - len(taken)
+            taken.extend(self.queues[part][:room])
+            del self.queues[part][:room]
+        return taken
+
+    def __iter__(self):
+        """Build one epoch of batches and hand them back in shuffled order.
+
+        The clips are drawn per kind and batched per kind, and only the order
+        the finished batches arrive in is shuffled. A batch left partly filled
+        at the end of a kind is dropped, which is what the frame-wise loader
+        does with its remainder and for the same reason: batch normalisation on
+        a batch of one fails.
+        """
+        batches: list[list[int]] = []
+        for part, (sampler, per_epoch) in enumerate(self.parts):
+            drawn = sampler.clips()
+            chosen = self._take(part, len(drawn), per_epoch)
+            clips_per_batch = self.frames_per_batch // sampler.frames_per_video
+            for start in range(0, len(chosen) - clips_per_batch + 1, clips_per_batch):
+                batches.append(
+                    [
+                        int(position)
+                        for index in chosen[start : start + clips_per_batch]
+                        for position in drawn[index]
+                    ]
+                )
+
+        order = np.arange(len(batches))
+        self.rng.shuffle(order)
+        return iter([batches[index] for index in order])
+
+
+def drawing_sampler(loader) -> Sampler:
+    """The sampler of a loader whose draw has to survive a restart.
+
+    A loader built with a batch sampler keeps it under a different attribute and
+    puts a plain sequential sampler under the usual one, so a caller that always
+    reached for ``loader.sampler`` would save the state of the wrong object —
+    and of one that has no state to save.
+
+    Args:
+        loader: The training loader.
+
+    Returns:
+        Whichever of its samplers carries a draw.
+
+    Raises:
+        RuntimeError: If neither does, which would mean a resumed run silently
+            repeating its first epoch.
+    """
+    for candidate in (loader.batch_sampler, loader.sampler):
+        if hasattr(candidate, "state_dict"):
+            return candidate
+    raise RuntimeError("the loader has no sampler carrying a draw to save")
