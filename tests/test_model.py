@@ -10,12 +10,20 @@ from model import (
     FROZEN_STAGES,
     HEAD_PATHS,
     NORMALISATION_LAYERS,
+    SEGMENTS_KEY,
+    SHUFFLE_KEY,
     TORCHVISION_BACKBONES,
+    TemporalShift,
     adapt_batchnorm,
     backbone_of,
     build_model,
     freeze,
     head_width,
+    insert_temporal_shift,
+    reset_shuffle,
+    set_segments,
+    shift_segments,
+    shift_shuffled,
     stem_width,
     strip_head,
 )
@@ -392,3 +400,183 @@ def test_how_many_channels_a_checkpoint_expects_is_read_off_the_file():
 
     assert stem_width(widened.state_dict()) == 6
     assert stem_width(build_model(8, "resnet18").state_dict()) == 3
+
+
+def shifted_resnet(**options):
+    """A ResNet18 carrying a shift, with weights that are irrelevant here."""
+    network = resnet18(weights=None)
+    insert_temporal_shift(network, "resnet18", **options)
+
+    return network
+
+
+def indexed_clip(frames: int, channels: int) -> torch.Tensor:
+    """A clip where every value is the index of the frame it belongs to.
+
+    A value therefore says which frame it travelled from, which is what makes
+    the movement checkable rather than merely non-crashing.
+    """
+    return (
+        torch.arange(frames, dtype=torch.float32)
+        .view(frames, 1, 1, 1)
+        .expand(frames, channels, 1, 1)
+        .contiguous()
+    )
+
+
+def test_the_shift_takes_a_fold_from_each_neighbour_and_leaves_the_rest():
+    shift = TemporalShift(fold_divisor=4)
+    shift.segments = 4
+
+    (moved,) = shift(nn.Identity(), (indexed_clip(4, 8),))
+
+    values = moved[:, :, 0, 0]
+    assert values[:, 0].tolist() == [1.0, 2.0, 3.0, 0.0]
+    assert values[:, 2].tolist() == [0.0, 0.0, 1.0, 2.0]
+    assert values[:, 4].tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_the_ends_of_a_clip_receive_zero_rather_than_the_other_end():
+    """Wrapping would hand the first frame the last one as its past."""
+    shift = TemporalShift(fold_divisor=4)
+    shift.segments = 4
+
+    (moved,) = shift(nn.Identity(), (indexed_clip(4, 8),))
+
+    assert moved[3, 0, 0, 0] == 0.0
+    assert moved[0, 2, 0, 0] == 0.0
+
+
+def test_a_permuted_clip_comes_back_in_the_order_it_arrived():
+    """The rows are matched to a manifest positionally, so they cannot move."""
+    shift = TemporalShift(fold_divisor=4)
+    shift.segments = 4
+    shift.order = torch.tensor([1, 0, 3, 2])
+
+    (moved,) = shift(nn.Identity(), (indexed_clip(4, 8),))
+
+    # Whatever the permutation did, a row still carries its own frame in the
+    # channels the shift does not touch.
+    assert moved[:, 4, 0, 0].tolist() == [0.0, 1.0, 2.0, 3.0]
+    # And the neighbours it received are the ones the permuted sequence puts
+    # beside it, not the ones in filmed order.
+    assert moved[:, 0, 0, 0].tolist() == [3.0, 0.0, 0.0, 2.0]
+
+
+def test_the_shift_costs_no_parameter_and_renames_no_weight():
+    """The published claim, and the reason a hook was used instead of a wrapper."""
+    plain = resnet18(weights=None)
+    shifted = shifted_resnet(segments=8)
+
+    assert sum(p.numel() for p in plain.parameters()) == sum(
+        p.numel() for p in shifted.parameters()
+    )
+    assert set(shifted.state_dict()) - set(plain.state_dict()) == {
+        SEGMENTS_KEY,
+        SHUFFLE_KEY,
+    }
+    assert not set(plain.state_dict()) - set(shifted.state_dict())
+
+
+def test_a_checkpoint_says_how_it_was_shifted():
+    """Scoring reads it off the file, so the flag cannot be forgotten."""
+    ordered = shifted_resnet(segments=8).state_dict()
+    control = shifted_resnet(segments=4, shuffle=True).state_dict()
+
+    assert shift_segments(ordered) == 8
+    assert shift_shuffled(ordered) is False
+    assert shift_segments(control) == 4
+    assert shift_shuffled(control) is True
+
+
+def test_a_checkpoint_written_before_the_shift_says_so_rather_than_failing():
+    plain = resnet18(weights=None).state_dict()
+
+    assert shift_segments(plain) is None
+    assert shift_shuffled(plain) is False
+
+
+def test_every_depth_shares_one_permutation():
+    """A permutation per depth is noise at each layer, not a destroyed sequence."""
+    control = shifted_resnet(segments=8, shuffle=True)
+
+    set_segments(control, 8)
+
+    orders = {tuple(shift.order.tolist()) for shift in control.temporal_shifts}
+    assert len(control.temporal_shifts) == 8
+    assert len(orders) == 1
+
+
+def test_the_ordered_arm_draws_no_permutation():
+    shifted = shifted_resnet(segments=8)
+
+    set_segments(shifted, 8)
+
+    assert all(shift.order is None for shift in shifted.temporal_shifts)
+    assert all(shift.segments == 8 for shift in shifted.temporal_shifts)
+
+
+def test_setting_the_clip_length_on_a_network_without_a_shift_does_nothing():
+    """Both loops call it unconditionally, so a run without the shift is unchanged."""
+    plain = resnet18(weights=None)
+
+    set_segments(plain, 8)
+    reset_shuffle(plain)
+
+
+def test_a_reset_scoring_pass_repeats_itself():
+    """Successive epochs have to be measured against the same thing."""
+    control = shifted_resnet(segments=4, shuffle=True).eval()
+    clip = torch.randn(4, 3, 64, 64)
+
+    with torch.no_grad():
+        reset_shuffle(control)
+        set_segments(control, 4)
+        first = control(clip)
+        reset_shuffle(control)
+        set_segments(control, 4)
+        again = control(clip)
+
+    assert torch.allclose(first, again)
+
+
+def test_the_shift_makes_a_frame_depend_on_the_frames_beside_it():
+    """The line the order-blind baseline cannot cross, by construction."""
+    shifted = shifted_resnet(segments=4).eval()
+    clip = torch.randn(4, 3, 64, 64)
+
+    with torch.no_grad():
+        set_segments(shifted, 4)
+        scored = shifted(clip)
+        reordered = shifted(clip[torch.tensor([2, 1, 3, 0])])
+
+    assert not torch.allclose(scored[2], reordered[0], atol=1e-5)
+
+
+def test_a_batch_that_is_not_whole_clips_is_refused():
+    shifted = shifted_resnet(segments=8).eval()
+
+    set_segments(shifted, 8)
+    with pytest.raises(RuntimeError, match="do not divide into clips"):
+        shifted(torch.randn(12, 3, 64, 64))
+
+
+def test_a_shift_with_no_clip_length_refuses_rather_than_guesses():
+    with pytest.raises(RuntimeError, match="no clip length set"):
+        TemporalShift()(nn.Identity(), (torch.randn(8, 64, 4, 4),))
+
+
+def test_a_fold_that_rounds_down_to_nothing_is_refused():
+    """A divisor wider than the layer would shift nothing and report success."""
+    shift = TemporalShift(fold_divisor=64)
+    shift.segments = 2
+
+    with pytest.raises(RuntimeError, match="leaves nothing to shift"):
+        shift(nn.Identity(), (torch.randn(2, 8, 4, 4),))
+
+
+@pytest.mark.parametrize("backbone", ["mobilenet_v3_small", "efficientnet_b0"])
+def test_a_backbone_with_no_residual_branch_is_refused(backbone):
+    """The shift has to leave the identity path carrying the frame's own features."""
+    with pytest.raises(ValueError, match="cannot shift inside"):
+        insert_temporal_shift(resnet18(weights=None), backbone, segments=8)

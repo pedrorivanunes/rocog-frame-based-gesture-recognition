@@ -474,11 +474,30 @@ def test_parse_args_takes_groups_to_exclude_entirely():
 
 def test_the_standard_run_serves_frames_rather_than_clips():
     """Every result on record was drawn frame-wise, so that stays the default."""
-    assert parse_args([]).clips is None
+    args = parse_args([])
+
+    assert args.clips is None
+    assert args.tsm is False
+    assert args.tsm_shuffle is False
 
 
-def test_parse_args_takes_a_clip_length():
-    assert parse_args(["--clips", "8"]).clips == 8
+def test_parse_args_takes_a_clip_length_and_a_shift():
+    args = parse_args(["--clips", "8", "--tsm"])
+
+    assert args.clips == 8
+    assert args.tsm is True
+    assert args.tsm_fold_divisor == 8
+
+
+def test_a_shift_without_clips_is_refused():
+    """The frames of a clip have to arrive together for anything to shift along."""
+    with pytest.raises(SystemExit):
+        parse_args(["--tsm"])
+
+
+def test_the_control_without_the_treatment_is_refused():
+    with pytest.raises(SystemExit):
+        parse_args(["--tsm-shuffle"])
 
 
 def test_a_clip_of_no_frames_is_refused():

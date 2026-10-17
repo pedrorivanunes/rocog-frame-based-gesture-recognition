@@ -343,6 +343,275 @@ def backbone_of(weights: Mapping[str, object]) -> str:
     )
 
 
+# Where a shift can be inserted, and the omission is part of the claim. The
+# shift has to sit inside a residual branch so that the identity path still
+# carries the frame's own activations forward: moving channels on the trunk
+# takes them away from the current frame, and the published ablation measures
+# that as worse at every proportion. Only the two ResNets expose a branch a
+# wrapper can reach without rewriting the block, so only they are listed.
+SHIFT_BACKBONES = ("resnet18", "resnet18_ibn_a")
+SHIFT_STAGES = ("layer1", "layer2", "layer3", "layer4")
+
+# The first convolution of a block's residual branch. Shifting its input is what
+# "inside the residual branch" means in practice: everything the branch computes
+# afterwards reads the moved channels, and the skip connection does not.
+SHIFT_BRANCH = "conv1"
+
+# One eighth of the channels travel in each direction, a quarter in total, which
+# is where the published ablation puts the peak. The divisor rather than a
+# fraction because the fold has to be a whole number of channels, and a float
+# would round differently at each width.
+FOLD_DIVISOR = 8
+
+# Where a checkpoint records how a shift was configured while it trained. They
+# exist so that scoring reads the arrangement off the file instead of being told
+# it: a model whose features were learned with neighbours visible produces
+# different predictions without them, and a flag that has to be remembered
+# eventually is not. Same reasoning as the head width and the backbone name.
+SEGMENTS_KEY = "shift_segments"
+SHUFFLE_KEY = "shift_shuffled"
+
+# Draws the control's permutations. Fixed rather than tied to the run's seed,
+# and reset before every scoring pass, because successive epochs have to be
+# measured against the same thing: a permutation that moved between epochs would
+# put the validation curve's noise inside the measurement.
+SHUFFLE_SEED = 31
+
+
+class TemporalShift:
+    """Move a fraction of the channels one frame forward and one frame back.
+
+    The classifier this project reports is blind to order by construction: a
+    frame is scored on its own and the decision averages those scores, so no
+    permutation of the frames changes the answer. This is the cheapest way to
+    cross that line without changing what the network costs. A slice of the
+    channels of frame t is replaced by the same slice from frame t+1, another
+    slice by the one from t-1, and the rest is left alone. No multiply happens
+    and no weight is added; the arithmetic of the forward pass is untouched and
+    only the contents of a tensor move.
+
+    The frames at the ends of a clip have no neighbour on one side, and what
+    arrives there is zero rather than a wrap-around. Wrapping would hand the
+    first frame the last one as its past, which is a sequence the data never
+    contains.
+
+    It is a hook rather than a module on purpose. Wrapping a convolution would
+    rename every weight below it, and the checkpoints this project already has
+    would stop loading into a network that carries the shift. As a hook the
+    parameter names are the ones every other run wrote, and what marks a
+    checkpoint as having trained with a shift is a recorded number instead of a
+    renamed tree.
+
+    How many frames a clip holds is set per batch rather than fixed at
+    construction, because a run trains on gesture clips and clips of the
+    material before the gesture in the same epoch, and fewer of the latter are
+    stored.
+
+    The control arm permutes the clip before shifting and puts the order back
+    afterwards. That is what makes it a control rather than a different
+    experiment: each frame still receives a slice of some other frame of the
+    same clip, so the capacity, the parameter count and the arithmetic are
+    identical, and the only thing destroyed is which frames are adjacent.
+    Restoring the order matters as much as the permutation, because the rows
+    have to come back in the order the manifest lists them or every probability
+    is attached to the wrong frame.
+    """
+
+    def __init__(self, fold_divisor: int = FOLD_DIVISOR):
+        """Hold the proportion to move, with no clip length yet.
+
+        Args:
+            fold_divisor: One over the share of channels travelling in each
+                direction. Eight moves a quarter of them in total.
+        """
+        self.fold_divisor = fold_divisor
+        self.segments: int | None = None
+        self.order: torch.Tensor | None = None
+
+    def __call__(self, module: nn.Module, inputs: tuple) -> tuple:
+        """Shift the tensor about to enter a residual branch.
+
+        Args:
+            module: The convolution being fed. Unused, and present because a
+                forward pre-hook is called with it.
+            inputs: What the convolution was going to read, as a one-tuple.
+
+        Returns:
+            The same tuple with the channels moved along the clip.
+
+        Raises:
+            RuntimeError: If no clip length has been set, if the batch does not
+                divide into clips of that length, or if the proportion rounds
+                down to no channels at this width. All three would otherwise
+                read as a model that trains and means nothing.
+        """
+        (frames,) = inputs
+
+        if self.segments is None:
+            raise RuntimeError(
+                "no clip length set; call set_segments before the forward pass"
+            )
+        if frames.shape[0] % self.segments:
+            raise RuntimeError(
+                f"{frames.shape[0]} frames do not divide into clips of "
+                f"{self.segments}; the batch is not clip-aligned"
+            )
+
+        channels = frames.shape[1]
+        fold = channels // self.fold_divisor
+        if not fold:
+            raise RuntimeError(
+                f"{channels} channels over a divisor of {self.fold_divisor} "
+                "leaves nothing to shift"
+            )
+
+        clips = frames.shape[0] // self.segments
+        ordered = frames.view(clips, self.segments, *frames.shape[1:])
+        if self.order is not None:
+            ordered = ordered[:, self.order.to(frames.device)]
+
+        shifted = torch.zeros_like(ordered)
+        # The first fold reads the next frame, the second the previous one, and
+        # the remainder stays where it is. Assigning into zeros is what leaves
+        # the ends without a neighbour at zero.
+        shifted[:, :-1, :fold] = ordered[:, 1:, :fold]
+        shifted[:, 1:, fold : 2 * fold] = ordered[:, :-1, fold : 2 * fold]
+        shifted[:, :, 2 * fold :] = ordered[:, :, 2 * fold :]
+
+        if self.order is not None:
+            shifted = shifted[:, self.order.argsort().to(frames.device)]
+
+        return (shifted.reshape(frames.shape),)
+
+
+def insert_temporal_shift(
+    model: nn.Module,
+    backbone: str = DEFAULT_BACKBONE,
+    segments: int = 8,
+    fold_divisor: int = FOLD_DIVISOR,
+    shuffle: bool = False,
+) -> list[TemporalShift]:
+    """Give every residual branch a shift, and record the arrangement on the model.
+
+    The shifts are returned and also kept on the model, because two callers need
+    them for different reasons: a test wants to inspect them, and the training
+    loop has to tell them how long the batch's clips are before each forward.
+
+    What was recorded travels in the checkpoint, as buffers rather than
+    attributes. That is what lets scoring rebuild the same network from the file
+    alone, including whether this was the ordered arm or the control.
+
+    Args:
+        model: The network to modify, already carrying its final head.
+        backbone: Which architecture it is. Read rather than guessed, for the
+            same reason every other edit here takes it.
+        segments: Frames per clip the run trains on. Recorded, not enforced:
+            the shift reads the length of the batch in front of it.
+        fold_divisor: Passed to each shift.
+        shuffle: Destroys which frames are adjacent, leaving everything else
+            in place. This is the control that isolates order.
+
+    Returns:
+        The shifts, one per residual branch, in the order they were inserted.
+
+    Raises:
+        ValueError: If the backbone has no residual branch to shift inside.
+    """
+    if backbone not in SHIFT_BACKBONES:
+        raise ValueError(
+            f"cannot shift inside {backbone!r}; expected one of {SHIFT_BACKBONES}"
+        )
+
+    shifts = []
+    for stage in SHIFT_STAGES:
+        for block in _module_at(model, stage):
+            shift = TemporalShift(fold_divisor)
+            _module_at(block, SHIFT_BRANCH).register_forward_pre_hook(shift)
+            shifts.append(shift)
+
+    model.register_buffer(SEGMENTS_KEY, torch.tensor(segments))
+    model.register_buffer(SHUFFLE_KEY, torch.tensor(shuffle))
+    model.temporal_shifts = shifts
+    model.shift_generator = torch.Generator().manual_seed(SHUFFLE_SEED)
+    return shifts
+
+
+def set_segments(model: nn.Module, segments: int) -> None:
+    """Tell every shift how many frames the next batch's clips hold.
+
+    The control's permutation is drawn here, once, and handed to every shift.
+    One draw rather than one per shift is the point: a permutation that differed
+    by depth would leave each layer reading a different sequence, which is noise
+    injected eight times over rather than a clip whose order has been destroyed.
+
+    A no-op on a network without shifts, so that the training and scoring loops
+    can call it unconditionally and a run without the treatment behaves exactly
+    as the runs recorded before it.
+
+    Args:
+        model: The network about to run.
+        segments: Frames per clip in the batch it is about to read.
+    """
+    shifts = getattr(model, "temporal_shifts", ())
+    if not shifts:
+        return
+
+    order = None
+    if bool(model.get_buffer(SHUFFLE_KEY)):
+        order = torch.randperm(segments, generator=model.shift_generator)
+
+    for shift in shifts:
+        shift.segments = segments
+        shift.order = order
+
+
+def reset_shuffle(model: nn.Module, seed: int = SHUFFLE_SEED) -> None:
+    """Put the control's permutations back to the start of their sequence.
+
+    Called before a scoring pass so that successive passes over the same frames
+    return the same numbers. Without it the permutations a validation pass draws
+    would depend on how many batches training happened to consume beforehand,
+    and the epoch-to-epoch curve would carry that as noise.
+
+    A no-op on a network without shifts, and on the ordered arm it changes
+    nothing that is read.
+
+    Args:
+        model: The network about to be scored.
+        seed: Where the sequence restarts.
+    """
+    if hasattr(model, "shift_generator"):
+        model.shift_generator.manual_seed(seed)
+
+
+def shift_segments(weights: Mapping[str, object]) -> int | None:
+    """How many frames per clip a checkpoint trained with, or None if it had no shift.
+
+    Args:
+        weights: A state dictionary, as ``torch.load`` returns it.
+
+    Returns:
+        The clip length the run recorded, or ``None`` for every checkpoint
+        written before the shift existed and every run without it.
+    """
+    recorded = weights.get(SEGMENTS_KEY)
+    return None if recorded is None else int(recorded)
+
+
+def shift_shuffled(weights: Mapping[str, object]) -> bool:
+    """Whether a checkpoint is the control arm rather than the ordered one.
+
+    Args:
+        weights: A state dictionary, as ``torch.load`` returns it.
+
+    Returns:
+        True if the run that wrote it destroyed the order of each clip. False
+        for the ordered arm and for every checkpoint written without a shift.
+    """
+    recorded = weights.get(SHUFFLE_KEY)
+    return False if recorded is None else bool(recorded)
+
+
 # How far into the network a run holds the pretrained weights. Named in stages
 # rather than in a layer count because that is the unit torchvision exposes, and
 # because the boundary that matters is one of them: "backbone" is every stage

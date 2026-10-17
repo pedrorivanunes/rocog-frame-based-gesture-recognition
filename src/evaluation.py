@@ -17,9 +17,12 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-# The one runtime import not left to the main block below, because parse_args
-# has to name its default and parse_args is read at import time.
+# The two runtime imports not left to the main block below. CROP_SIZE because
+# parse_args has to name its default and parse_args is read at import time; the
+# shift helpers because ``predict`` itself calls them, and training imports
+# ``predict`` to score its validation split every epoch.
 from dataset import CROP_SIZE
+from model import reset_shuffle, set_segments
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 BATCH_SIZE = 64
@@ -141,6 +144,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "refused rather than scored",
     )
     parser.add_argument(
+        "--clips",
+        type=int,
+        metavar="FRAMES",
+        help="score a model that carries a shift at this clip length instead of "
+        "the one it trained at, which is what the accuracy-against-K curve "
+        "needs: at K frames aggregated, a decision that read K frames is the "
+        "honest comparison against an order-blind model's K. Omit to use the "
+        "recorded length, which is the default and the right one for a single "
+        "figure. Has no effect on a checkpoint without a shift",
+    )
+    parser.add_argument(
         "--num-workers",
         type=int,
         default=NUM_WORKERS,
@@ -191,6 +205,7 @@ def predict(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
+    clips: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
     """Score every frame a loader serves, without updating the model.
 
@@ -210,12 +225,25 @@ def predict(
         loader: Serves the frames to score. Its order is preserved in the
             result, so the rows can be matched back to a manifest.
         device: Where the forward pass runs.
+        clips: Frames per clip the loader serves, when it serves clips at all.
+            A model carrying a shift needs it: its prediction for a frame
+            depends on which frames arrived beside it, so the number is part of
+            what is being measured rather than a detail of batching. A single
+            value, unlike training, because an evaluation split holds one kind
+            of row.
 
     Returns:
         The ``(frames, classes)`` logits, the matching labels, and the video
         each frame came from, all in the order the loader served them.
     """
     model.eval()
+    # Before the pass, not during it, so that two passes over the same frames
+    # return the same numbers. The control draws a permutation per batch, and
+    # left running it would depend on how many batches training happened to
+    # consume first, putting that in the epoch-to-epoch curve as noise.
+    reset_shuffle(model)
+    if clips:
+        set_segments(model, clips)
 
     logits = []
     labels = []
@@ -322,7 +350,7 @@ def probability_table(
 
 
 if __name__ == "__main__":
-    from dataset import FrameDataset, eval_transform
+    from dataset import FrameDataset, clip_batches, eval_transform
     from device import describe, pick_device
     from manifest import dense_name_for, load_class_names, with_idle_class
     from model import (
@@ -331,6 +359,9 @@ if __name__ == "__main__":
         backbone_of,
         build_model,
         head_width,
+        insert_temporal_shift,
+        shift_segments,
+        shift_shuffled,
         stem_width,
     )
     from splits import (
@@ -411,9 +442,43 @@ if __name__ == "__main__":
             print(f"differencing against the frames {spacings} back")
 
     model = build_model(num_classes, backbone, in_channels).to(device)
+    # Read off the file for the same reason the head's width and the backbone
+    # are: a model whose features were learned with neighbours visible predicts
+    # differently without them, so scoring one as though it had no shift would
+    # report a number for a network that never existed. Nothing here is a flag
+    # a caller could forget.
+    # The override only applies to a checkpoint that has a shift. Without one a
+    # frame's prediction does not depend on what arrived beside it, so clip
+    # length changes no number, and inserting a shift a run never trained with
+    # would score a network that never existed.
+    recorded = shift_segments(weights)
+    segments = None if recorded is None else (args.clips or recorded)
+    if recorded is None and args.clips:
+        print(f"--clips ignored: {args.checkpoint.name} carries no shift")
+    if segments is not None:
+        insert_temporal_shift(
+            model,
+            backbone,
+            segments=segments,
+            shuffle=shift_shuffled(weights),
+        )
     model.load_state_dict(weights)
     if backbone != DEFAULT_BACKBONE:
         print(f"backbone: {backbone}")
+    if segments is not None:
+        arm = "shuffled" if shift_shuffled(weights) else "ordered"
+        print(
+            f"temporal shift: {arm}, clips of {segments}"
+            + (f"  (trained at {recorded})" if recorded != segments else "")
+        )
+        # Only an overridden length goes into the name, and the asymmetry is the
+        # point. The recorded one needs no mark because the weights carry it, so
+        # the default table keeps the name every other cell's does and the
+        # canonical reader finds it. A length the caller chose has nothing in the
+        # file to disambiguate it, and the curve scores one checkpoint at several
+        # of them, so those must not write over each other.
+        if segments != recorded:
+            split_name = f"{split_name}_clips{segments}"
 
     def frame_loader(rows: pd.DataFrame) -> DataLoader:
         """Serve a manifest's frames exactly as scoring will meet them.
@@ -422,13 +487,20 @@ if __name__ == "__main__":
         point: statistics estimated from augmented frames would describe images
         the model never sees at evaluation.
         """
+        dataset = FrameDataset(
+            rows,
+            PROJECT_ROOT,
+            eval_transform(args.crop_size),
+            difference_gain=args.difference_gain,
+        )
+        if segments is not None:
+            return DataLoader(
+                dataset,
+                batch_sampler=clip_batches(rows, segments, BATCH_SIZE),
+                num_workers=args.num_workers,
+            )
         return DataLoader(
-            FrameDataset(
-                rows,
-                PROJECT_ROOT,
-                eval_transform(args.crop_size),
-                difference_gain=args.difference_gain,
-            ),
+            dataset,
             batch_size=BATCH_SIZE,
             shuffle=False,
             num_workers=args.num_workers,
@@ -447,7 +519,9 @@ if __name__ == "__main__":
         from model import strip_head
 
         width = strip_head(model, backbone)
-        features, _, video_ids = predict(model, frame_loader(manifest), device)
+        features, _, video_ids = predict(
+            model, frame_loader(manifest), device, segments
+        )
         cube, video_labels, ids = feature_cube(features, manifest, video_ids)
 
         features_dir = PROJECT_ROOT / "data" / "features"
@@ -463,7 +537,7 @@ if __name__ == "__main__":
         print(f"written to {output.relative_to(PROJECT_ROOT)}")
         raise SystemExit(0)
 
-    logits, labels, video_ids = predict(model, frame_loader(manifest), device)
+    logits, labels, video_ids = predict(model, frame_loader(manifest), device, segments)
     loss, accuracy = frame_metrics(logits, labels, nn.CrossEntropyLoss())
     table = probability_table(logits, video_ids, manifest, class_names)
 

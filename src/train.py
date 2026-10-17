@@ -27,6 +27,7 @@ from dataset import (
     SegmentSampler,
     TextureRandomiser,
     clip_batches,
+    clip_length,
     drawing_sampler,
     eval_transform,
     train_transform,
@@ -37,12 +38,15 @@ from manifest import IDLE_LABEL, dense_name_for
 from model import (
     BACKBONES,
     DEFAULT_BACKBONE,
+    FOLD_DIVISOR,
     FROZEN_STAGES,
     NUM_CLASSES,
     backbone_of,
     build_model,
     freeze,
     head_width,
+    insert_temporal_shift,
+    set_segments,
 )
 from splits import (
     WINDOWS,
@@ -413,10 +417,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "its own it changes only how batches are composed, which is the "
         "control the shift is measured against; --tsm needs it",
     )
+    parser.add_argument(
+        "--tsm",
+        action="store_true",
+        help="let neighbouring frames exchange a quarter of their channels "
+        "inside the network, at no cost in parameters or arithmetic. Needs "
+        "--clips, because the frames of a clip have to arrive together",
+    )
+    parser.add_argument(
+        "--tsm-shuffle",
+        action="store_true",
+        help="the control for --tsm: each frame still receives channels from "
+        "another frame of its own clip, drawn at random rather than from its "
+        "neighbour. Same architecture, same capacity, same frames, with only "
+        "which frames are adjacent destroyed",
+    )
+    parser.add_argument(
+        "--tsm-fold-divisor",
+        type=int,
+        default=FOLD_DIVISOR,
+        metavar="N",
+        help="one over the share of channels travelling in each direction; "
+        "the default moves a quarter of them in total, where the published "
+        "ablation puts the peak",
+    )
     arguments = parser.parse_args(argv)
 
     # Refused here rather than left to fail somewhere inside the first forward
     # pass, which is minutes of loading later and reads as a shape error.
+    if arguments.tsm and not arguments.clips:
+        parser.error("--tsm needs --clips: the frames of a clip must arrive together")
+    if arguments.tsm_shuffle and not arguments.tsm:
+        parser.error("--tsm-shuffle is the control for --tsm and needs it")
     if arguments.clips is not None and arguments.clips < 1:
         parser.error("--clips needs at least one frame")
 
@@ -838,7 +870,9 @@ def build_criteria(label_smoothing: float) -> tuple[nn.Module, nn.Module]:
     return nn.CrossEntropyLoss(label_smoothing=label_smoothing), nn.CrossEntropyLoss()
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, frozen=()) -> float:
+def train_one_epoch(
+    model, loader, criterion, optimizer, device, frozen=(), clips=None
+) -> float:
     """Run one pass over the training data and return the mean loss.
 
     Measured against ln(7) ≈ 1.95, the loss of a model guessing uniformly across
@@ -858,6 +892,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device, frozen=()) -> f
         optimizer: Applies the gradients. Sees only trainable parameters.
         device: Where the pass runs.
         frozen: Stages held at their pretrained values, from ``model.freeze``.
+        clips: Whether the batches are clips at all. The length itself is
+            counted from each batch rather than taken from here, because the
+            eighth class is served at its own shorter one; this only says
+            whether there is a shift waiting to be told.
 
     Returns:
         Mean loss across the epoch's batches.
@@ -867,7 +905,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device, frozen=()) -> f
         stage.eval()
 
     running_loss = 0.0
-    for frames, labels, _ in loader:
+    for frames, labels, video_ids in loader:
+        if clips:
+            set_segments(model, clip_length(video_ids))
         frames = frames.to(device)
         labels = labels.to(device)
 
@@ -1059,6 +1099,23 @@ if __name__ == "__main__":
         print(
             f"starting from {args.initial_weights}  ({backbone}, {num_classes} outputs)"
         )
+    # After the weights are in, because inserting the shift registers a buffer
+    # the saved state does not carry, and a strict load would refuse a
+    # checkpoint written before this run existed. Nothing it adds is learned, so
+    # there is nothing in it for a checkpoint to have supplied.
+    if args.tsm:
+        insert_temporal_shift(
+            model,
+            backbone,
+            segments=args.clips,
+            fold_divisor=args.tsm_fold_divisor,
+            shuffle=args.tsm_shuffle,
+        )
+        arm = "shuffled, the control" if args.tsm_shuffle else "ordered"
+        print(
+            f"temporal shift: {arm}, clips of {args.clips}, "
+            f"1/{args.tsm_fold_divisor} of the channels each way"
+        )
     frozen = freeze(model, args.freeze)
     criterion, validation_criterion = build_criteria(args.label_smoothing)
     # Only the parameters that still train. Adam would skip a frozen one anyway,
@@ -1091,10 +1148,10 @@ if __name__ == "__main__":
 
     for epoch in range(epochs_done, args.max_epochs):
         loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, frozen
+            model, train_loader, criterion, optimizer, device, frozen, args.clips
         )
 
-        logits, labels, _ = predict(model, eval_loader, device)
+        logits, labels, _ = predict(model, eval_loader, device, args.clips)
         eval_loss, eval_accuracy = frame_metrics(logits, labels, validation_criterion)
 
         print(
