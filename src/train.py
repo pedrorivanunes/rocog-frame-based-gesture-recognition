@@ -433,6 +433,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "which frames are adjacent destroyed",
     )
     parser.add_argument(
+        "--tsm-causal",
+        action="store_true",
+        help="shift from the past only, so no decision waits on a frame that "
+        "has not arrived. This is the published online variant, and it is what "
+        "keeps the per-frame latency argument intact: reading a slice of the "
+        "next frame means the model cannot answer until that frame exists, "
+        "which is the property this work holds against models that consume a "
+        "clip. --tsm-fold-divisor is the share per direction, so the default "
+        "moves half of what two directions move; a divisor of four instead "
+        "holds the moved share equal and separates losing a direction from "
+        "moving fewer channels",
+    )
+    parser.add_argument(
         "--tsm-fold-divisor",
         type=int,
         default=FOLD_DIVISOR,
@@ -449,6 +462,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--tsm needs --clips: the frames of a clip must arrive together")
     if arguments.tsm_shuffle and not arguments.tsm:
         parser.error("--tsm-shuffle is the control for --tsm and needs it")
+    if arguments.tsm_causal and not arguments.tsm:
+        parser.error("--tsm-causal is a variant of --tsm and needs it")
+    if arguments.tsm_causal and arguments.tsm_shuffle:
+        parser.error(
+            "--tsm-causal and --tsm-shuffle answer different questions and do "
+            "not compose: destroying the order of a one-directional shift "
+            "measures neither direction nor order"
+        )
     if arguments.clips is not None and arguments.clips < 1:
         parser.error("--clips needs at least one frame")
 
@@ -1110,8 +1131,14 @@ if __name__ == "__main__":
             segments=args.clips,
             fold_divisor=args.tsm_fold_divisor,
             shuffle=args.tsm_shuffle,
+            causal=args.tsm_causal,
         )
-        arm = "shuffled, the control" if args.tsm_shuffle else "ordered"
+        if args.tsm_shuffle:
+            arm = "shuffled, the control"
+        elif args.tsm_causal:
+            arm = "causal, from the past only"
+        else:
+            arm = "ordered, both directions"
         print(
             f"temporal shift: {arm}, clips of {args.clips}, "
             f"1/{args.tsm_fold_divisor} of the channels each way"

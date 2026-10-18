@@ -360,6 +360,8 @@ if __name__ == "__main__":
         build_model,
         head_width,
         insert_temporal_shift,
+        load_shifted,
+        shift_causal,
         shift_segments,
         shift_shuffled,
         stem_width,
@@ -461,12 +463,23 @@ if __name__ == "__main__":
             backbone,
             segments=segments,
             shuffle=shift_shuffled(weights),
+            causal=shift_causal(weights),
         )
-    model.load_state_dict(weights)
+        # Tolerant only about the markers, and only because this network was
+        # built from this file: a checkpoint written before a marker existed
+        # would otherwise be refused for lacking it.
+        load_shifted(model, weights)
+    else:
+        model.load_state_dict(weights)
     if backbone != DEFAULT_BACKBONE:
         print(f"backbone: {backbone}")
     if segments is not None:
-        arm = "shuffled" if shift_shuffled(weights) else "ordered"
+        if shift_shuffled(weights):
+            arm = "shuffled"
+        elif shift_causal(weights):
+            arm = "causal"
+        else:
+            arm = "ordered"
         print(
             f"temporal shift: {arm}, clips of {segments}"
             + (f"  (trained at {recorded})" if recorded != segments else "")

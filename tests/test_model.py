@@ -6,6 +6,7 @@ from torchvision.models import mobilenet_v3_small, resnet18
 import model as model_module
 from model import (
     BACKBONES,
+    CAUSAL_KEY,
     DEFAULT_BACKBONE,
     FROZEN_STAGES,
     HEAD_PATHS,
@@ -20,8 +21,10 @@ from model import (
     freeze,
     head_width,
     insert_temporal_shift,
+    load_shifted,
     reset_shuffle,
     set_segments,
+    shift_causal,
     shift_segments,
     shift_shuffled,
     stem_width,
@@ -471,9 +474,13 @@ def test_the_shift_costs_no_parameter_and_renames_no_weight():
     assert sum(p.numel() for p in plain.parameters()) == sum(
         p.numel() for p in shifted.parameters()
     )
+    # The three recorded markers, and nothing else: how long a clip was, whether
+    # the order was destroyed, and whether it read only the past. Each is read
+    # back by scoring, which is why they travel in the file at all.
     assert set(shifted.state_dict()) - set(plain.state_dict()) == {
         SEGMENTS_KEY,
         SHUFFLE_KEY,
+        CAUSAL_KEY,
     }
     assert not set(plain.state_dict()) - set(shifted.state_dict())
 
@@ -580,3 +587,109 @@ def test_a_backbone_with_no_residual_branch_is_refused(backbone):
     """The shift has to leave the identity path carrying the frame's own features."""
     with pytest.raises(ValueError, match="cannot shift inside"):
         insert_temporal_shift(resnet18(weights=None), backbone, segments=8)
+
+
+def test_the_causal_shift_takes_from_the_past_and_nothing_from_ahead():
+    shift = TemporalShift(fold_divisor=4, causal=True)
+    shift.segments = 4
+
+    (moved,) = shift(nn.Identity(), (indexed_clip(4, 8),))
+
+    values = moved[:, :, 0, 0]
+    assert values[:, 0].tolist() == [0.0, 0.0, 1.0, 2.0]
+    # The group that reads ahead in the two-directional arm is left alone here.
+    assert values[:, 2].tolist() == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_one_direction_moves_the_share_of_one_direction():
+    """The divisor is per direction, so causal moves half of what both move."""
+    for divisor, share in ((8, 1 / 8), (4, 1 / 4)):
+        shift = TemporalShift(fold_divisor=divisor, causal=True)
+        shift.segments = 2
+        frames = torch.zeros(2, 64, 1, 1)
+        frames[0] = 1.0
+
+        (moved,) = shift(nn.Identity(), (frames,))
+
+        assert int((moved[1, :, 0, 0] == 1.0).sum()) == int(64 * share)
+
+
+def test_a_causal_frame_does_not_depend_on_any_frame_after_it():
+    """The property the arm exists for: it is what restores the latency claim."""
+    model = shifted_resnet(segments=4, causal=True).eval()
+    clip = torch.randn(4, 3, 64, 64)
+    altered = clip.clone()
+    altered[3] = torch.randn(3, 64, 64)
+
+    with torch.no_grad():
+        set_segments(model, 4)
+        before = model(clip)
+        set_segments(model, 4)
+        after = model(altered)
+
+    for frame in range(3):
+        assert torch.allclose(before[frame], after[frame], atol=1e-6)
+
+
+def test_the_two_directional_shift_reaches_back_through_every_depth():
+    """A late frame reaches an early one, through the depth of the network.
+
+    Eight stacked shifts carry it, so the whole clip has to exist before any of
+    it can be decided. That is the cost the causal arm removes, and it is larger
+    than one frame of lookahead.
+    """
+    model = shifted_resnet(segments=4).eval()
+    clip = torch.randn(4, 3, 64, 64)
+    altered = clip.clone()
+    altered[3] = torch.randn(3, 64, 64)
+
+    with torch.no_grad():
+        set_segments(model, 4)
+        before = model(clip)
+        set_segments(model, 4)
+        after = model(altered)
+
+    assert not torch.allclose(before[0], after[0], atol=1e-6)
+
+
+def test_a_checkpoint_says_whether_it_can_run_online():
+    assert shift_causal(shifted_resnet(segments=8, causal=True).state_dict()) is True
+    assert shift_causal(shifted_resnet(segments=8).state_dict()) is False
+    assert shift_causal(resnet18(weights=None).state_dict()) is False
+    assert CAUSAL_KEY in shifted_resnet(segments=8).state_dict()
+
+
+def test_the_causal_shift_costs_no_parameter_either():
+    plain = resnet18(weights=None)
+    causal = shifted_resnet(segments=8, causal=True)
+
+    assert sum(p.numel() for p in plain.parameters()) == sum(
+        p.numel() for p in causal.parameters()
+    )
+
+
+def test_a_checkpoint_written_before_a_marker_existed_still_loads():
+    """The markers grew over time; a run that predates one is not wrong."""
+    model = shifted_resnet(segments=8)
+    weights = {
+        key: value
+        for key, value in model.state_dict().items()
+        if key != CAUSAL_KEY  # as every checkpoint written before it looked
+    }
+
+    with pytest.raises(RuntimeError, match="Missing key"):
+        model.load_state_dict(weights)
+
+    load_shifted(model, weights)
+    assert shift_causal(model.state_dict()) is False
+
+
+def test_a_real_mismatch_still_fails_loudly():
+    """Filling a marker is not permission to absorb a wrong architecture."""
+    model = shifted_resnet(segments=8)
+    weights = dict(model.state_dict())
+    weights["fc.weight"] = torch.randn(3, 512)
+    weights["fc.bias"] = torch.randn(3)
+
+    with pytest.raises(RuntimeError, match="size mismatch"):
+        load_shifted(model, weights)

@@ -370,6 +370,7 @@ FOLD_DIVISOR = 8
 # eventually is not. Same reasoning as the head width and the backbone name.
 SEGMENTS_KEY = "shift_segments"
 SHUFFLE_KEY = "shift_shuffled"
+CAUSAL_KEY = "shift_causal"
 
 # Draws the control's permutations. Fixed rather than tied to the run's seed,
 # and reset before every scoring pass, because successive epochs have to be
@@ -415,16 +416,38 @@ class TemporalShift:
     Restoring the order matters as much as the permutation, because the rows
     have to come back in the order the manifest lists them or every probability
     is attached to the wrong frame.
+
+    The causal arm takes channels from the past only, and it exists for a reason
+    that is about the argument rather than the accuracy. Reading a slice of the
+    next frame means a decision cannot be made until that frame exists — which
+    is the property this project holds against models that consume a clip, and
+    the shift as published for offline use has it too. One direction removes it:
+    a frame then needs only frames already seen, so the model can answer as each
+    one arrives. The published online variant is exactly this, and verified in
+    the source: *"in the online setting, we cannot access future frames,
+    therefore, we only shift from past frames to future frames in a
+    uni-directional fashion"*, saving an eighth of each block's feature maps to
+    reuse on the next frame.
+
+    ``fold_divisor`` is the share taken from each direction, so the causal arm
+    at the default moves half of what the two-directional one moves. That is
+    the published design and the deployable one; holding the moved share equal
+    instead is the same flag at a divisor of four, and it is the control that
+    separates losing a direction from moving fewer channels.
     """
 
-    def __init__(self, fold_divisor: int = FOLD_DIVISOR):
+    def __init__(self, fold_divisor: int = FOLD_DIVISOR, causal: bool = False):
         """Hold the proportion to move, with no clip length yet.
 
         Args:
             fold_divisor: One over the share of channels travelling in each
-                direction. Eight moves a quarter of them in total.
+                direction. Eight moves a quarter of them in total, or an eighth
+                when only one direction is used.
+            causal: Take channels from the past only, so that a frame needs no
+                frame after it and the model can answer as each one arrives.
         """
         self.fold_divisor = fold_divisor
+        self.causal = causal
         self.segments: int | None = None
         self.order: torch.Tensor | None = None
 
@@ -471,12 +494,18 @@ class TemporalShift:
             ordered = ordered[:, self.order.to(frames.device)]
 
         shifted = torch.zeros_like(ordered)
-        # The first fold reads the next frame, the second the previous one, and
-        # the remainder stays where it is. Assigning into zeros is what leaves
-        # the ends without a neighbour at zero.
-        shifted[:, :-1, :fold] = ordered[:, 1:, :fold]
-        shifted[:, 1:, fold : 2 * fold] = ordered[:, :-1, fold : 2 * fold]
-        shifted[:, :, 2 * fold :] = ordered[:, :, 2 * fold :]
+        if self.causal:
+            # One direction: the fold reads the previous frame and nothing reads
+            # ahead, so a decision never waits on a frame that has not arrived.
+            shifted[:, 1:, :fold] = ordered[:, :-1, :fold]
+            shifted[:, :, fold:] = ordered[:, :, fold:]
+        else:
+            # The first fold reads the next frame, the second the previous one,
+            # and the remainder stays where it is. Assigning into zeros is what
+            # leaves the ends without a neighbour at zero.
+            shifted[:, :-1, :fold] = ordered[:, 1:, :fold]
+            shifted[:, 1:, fold : 2 * fold] = ordered[:, :-1, fold : 2 * fold]
+            shifted[:, :, 2 * fold :] = ordered[:, :, 2 * fold :]
 
         if self.order is not None:
             shifted = shifted[:, self.order.argsort().to(frames.device)]
@@ -490,6 +519,7 @@ def insert_temporal_shift(
     segments: int = 8,
     fold_divisor: int = FOLD_DIVISOR,
     shuffle: bool = False,
+    causal: bool = False,
 ) -> list[TemporalShift]:
     """Give every residual branch a shift, and record the arrangement on the model.
 
@@ -510,6 +540,9 @@ def insert_temporal_shift(
         fold_divisor: Passed to each shift.
         shuffle: Destroys which frames are adjacent, leaving everything else
             in place. This is the control that isolates order.
+        causal: Takes channels from the past only, so that no decision waits on
+            a frame that has not arrived. Recorded like the rest, because a
+            model that learned to read ahead scores differently when it cannot.
 
     Returns:
         The shifts, one per residual branch, in the order they were inserted.
@@ -525,12 +558,13 @@ def insert_temporal_shift(
     shifts = []
     for stage in SHIFT_STAGES:
         for block in _module_at(model, stage):
-            shift = TemporalShift(fold_divisor)
+            shift = TemporalShift(fold_divisor, causal)
             _module_at(block, SHIFT_BRANCH).register_forward_pre_hook(shift)
             shifts.append(shift)
 
     model.register_buffer(SEGMENTS_KEY, torch.tensor(segments))
     model.register_buffer(SHUFFLE_KEY, torch.tensor(shuffle))
+    model.register_buffer(CAUSAL_KEY, torch.tensor(causal))
     model.temporal_shifts = shifts
     model.shift_generator = torch.Generator().manual_seed(SHUFFLE_SEED)
     return shifts
@@ -596,6 +630,54 @@ def shift_segments(weights: Mapping[str, object]) -> int | None:
     """
     recorded = weights.get(SEGMENTS_KEY)
     return None if recorded is None else int(recorded)
+
+
+# The markers, as one list. Named once because two things read it: what gets
+# registered on a model, and what a load is allowed to fill in.
+MARKER_KEYS = (SEGMENTS_KEY, SHUFFLE_KEY, CAUSAL_KEY)
+
+
+def load_shifted(model: nn.Module, weights: Mapping[str, object]) -> None:
+    """Load weights into a shifted network, tolerating a marker it predates.
+
+    The markers are the one part of a shifted network's state that this project
+    adds to over time: the clip length came first, then whether the order was
+    destroyed, then whether only the past was read. A checkpoint written before
+    one of them existed is not wrong — it is a run that did not have the choice
+    — but a strict load refuses it for a missing key, and that refusal arrives
+    after the manifest and the model are already in memory.
+
+    Filling a missing marker from the network's own buffer is correct rather
+    than permissive, because the network was built from this same file: the
+    readers return the default for a marker that is absent, and the default is
+    what the run actually did. Everything that is not a marker stays strict, so
+    a real mismatch — a head of the wrong width, a stem of the wrong depth —
+    still fails as loudly as before.
+
+    Args:
+        model: The network to load into, with its shift already inserted.
+        weights: A state dictionary, as ``torch.load`` returns it.
+    """
+    state = dict(weights)
+    for key in MARKER_KEYS:
+        if key not in state:
+            state[key] = model.get_buffer(key)
+
+    model.load_state_dict(state)
+
+
+def shift_causal(weights: Mapping[str, object]) -> bool:
+    """Whether a checkpoint reads only the past, and can therefore run online.
+
+    Args:
+        weights: A state dictionary, as ``torch.load`` returns it.
+
+    Returns:
+        True if the run that wrote it shifted in one direction. False for the
+        two-directional arm and for every checkpoint written without a shift.
+    """
+    recorded = weights.get(CAUSAL_KEY)
+    return False if recorded is None else bool(recorded)
 
 
 def shift_shuffled(weights: Mapping[str, object]) -> bool:
