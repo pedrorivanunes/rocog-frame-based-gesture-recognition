@@ -534,8 +534,8 @@ def test_clips_keep_the_eighth_class_at_the_weight_the_frames_gave_it(tmp_path):
     assert idle / len(served) == pytest.approx(1 / 9, abs=0.001)
 
 
-def test_the_clipped_evaluation_loader_serves_every_row_in_order(tmp_path):
-    """The probability table refuses scores that arrived in another order."""
+def test_the_clipped_evaluation_loader_serves_every_row_exactly_once(tmp_path):
+    """Window-spanning clips permute the rows; they must not lose any."""
     eval_rows = pd.concat(
         [rows_for(f"v{v}", 0, 24) for v in range(4)], ignore_index=True
     )
@@ -548,4 +548,4 @@ def test_the_clipped_evaluation_loader_serves_every_row_in_order(tmp_path):
     )
 
     served = [position for batch in eval_loader.batch_sampler for position in batch]
-    assert served == list(range(len(eval_rows)))
+    assert sorted(served) == list(range(len(eval_rows)))

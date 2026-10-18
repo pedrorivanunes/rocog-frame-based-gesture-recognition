@@ -24,6 +24,7 @@ from dataset import (
     drawing_sampler,
     eval_transform,
     noise_background,
+    restore_order,
     solid_background,
     train_transform,
 )
@@ -873,14 +874,48 @@ def test_a_resumed_clip_sampler_carries_on_rather_than_restarts():
     assert [list(batch) for batch in cut] == [list(batch) for batch in resumed]
 
 
-def test_evaluation_clips_serve_every_row_in_the_manifest_order():
-    """The probability table is matched positionally and refuses any other order."""
+def test_evaluation_clips_span_the_window_as_a_training_clip_does():
+    """Grouping consecutive rows built a clip covering a third of the gesture."""
+    manifest = frame_manifest(videos=1)
+
+    batches = clip_batches(manifest, segments=8, frames_per_batch=64)
+
+    stored = FRAMES_STORED // 8
+    for batch in batches:
+        for start in range(0, len(batch), 8):
+            clip = batch[start : start + 8]
+            # One frame from each equal block, which is the training draw's
+            # construction: consecutive positions would all sit in one block.
+            assert [position // stored for position in clip] == list(range(8))
+
+
+def test_evaluation_clips_serve_every_row_exactly_once():
+    """Permuted is allowed; losing or repeating a row is not."""
     manifest = frame_manifest(videos=5)
 
     batches = clip_batches(manifest, segments=8, frames_per_batch=64)
 
     served = [position for batch in batches for position in batch]
-    assert served == list(range(len(manifest)))
+    assert sorted(served) == list(range(len(manifest)))
+
+
+def test_the_served_order_inverts_back_to_the_manifest():
+    """The table is matched positionally, so the permutation has to undo."""
+    manifest = frame_manifest(videos=5)
+    batches = clip_batches(manifest, segments=8, frames_per_batch=64)
+
+    served = [position for batch in batches for position in batch]
+    places = restore_order(batches)
+
+    assert [served[place] for place in places] == list(range(len(manifest)))
+
+
+def test_a_pass_that_lost_or_repeated_a_row_is_refused():
+    """Either would attach probabilities to the wrong frames, silently."""
+    with pytest.raises(RuntimeError, match="not a permutation"):
+        restore_order([[0, 1, 1, 3]])
+    with pytest.raises(RuntimeError, match="not a permutation"):
+        restore_order([[0, 1, 2, 9]])
 
 
 def test_evaluation_clips_never_straddle_two_videos():

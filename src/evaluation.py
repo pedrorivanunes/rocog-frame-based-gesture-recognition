@@ -350,7 +350,7 @@ def probability_table(
 
 
 if __name__ == "__main__":
-    from dataset import FrameDataset, clip_batches, eval_transform
+    from dataset import FrameDataset, clip_batches, eval_transform, restore_order
     from device import describe, pick_device
     from manifest import dense_name_for, load_class_names, with_idle_class
     from model import (
@@ -506,6 +506,16 @@ if __name__ == "__main__":
             num_workers=args.num_workers,
         )
 
+    # Where each row of a window-spanning pass belongs in the manifest. Computed
+    # once here rather than from the loader, because both passes below need it
+    # and because a second loader built only to read its sampler is a second
+    # thing that can disagree with the first.
+    places = (
+        restore_order(clip_batches(manifest, segments, BATCH_SIZE))
+        if segments is not None
+        else None
+    )
+
     if args.adapt_bn:
         adaptation_rows = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.adapt_bn)
         seen = adapt_batchnorm(model, frame_loader(adaptation_rows), device)
@@ -522,6 +532,9 @@ if __name__ == "__main__":
         features, _, video_ids = predict(
             model, frame_loader(manifest), device, segments
         )
+        if places is not None:
+            features = features[places]
+            video_ids = [video_ids[place] for place in places]
         cube, video_labels, ids = feature_cube(features, manifest, video_ids)
 
         features_dir = PROJECT_ROOT / "data" / "features"
@@ -538,6 +551,15 @@ if __name__ == "__main__":
         raise SystemExit(0)
 
     logits, labels, video_ids = predict(model, frame_loader(manifest), device, segments)
+    if places is not None:
+        # Window-spanning clips do not arrive in the manifest's order. Moving the
+        # three arrays back by the one permutation is what lets the table be
+        # built at all: it refuses scores out of that order, and that refusal is
+        # the only thing standing between a permuted pass and every probability
+        # attached to the wrong frame.
+        logits = logits[places]
+        labels = labels[places]
+        video_ids = [video_ids[place] for place in places]
     loss, accuracy = frame_metrics(logits, labels, nn.CrossEntropyLoss())
     table = probability_table(logits, video_ids, manifest, class_names)
 

@@ -954,18 +954,26 @@ def clip_batches(
     segments: int,
     frames_per_batch: int,
 ) -> list[list[int]]:
-    """Cut every frame a manifest lists into clips, reordering nothing.
+    """Cut every frame a manifest lists into clips that span the gesture window.
 
-    The batches evaluation serves have to stay in the manifest's order, because
-    the probability table is matched back to it positionally and refuses to be
-    built from scores that arrived in another order. So this groups rather than
-    draws: a video's frames are already consecutive and already in frame order,
-    and all this does is decide where the batch boundaries fall so that no clip
-    straddles one.
+    A clip takes one frame from each equal block of a video's stored frames,
+    which is the same construction the training draw makes. That matters more
+    than it looks, and getting it wrong was measured here: grouping consecutive
+    stored rows instead builds a clip covering about a third of the gesture,
+    while a training clip covers the whole of it — eight frames spanning 104
+    frames of video against eight spanning 32. A shift trained to exchange
+    channels with a neighbour some fourteen frames away would then be scored
+    exchanging with one four frames away, which is a different input
+    distribution, and this project has measured that the spacing of the
+    neighbour is worth several points and that the two domains disagree about
+    it. Only a model that relates frames is affected, but that is the model this
+    exists for.
 
-    Every frame is served, including the ones in a final short batch. Nothing is
-    dropped the way training drops its remainder, because a split has to be
-    scored whole.
+    Every frame is served exactly once, so the served order is a permutation of
+    the manifest's and the scores can be put back. They have to be: the
+    probability table is matched to the manifest positionally and refuses to be
+    built from scores that arrived in another order. The caller restores it with
+    ``restore_order``, for which the flattened batches are the permutation.
 
     Args:
         manifest: The rows to serve, in the order they will be scored.
@@ -994,9 +1002,14 @@ def clip_batches(
                 f"a video holds {len(positions)} frames, which do not divide "
                 f"into clips of {segments}"
             )
+        # One frame per block, the blocks being the same equal cuts the training
+        # sampler makes. Block b holds positions [b*size, (b+1)*size), and clip
+        # j takes the j-th of each, so the clips partition the video's frames and
+        # every one of them spans the whole window.
+        size = len(positions) // segments
         clips.extend(
-            positions[start : start + segments].tolist()
-            for start in range(0, len(positions), segments)
+            [int(positions[block * size + offset]) for block in range(segments)]
+            for offset in range(size)
         )
 
     return [
@@ -1200,3 +1213,42 @@ def drawing_sampler(loader) -> Sampler:
         if hasattr(candidate, "state_dict"):
             return candidate
     raise RuntimeError("the loader has no sampler carrying a draw to save")
+
+
+def restore_order(served: list[list[int]]) -> list[int]:
+    """Where each served row belongs in the manifest.
+
+    Clips that span the gesture window do not arrive in the manifest's order,
+    and the probability table is matched to that order positionally. Since every
+    row is served exactly once, the flattened batches are a permutation of the
+    manifest's positions, and inverting it says where to put each score back.
+
+    Returned as positions rather than applied, because the caller holds three
+    arrays that have to move together — scores, labels and video ids — and doing
+    it here would mean knowing about all three.
+
+    Args:
+        served: The batches, as ``clip_batches`` returned them.
+
+    Returns:
+        For each position in the manifest, the index in the served sequence that
+        carries it. Indexing the served arrays by this gives manifest order.
+
+    Raises:
+        RuntimeError: If the batches are not a permutation of a manifest's
+            positions — a row served twice, or none. Either would attach
+            probabilities to the wrong frames, silently.
+    """
+    flat = [position for batch in served for position in batch]
+    places = [0] * len(flat)
+    seen = [False] * len(flat)
+    for index, position in enumerate(flat):
+        if not 0 <= position < len(flat) or seen[position]:
+            raise RuntimeError(
+                f"the served batches are not a permutation of {len(flat)} rows; "
+                f"position {position} is out of range or served twice"
+            )
+        seen[position] = True
+        places[position] = index
+
+    return places
