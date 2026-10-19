@@ -65,6 +65,11 @@ ARM_LANDMARKS = (11, 12, 13, 14, 15, 16)
 # if the choice matters, the medians will say so.
 VISIBILITY_FLOOR = 0.5
 
+# The middle of the detector's three model sizes. Kept in one place because
+# the keypoint extraction builds its detector here too, and what this probe
+# measured only describes that extraction if both ran the same model.
+MODEL_COMPLEXITY = 1
+
 # How many frames to read from each video. Lighting is a property of a
 # recording, not of a frame, so breadth across videos buys more than depth
 # within one.
@@ -233,7 +238,9 @@ def make_detector():
                 f"landmark {index} is {landmark(index).name}, expected {name}"
             )
 
-    return mp.solutions.pose.Pose(static_image_mode=True, model_complexity=1)
+    return mp.solutions.pose.Pose(
+        static_image_mode=True, model_complexity=MODEL_COMPLEXITY
+    )
 
 
 def landmark_visibilities(detector, frame: np.ndarray) -> list[float] | None:
