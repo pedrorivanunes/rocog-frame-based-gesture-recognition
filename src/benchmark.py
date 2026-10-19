@@ -59,7 +59,6 @@ from __future__ import annotations
 import argparse
 import csv
 import platform
-import statistics
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -75,6 +74,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from dataset import eval_transform  # noqa: E402
 from device import pick_device  # noqa: E402
 from model import build_model  # noqa: E402
+from timing import REPEATS, WARMUP, Summary, summarise  # noqa: E402
 
 # Frames the stored dataset holds per side, before the evaluation crop. Timing
 # starts from this shape because it is the shape the project's own evaluation
@@ -82,8 +82,6 @@ from model import build_model  # noqa: E402
 STORED_SIZE = 256
 
 NUM_CLASSES = 8
-WARMUP = 5
-REPEATS = 30
 FRAME_COUNTS = (1, 4, 8, 16, 24)
 
 
@@ -195,49 +193,6 @@ ENTRIES: tuple[Entry, ...] = (
     Entry("x3d_m_256", _pytorchvideo("x3d_m"), 256, 16, "baseline"),
     Entry("x3d_m_224", _pytorchvideo("x3d_m"), 224, 16, "baseline"),
 )
-
-
-@dataclass(frozen=True)
-class Summary:
-    """What a set of timings is reported as.
-
-    The median and the interquartile range rather than a mean and a standard
-    deviation, because wall clock on a general purpose machine is bounded below
-    and has a long right tail: one descheduled run drags a mean and leaves a
-    median alone. The minimum is kept as the closest thing to an uninterrupted
-    run.
-    """
-
-    median_ms: float
-    iqr_ms: float
-    min_ms: float
-    samples: int
-
-
-def summarise(samples: Sequence[float]) -> Summary:
-    """Reduce raw timings, in milliseconds, to what gets reported.
-
-    Args:
-        samples: One duration per timed repetition, in milliseconds.
-
-    Returns:
-        The summary described by ``Summary``.
-
-    Raises:
-        ValueError: If there is nothing to summarise. An empty set here means
-            the timing loop never ran, which is a bug rather than a result.
-    """
-    if not samples:
-        raise ValueError("no timings to summarise")
-
-    ordered = sorted(samples)
-    if len(ordered) >= 4:
-        quartiles = statistics.quantiles(ordered, n=4, method="inclusive")
-        iqr = quartiles[2] - quartiles[0]
-    else:
-        iqr = ordered[-1] - ordered[0]
-
-    return Summary(statistics.median(ordered), iqr, ordered[0], len(ordered))
 
 
 def synchronize(device: torch.device) -> None:
