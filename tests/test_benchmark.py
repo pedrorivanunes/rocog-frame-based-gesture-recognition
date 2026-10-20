@@ -6,6 +6,7 @@ from torch import nn
 
 from benchmark import (
     NUM_CLASSES,
+    SHIFT_SEGMENTS,
     STORED_SIZE,
     Entry,
     decision_call,
@@ -45,6 +46,14 @@ def _clip_entry() -> Entry:
 
 def _difference_entry() -> Entry:
     return Entry("stub_diff", _Counter, 224, None, "test", channels=6)
+
+
+def _offline_shift_entry() -> Entry:
+    return Entry("stub_shift", _Counter, 224, None, "test", shift="offline")
+
+
+def _online_shift_entry() -> Entry:
+    return Entry("stub_stream", _Counter, 224, None, "test", shift="online")
 
 
 def test_a_frame_model_is_fed_one_frame_and_a_clip_model_a_clip():
@@ -129,6 +138,61 @@ def test_a_clip_model_ignores_the_requested_frame_count():
     assert model.seen[0][2] == 16
 
 
+def test_an_offline_shift_reads_its_clip_as_one_batch_of_frames():
+    """The frames share a batch so that the shift can reach across them."""
+    assert forward_input(_offline_shift_entry(), CPU).shape == (
+        SHIFT_SEGMENTS,
+        3,
+        224,
+        224,
+    )
+
+
+def test_an_offline_shift_decides_on_the_clip_it_trained_on_whatever_was_asked():
+    """Its decision cannot be made before the clip is complete, at any K."""
+    entry, model = _offline_shift_entry(), _Counter()
+
+    decision_call(entry, model, 24, CPU)()
+
+    assert model.seen == [(SHIFT_SEGMENTS, 3, 224, 224)]
+
+
+def test_an_online_shift_runs_one_frame_per_decision_whatever_k_is():
+    """The decision averages recent answers; it does not rerun recent frames."""
+    entry, model = _online_shift_entry(), _Counter()
+    decide = decision_call(entry, model, 16, CPU)
+
+    decide()
+    decide()
+
+    assert model.seen == [(1, 3, 224, 224), (1, 3, 224, 224)]
+
+
+def test_an_online_decision_averages_the_last_k_answers():
+    """Each answer joins the window and the oldest one leaves it."""
+    entry = _online_shift_entry()
+
+    class _Votes(_Counter):
+        """Answers class 2 on the first call and class 5 on every later one."""
+
+        def forward(self, batch: torch.Tensor) -> torch.Tensor:
+            logits = torch.zeros(1, self.classes)
+            logits[0, 2 if not self.seen else 5] = 50.0
+            super().forward(batch)
+            return logits
+
+    model = _Votes()
+    decide = decision_call(entry, model, 2, CPU)
+
+    first, second, third = decide(), decide(), decide()
+
+    # One confident answer outweighs the uniform start, so the first decision
+    # is class 2; by the third, both answers in a window of two are class 5.
+    assert int(first) == 2
+    assert int(third) == 5
+    assert int(second) in (2, 5)
+
+
 def test_time_calls_runs_the_warmup_outside_the_measured_repetitions():
     calls = []
 
@@ -157,6 +221,30 @@ def test_a_clip_model_is_timed_once_whatever_was_requested():
 
     levels = [(record["level"], record["frames"]) for record in records]
     assert levels == [("forward", 16), ("decision", 16)]
+
+
+def test_an_offline_shift_is_timed_once_at_its_clip_length():
+    records = rows_for(
+        _offline_shift_entry(),
+        CPU,
+        [1, 8, 24],
+        parse_args(["--warmup", "0", "--repeats", "1"]),
+    )
+
+    levels = [(record["level"], record["frames"]) for record in records]
+    assert levels == [("forward", SHIFT_SEGMENTS), ("decision", SHIFT_SEGMENTS)]
+
+
+def test_an_online_shift_is_timed_at_every_requested_window():
+    records = rows_for(
+        _online_shift_entry(),
+        CPU,
+        [1, 8],
+        parse_args(["--warmup", "0", "--repeats", "1"]),
+    )
+
+    levels = [(record["level"], record["frames"]) for record in records]
+    assert levels == [("forward", 1), ("decision", 1), ("decision", 8)]
 
 
 def test_parameters_are_reported_in_millions():

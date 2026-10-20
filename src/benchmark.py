@@ -61,6 +61,7 @@ import csv
 import platform
 import sys
 import time
+from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,7 +74,12 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from dataset import eval_transform  # noqa: E402
 from device import pick_device  # noqa: E402
-from model import build_model  # noqa: E402
+from model import (  # noqa: E402
+    build_model,
+    insert_temporal_shift,
+    set_segments,
+    stream_temporal_shift,
+)
 from timing import REPEATS, WARMUP, Summary, summarise  # noqa: E402
 
 # Frames the stored dataset holds per side, before the evaluation crop. Timing
@@ -83,6 +89,8 @@ STORED_SIZE = 256
 
 NUM_CLASSES = 8
 FRAME_COUNTS = (1, 4, 8, 16, 24)
+# Frames per clip the shifted runs trained and were scored on.
+SHIFT_SEGMENTS = 8
 
 
 @dataclass(frozen=True)
@@ -102,6 +110,11 @@ class Entry:
             given a frame and what changed since a neighbour, which costs a
             second frame through the transform for every frame aggregated —
             the part of that arrangement arithmetic does not show.
+        shift: How a network that exchanges channels between frames is run.
+            ``"offline"`` reads a clip of ``SHIFT_SEGMENTS`` frames in one
+            batch, both directions, so a decision is that clip; ``"online"``
+            reads the past only, one frame per call, and decides on every
+            frame from the last K answers. ``None`` for every other row.
     """
 
     name: str
@@ -110,6 +123,7 @@ class Entry:
     clip: int | None
     source: str
     channels: int = 3
+    shift: str | None = None
 
 
 def _pytorchvideo(factory: str):
@@ -121,6 +135,21 @@ def _pytorchvideo(factory: str):
         return getattr(hub, factory)(pretrained=False)
 
     return build
+
+
+def _shifted() -> nn.Module:
+    """The ResNet18 with the two-directional shift, set for a clip of eight."""
+    model = build_model(NUM_CLASSES, "resnet18")
+    insert_temporal_shift(model, "resnet18", SHIFT_SEGMENTS)
+    set_segments(model, SHIFT_SEGMENTS)
+    return model
+
+
+def _streaming() -> nn.Module:
+    """The ResNet18 with the causal shift, run one arriving frame at a time."""
+    model = build_model(NUM_CLASSES, "resnet18")
+    stream_temporal_shift(model, "resnet18")
+    return model
 
 
 # The three frame-based networks are the project's own. The two clip-based ones
@@ -183,6 +212,14 @@ ENTRIES: tuple[Entry, ...] = (
         "ours",
         channels=12,
     ),
+    # The network with channels exchanged between neighbouring frames, in the
+    # two forms that were trained. Offline it reads both directions, so its
+    # decision is a clip of eight that cannot be made before the eighth frame
+    # exists. Online it reads the past only and keeps what the next frame will
+    # need, so it answers on every frame; that row's K is how many recent answers
+    # are averaged, not how many frames are run.
+    Entry("resnet18_tsm", _shifted, 224, None, "ours", shift="offline"),
+    Entry("resnet18_tsm_online", _streaming, 224, None, "ours", shift="online"),
     Entry("i3d_r50", _pytorchvideo("i3d_r50"), 256, 16, "baseline"),
     # X3D-M appears at two sizes because its own and the paper's disagree. The
     # architecture was published at 224 and its cost figures are quoted there;
@@ -238,7 +275,9 @@ def time_calls(
 
 def forward_input(entry: Entry, device: torch.device) -> torch.Tensor:
     """The batch-of-one tensor one forward consumes, already on the device."""
-    if entry.clip is None:
+    if entry.shift == "offline":
+        shape = (SHIFT_SEGMENTS, entry.channels, entry.crop, entry.crop)
+    elif entry.clip is None:
         shape = (1, entry.channels, entry.crop, entry.crop)
     else:
         shape = (1, entry.channels, entry.clip, entry.crop, entry.crop)
@@ -284,8 +323,13 @@ def decision_call(
     Returns:
         A callable taking no arguments and returning the chosen class.
     """
+    if entry.shift == "online":
+        return streaming_decision(entry, model, frames, device)
+
     transform = eval_transform(entry.crop)
     count = entry.clip if entry.clip is not None else frames
+    if entry.shift == "offline":
+        count = SHIFT_SEGMENTS
     # Three channels per block: the frame, then one neighbour per spacing. A
     # row reading several spacings puts that many times K frames through the
     # transform, and that is the half of the cost arithmetic cannot be asked.
@@ -308,6 +352,40 @@ def decision_call(
         if entry.clip is None:
             probabilities = probabilities.mean(dim=0, keepdim=True)
         return probabilities.argmax(dim=1)
+
+    return decide
+
+
+def streaming_decision(
+    entry: Entry, model: nn.Module, frames: int, device: torch.device
+) -> Callable[[], object]:
+    """Build the closure that decides as one more frame arrives.
+
+    A network that reads only the past does not wait for a clip: each frame is
+    run on its own, reading what the previous frame kept, and the answer is the
+    mean of the last K frames' probabilities, which are kept the same way. So a
+    decision costs one frame through the transform and the network whatever K
+    is, and that is the property being timed. Each call advances the stream,
+    as each arriving frame would.
+
+    Args:
+        entry: The network's row.
+        model: Its built and evaluated instance, carrying the online shift.
+        frames: How many recent answers the decision averages.
+        device: Where the forward runs.
+
+    Returns:
+        A callable taking no arguments and returning the chosen class.
+    """
+    transform = eval_transform(entry.crop)
+    raw = stored_frames(1)
+    uniform = torch.full((NUM_CLASSES,), 1 / NUM_CLASSES, device=device)
+    recent = deque([uniform] * frames, maxlen=frames)
+
+    def decide() -> torch.Tensor:
+        batch = transform(raw).to(device)
+        recent.append(model(batch).softmax(dim=1)[0])
+        return torch.stack(tuple(recent)).mean(dim=0).argmax()
 
     return decide
 
@@ -348,7 +426,7 @@ def rows_for(
             "model": entry.name,
             "source": entry.source,
             "level": "forward",
-            "frames": entry.clip or 1,
+            "frames": entry.clip or (SHIFT_SEGMENTS if entry.shift == "offline" else 1),
             "crop": entry.crop,
             "median_ms": level.median_ms,
             "iqr_ms": level.iqr_ms,
@@ -360,7 +438,12 @@ def rows_for(
 
     # A clip-based row has one decision size, so asking for five frame counts
     # would time the same thing five times under different labels.
-    counts = [entry.clip] if entry.clip is not None else list(frame_counts)
+    if entry.clip is not None:
+        counts = [entry.clip]
+    elif entry.shift == "offline":
+        counts = [SHIFT_SEGMENTS]
+    else:
+        counts = list(frame_counts)
     for count in counts:
         decision = time_calls(
             decision_call(entry, model, count, device),
