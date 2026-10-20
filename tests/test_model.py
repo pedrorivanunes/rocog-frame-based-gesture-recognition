@@ -23,11 +23,13 @@ from model import (
     insert_temporal_shift,
     load_shifted,
     reset_shuffle,
+    reset_stream,
     set_segments,
     shift_causal,
     shift_segments,
     shift_shuffled,
     stem_width,
+    stream_temporal_shift,
     strip_head,
 )
 
@@ -558,6 +560,68 @@ def test_the_shift_makes_a_frame_depend_on_the_frames_beside_it():
         reordered = shifted(clip[torch.tensor([2, 1, 3, 0])])
 
     assert not torch.allclose(scored[2], reordered[0], atol=1e-5)
+
+
+def streaming_resnet(weights=None):
+    """A ResNet18 carrying the online shift, optionally with given weights."""
+    network = resnet18(weights=None)
+    if weights is not None:
+        # The offline network records how it was shifted; a stream has no clip
+        # length or permutation to record, so those three entries are left out.
+        network.load_state_dict(
+            {k: v for k, v in weights.items() if k not in model_module.MARKER_KEYS}
+        )
+    stream_temporal_shift(network, "resnet18")
+
+    return network
+
+
+def test_a_stream_reproduces_the_causal_clip_frame_for_frame():
+    """Online keeps what offline has in memory, so over one clip the two agree."""
+    offline = shifted_resnet(segments=4, causal=True).eval()
+    online = streaming_resnet(offline.state_dict()).eval()
+    clip = torch.randn(4, 3, 64, 64)
+
+    with torch.no_grad():
+        set_segments(offline, 4)
+        whole = offline(clip)
+        streamed = torch.cat([online(clip[index : index + 1]) for index in range(4)])
+
+    assert torch.allclose(whole, streamed, atol=1e-5)
+
+
+def test_a_stream_reads_the_past_and_not_only_the_present():
+    """Without the kept slice the second frame would score as if it came first."""
+    online = streaming_resnet().eval()
+    first, second = torch.randn(1, 3, 64, 64), torch.randn(1, 3, 64, 64)
+
+    with torch.no_grad():
+        alone = online(second)
+        reset_stream(online)
+        online(first)
+        after_first = online(second)
+
+    assert not torch.allclose(alone, after_first, atol=1e-5)
+
+
+def test_a_reset_stream_starts_over():
+    online = streaming_resnet().eval()
+    frame = torch.randn(1, 3, 64, 64)
+
+    with torch.no_grad():
+        first = online(frame)
+        online(torch.randn(1, 3, 64, 64))
+        reset_stream(online)
+        again = online(frame)
+
+    assert torch.allclose(first, again)
+
+
+def test_a_stream_refuses_several_frames_at_once():
+    online = streaming_resnet().eval()
+
+    with torch.no_grad(), pytest.raises(RuntimeError, match="one frame per call"):
+        online(torch.randn(2, 3, 64, 64))
 
 
 def test_a_batch_that_is_not_whole_clips_is_refused():

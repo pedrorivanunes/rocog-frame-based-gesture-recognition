@@ -618,6 +618,126 @@ def reset_shuffle(model: nn.Module, seed: int = SHUFFLE_SEED) -> None:
         model.shift_generator.manual_seed(seed)
 
 
+class StreamingShift:
+    """The causal shift for frames that arrive one at a time.
+
+    Offline a whole clip is in memory, and the causal shift hands each frame a
+    slice of the channels of the frame before it. Online there is no clip: a
+    frame arrives, the model answers, and the next frame has not been filmed
+    yet. What that next frame will need from this one is exactly the slice, so
+    it is kept, one per residual branch, and handed over when the next frame
+    arrives. That is the published online form: the slice a frame passes on is
+    cached rather than recomputed.
+
+    The first frame of a stream finds nothing kept and reads zeros, which is
+    what the offline shift gives the first frame of a clip, so over one clip the
+    two produce the same outputs frame for frame. After that they part: a
+    stream never stops passing slices along, while the scored clips start
+    again from zero every eight frames. That changes what a frame reads, not
+    what it costs to read it.
+
+    One frame per call. Several streams at once would each need their own
+    cache, and nothing here asks for that.
+    """
+
+    def __init__(self, fold_divisor: int = FOLD_DIVISOR):
+        """Start with nothing kept, as at the start of a stream.
+
+        Args:
+            fold_divisor: One over the share of channels handed to the next
+                frame, as in the offline causal shift.
+        """
+        self.fold_divisor = fold_divisor
+        self.kept: torch.Tensor | None = None
+
+    def __call__(self, module: nn.Module, inputs: tuple) -> tuple:
+        """Hand this frame the slice the previous one kept, and keep its own.
+
+        Args:
+            module: The convolution being fed. Unused, and present because a
+                forward pre-hook is called with it.
+            inputs: The frame about to enter the residual branch, as a one-tuple.
+
+        Returns:
+            The same tuple with the slice replaced by the previous frame's.
+
+        Raises:
+            RuntimeError: If more than one frame arrives at once, or if the
+                proportion rounds down to no channels at this width.
+        """
+        (frame,) = inputs
+
+        if frame.shape[0] != 1:
+            raise RuntimeError(
+                f"a stream carries one frame per call, not {frame.shape[0]}"
+            )
+        fold = frame.shape[1] // self.fold_divisor
+        if not fold:
+            raise RuntimeError(
+                f"{frame.shape[1]} channels over a divisor of {self.fold_divisor} "
+                "leaves nothing to shift"
+            )
+
+        shifted = frame.clone()
+        if self.kept is None:
+            shifted[:, :fold] = 0
+        else:
+            shifted[:, :fold] = self.kept
+        self.kept = frame[:, :fold].clone()
+
+        return (shifted,)
+
+
+def stream_temporal_shift(
+    model: nn.Module,
+    backbone: str = DEFAULT_BACKBONE,
+    fold_divisor: int = FOLD_DIVISOR,
+) -> list[StreamingShift]:
+    """Give every residual branch the online causal shift.
+
+    The branches are the ones ``insert_temporal_shift`` uses, so a network
+    built this way runs the arrangement the causal arm trained with, one frame
+    at a time.
+
+    Args:
+        model: The network to modify, already carrying its final head.
+        backbone: Which architecture it is.
+        fold_divisor: Passed to each shift.
+
+    Returns:
+        The shifts, one per residual branch, in the order they were inserted.
+
+    Raises:
+        ValueError: If the backbone has no residual branch to shift inside.
+    """
+    if backbone not in SHIFT_BACKBONES:
+        raise ValueError(
+            f"cannot shift inside {backbone!r}; expected one of {SHIFT_BACKBONES}"
+        )
+
+    shifts = []
+    for stage in SHIFT_STAGES:
+        for block in _module_at(model, stage):
+            shift = StreamingShift(fold_divisor)
+            _module_at(block, SHIFT_BRANCH).register_forward_pre_hook(shift)
+            shifts.append(shift)
+
+    model.streaming_shifts = shifts
+    return shifts
+
+
+def reset_stream(model: nn.Module) -> None:
+    """Forget what a stream kept, so that the next frame starts a new one.
+
+    A no-op on a network without a streaming shift.
+
+    Args:
+        model: The network about to read a new stream.
+    """
+    for shift in getattr(model, "streaming_shifts", ()):
+        shift.kept = None
+
+
 def shift_segments(weights: Mapping[str, object]) -> int | None:
     """How many frames per clip a checkpoint trained with, or None if it had no shift.
 
