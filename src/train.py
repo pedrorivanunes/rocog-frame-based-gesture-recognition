@@ -1139,9 +1139,10 @@ if __name__ == "__main__":
             arm = "causal, from the past only"
         else:
             arm = "ordered, both directions"
+        direction = "from the past" if args.tsm_causal else "each way"
         print(
             f"temporal shift: {arm}, clips of {args.clips}, "
-            f"1/{args.tsm_fold_divisor} of the channels each way"
+            f"1/{args.tsm_fold_divisor} of the channels {direction}"
         )
     frozen = freeze(model, args.freeze)
     criterion, validation_criterion = build_criteria(args.label_smoothing)
