@@ -173,10 +173,11 @@ ENTRIES: tuple[Entry, ...] = (
         "ours",
     ),
     # The same three again, reading a frame beside what changed since one a few
-    # back. The arithmetic of the widened stem is a rounding error, so what
-    # these rows are really for is the other half of the cost: a decision over
-    # K frames now puts 2K frames through the evaluation transform, and whether
-    # that shows up in the clock is not something arithmetic can be asked.
+    # back. That costs in two places: the widened stem adds under a tenth to the
+    # arithmetic, all of it in the first convolution, and a decision over K
+    # frames now puts 2K frames through the evaluation transform. A count of
+    # multiply-adds sees only the first, so how the two add up is left to the
+    # clock.
     Entry(
         "resnet18_diff",
         lambda: build_model(NUM_CLASSES, "resnet18", 6),
@@ -201,9 +202,10 @@ ENTRIES: tuple[Entry, ...] = (
         "ours",
         channels=6,
     ),
-    # And the same network again reading three spacings instead of one. The
-    # row exists because the transform is the cost that scales: four frames
-    # per decision instead of two, which no count of multiply-adds shows.
+    # And the same network again reading three spacings instead of one. It pays
+    # the same two costs as the rows above, each larger: the wider stem adds
+    # about a fifth to the arithmetic, and four frames per decision go through
+    # the transform instead of two.
     Entry(
         "resnet18_multi",
         lambda: build_model(NUM_CLASSES, "resnet18", 12),
@@ -332,7 +334,7 @@ def decision_call(
         count = SHIFT_SEGMENTS
     # Three channels per block: the frame, then one neighbour per spacing. A
     # row reading several spacings puts that many times K frames through the
-    # transform, and that is the half of the cost arithmetic cannot be asked.
+    # transform, which is the part of the cost arithmetic cannot count.
     blocks = entry.channels // 3
     stacked = entry.clip is None and blocks > 1
     raw = stored_frames(count * blocks if stacked else count)
