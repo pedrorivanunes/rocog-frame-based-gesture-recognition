@@ -350,19 +350,32 @@ def backbone_of(weights: Mapping[str, object]) -> str:
     )
 
 
-# Where a shift can be inserted, and the omission is part of the claim. The
+# Where a shift can be inserted, and the omissions are part of the claim. The
 # shift has to sit inside a residual branch so that the identity path still
 # carries the frame's own activations forward: moving channels on the trunk
 # takes them away from the current frame, and the published ablation measures
-# that as worse at every proportion. Only the two ResNets expose a branch a
-# wrapper can reach without rewriting the block, so only they are listed.
-SHIFT_BACKBONES = ("resnet18", "resnet18_ibn_a")
+# that as worse at every proportion. A block with no identity path therefore
+# gets no shift at all.
+#
+# The two ResNets add the input back in every block of their four stages, and
+# name the branch's first convolution the same way in each.
+RESIDUAL_STAGE_BACKBONES = ("resnet18", "resnet18_ibn_a")
 SHIFT_STAGES = ("layer1", "layer2", "layer3", "layer4")
 
 # The first convolution of a block's residual branch. Shifting its input is what
 # "inside the residual branch" means in practice: everything the branch computes
 # afterwards reads the moved channels, and the skip connection does not.
 SHIFT_BRANCH = "conv1"
+
+# The two cheaper networks are built from inverted residual blocks, which keep
+# the whole branch as one module and add the input back only when the block
+# keeps its width and resolution: nine of EfficientNet-B0's sixteen blocks and
+# six of MobileNetV3-Small's eleven. Which ones is read off each block, where
+# torchvision records it, rather than listed here. The published online form
+# caches "the first 1/8 feature maps of each residual block", and its edge
+# deployment runs on MobileNet-V2, a network of this kind.
+INVERTED_RESIDUAL_BACKBONES = ("mobilenet_v3_small", "efficientnet_b0")
+INVERTED_BRANCH = "block"
 
 # One eighth of the channels travel in each direction, a quarter in total, which
 # is where the published ablation puts the peak. The divisor rather than a
@@ -462,7 +475,7 @@ class TemporalShift:
         """Shift the tensor about to enter a residual branch.
 
         Args:
-            module: The convolution being fed. Unused, and present because a
+            module: Where the branch begins. Unused, and present because a
                 forward pre-hook is called with it.
             inputs: What the convolution was going to read, as a one-tuple.
 
@@ -520,6 +533,39 @@ class TemporalShift:
         return (shifted.reshape(frames.shape),)
 
 
+def residual_branches(model: nn.Module, backbone: str) -> list[nn.Module]:
+    """Find where each residual branch of a network begins.
+
+    A shift is hooked onto the input of each module returned, so that the
+    branch reads the moved channels and the identity path around it does not.
+
+    Args:
+        model: The network, as ``build_model`` returns it.
+        backbone: Which architecture it is, which says how its blocks are laid
+            out.
+
+    Returns:
+        One module per block that adds its input back, shallowest first.
+
+    Raises:
+        ValueError: If the backbone is not one this project builds.
+    """
+    if backbone in RESIDUAL_STAGE_BACKBONES:
+        return [
+            _module_at(block, SHIFT_BRANCH)
+            for stage in SHIFT_STAGES
+            for block in _module_at(model, stage)
+        ]
+    if backbone in INVERTED_RESIDUAL_BACKBONES:
+        return [
+            _module_at(block, INVERTED_BRANCH)
+            for block in model.modules()
+            if getattr(block, "use_res_connect", False)
+        ]
+
+    raise ValueError(f"cannot shift inside {backbone!r}; expected one of {BACKBONES}")
+
+
 def insert_temporal_shift(
     model: nn.Module,
     backbone: str = DEFAULT_BACKBONE,
@@ -555,19 +601,13 @@ def insert_temporal_shift(
         The shifts, one per residual branch, in the order they were inserted.
 
     Raises:
-        ValueError: If the backbone has no residual branch to shift inside.
+        ValueError: If the backbone is not one this project builds.
     """
-    if backbone not in SHIFT_BACKBONES:
-        raise ValueError(
-            f"cannot shift inside {backbone!r}; expected one of {SHIFT_BACKBONES}"
-        )
-
     shifts = []
-    for stage in SHIFT_STAGES:
-        for block in _module_at(model, stage):
-            shift = TemporalShift(fold_divisor, causal)
-            _module_at(block, SHIFT_BRANCH).register_forward_pre_hook(shift)
-            shifts.append(shift)
+    for branch in residual_branches(model, backbone):
+        shift = TemporalShift(fold_divisor, causal)
+        branch.register_forward_pre_hook(shift)
+        shifts.append(shift)
 
     model.register_buffer(SEGMENTS_KEY, torch.tensor(segments))
     model.register_buffer(SHUFFLE_KEY, torch.tensor(shuffle))
@@ -661,7 +701,7 @@ class StreamingShift:
         """Hand this frame the slice the previous one kept, and keep its own.
 
         Args:
-            module: The convolution being fed. Unused, and present because a
+            module: Where the branch begins. Unused, and present because a
                 forward pre-hook is called with it.
             inputs: The frame about to enter the residual branch, as a one-tuple.
 
@@ -715,19 +755,13 @@ def stream_temporal_shift(
         The shifts, one per residual branch, in the order they were inserted.
 
     Raises:
-        ValueError: If the backbone has no residual branch to shift inside.
+        ValueError: If the backbone is not one this project builds.
     """
-    if backbone not in SHIFT_BACKBONES:
-        raise ValueError(
-            f"cannot shift inside {backbone!r}; expected one of {SHIFT_BACKBONES}"
-        )
-
     shifts = []
-    for stage in SHIFT_STAGES:
-        for block in _module_at(model, stage):
-            shift = StreamingShift(fold_divisor)
-            _module_at(block, SHIFT_BRANCH).register_forward_pre_hook(shift)
-            shifts.append(shift)
+    for branch in residual_branches(model, backbone):
+        shift = StreamingShift(fold_divisor)
+        branch.register_forward_pre_hook(shift)
+        shifts.append(shift)
 
     model.streaming_shifts = shifts
     return shifts

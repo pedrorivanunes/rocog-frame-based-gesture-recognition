@@ -448,12 +448,22 @@ def test_how_many_channels_a_checkpoint_expects_is_read_off_the_file():
     assert stem_width(build_model(8, "resnet18").state_dict()) == 3
 
 
-def shifted_resnet(**options):
-    """A ResNet18 carrying a shift, with weights that are irrelevant here."""
-    network = resnet18(weights=None)
-    insert_temporal_shift(network, "resnet18", **options)
+def shifted_network(backbone="resnet18", **options):
+    """A network carrying a shift, with weights that are irrelevant here."""
+    builder, _ = TORCHVISION_BACKBONES[backbone]
+    network = builder(weights=None)
+    insert_temporal_shift(network, backbone, **options)
 
     return network
+
+
+def same(first: torch.Tensor, second: torch.Tensor) -> bool:
+    """Equal up to rounding, at whatever scale the network answers in.
+
+    Untrained, the two inverted residual networks answer in the order of 1e-10,
+    so a fixed tolerance would call any two of their outputs equal.
+    """
+    return bool((first - second).norm() <= 1e-5 * first.norm())
 
 
 def indexed_clip(frames: int, channels: int) -> torch.Tensor:
@@ -509,10 +519,24 @@ def test_a_permuted_clip_comes_back_in_the_order_it_arrived():
     assert moved[:, 0, 0, 0].tolist() == [3.0, 0.0, 0.0, 2.0]
 
 
-def test_the_shift_costs_no_parameter_and_renames_no_weight():
+@pytest.mark.parametrize(
+    ("backbone", "blocks"),
+    [("resnet18", 8), ("efficientnet_b0", 9), ("mobilenet_v3_small", 6)],
+)
+def test_every_block_that_adds_its_input_back_gets_one_shift(backbone, blocks):
+    """Eight basic blocks; nine and six inverted ones that keep width and size.
+
+    The inverted residual blocks that change width or resolution have no
+    identity path, and a shift there would take channels away from the frame.
+    """
+    assert len(shifted_network(backbone, segments=8).temporal_shifts) == blocks
+
+
+@pytest.mark.parametrize("backbone", sorted(TORCHVISION_BACKBONES))
+def test_the_shift_costs_no_parameter_and_renames_no_weight(backbone):
     """The published claim, and the reason a hook was used instead of a wrapper."""
-    plain = resnet18(weights=None)
-    shifted = shifted_resnet(segments=8)
+    plain = TORCHVISION_BACKBONES[backbone][0](weights=None)
+    shifted = shifted_network(backbone, segments=8)
 
     assert sum(p.numel() for p in plain.parameters()) == sum(
         p.numel() for p in shifted.parameters()
@@ -530,8 +554,8 @@ def test_the_shift_costs_no_parameter_and_renames_no_weight():
 
 def test_a_checkpoint_says_how_it_was_shifted():
     """Scoring reads it off the file, so the flag cannot be forgotten."""
-    ordered = shifted_resnet(segments=8).state_dict()
-    control = shifted_resnet(segments=4, shuffle=True).state_dict()
+    ordered = shifted_network(segments=8).state_dict()
+    control = shifted_network(segments=4, shuffle=True).state_dict()
 
     assert shift_segments(ordered) == 8
     assert shift_shuffled(ordered) is False
@@ -548,7 +572,7 @@ def test_a_checkpoint_written_before_the_shift_says_so_rather_than_failing():
 
 def test_every_depth_shares_one_permutation():
     """A permutation per depth is noise at each layer, not a destroyed sequence."""
-    control = shifted_resnet(segments=8, shuffle=True)
+    control = shifted_network(segments=8, shuffle=True)
 
     set_segments(control, 8)
 
@@ -558,7 +582,7 @@ def test_every_depth_shares_one_permutation():
 
 
 def test_the_ordered_arm_draws_no_permutation():
-    shifted = shifted_resnet(segments=8)
+    shifted = shifted_network(segments=8)
 
     set_segments(shifted, 8)
 
@@ -576,7 +600,7 @@ def test_setting_the_clip_length_on_a_network_without_a_shift_does_nothing():
 
 def test_a_reset_scoring_pass_repeats_itself():
     """Successive epochs have to be measured against the same thing."""
-    control = shifted_resnet(segments=4, shuffle=True).eval()
+    control = shifted_network(segments=4, shuffle=True).eval()
     clip = torch.randn(4, 3, 64, 64)
 
     with torch.no_grad():
@@ -590,9 +614,10 @@ def test_a_reset_scoring_pass_repeats_itself():
     assert torch.allclose(first, again)
 
 
-def test_the_shift_makes_a_frame_depend_on_the_frames_beside_it():
+@pytest.mark.parametrize("backbone", sorted(TORCHVISION_BACKBONES))
+def test_the_shift_makes_a_frame_depend_on_the_frames_beside_it(backbone):
     """The line the order-blind baseline cannot cross, by construction."""
-    shifted = shifted_resnet(segments=4).eval()
+    shifted = shifted_network(backbone, segments=4).eval()
     clip = torch.randn(4, 3, 64, 64)
 
     with torch.no_grad():
@@ -600,27 +625,29 @@ def test_the_shift_makes_a_frame_depend_on_the_frames_beside_it():
         scored = shifted(clip)
         reordered = shifted(clip[torch.tensor([2, 1, 3, 0])])
 
-    assert not torch.allclose(scored[2], reordered[0], atol=1e-5)
+    assert not same(scored[2], reordered[0])
 
 
-def streaming_resnet(weights=None):
-    """A ResNet18 carrying the online shift, optionally with given weights."""
-    network = resnet18(weights=None)
+def streaming_network(backbone="resnet18", weights=None):
+    """A network carrying the online shift, optionally with given weights."""
+    builder, _ = TORCHVISION_BACKBONES[backbone]
+    network = builder(weights=None)
     if weights is not None:
         # The offline network records how it was shifted; a stream has no clip
         # length or permutation to record, so those three entries are left out.
         network.load_state_dict(
             {k: v for k, v in weights.items() if k not in model_module.MARKER_KEYS}
         )
-    stream_temporal_shift(network, "resnet18")
+    stream_temporal_shift(network, backbone)
 
     return network
 
 
-def test_a_stream_reproduces_the_causal_clip_frame_for_frame():
+@pytest.mark.parametrize("backbone", sorted(TORCHVISION_BACKBONES))
+def test_a_stream_reproduces_the_causal_clip_frame_for_frame(backbone):
     """Online keeps what offline has in memory, so over one clip the two agree."""
-    offline = shifted_resnet(segments=4, causal=True).eval()
-    online = streaming_resnet(offline.state_dict()).eval()
+    offline = shifted_network(backbone, segments=4, causal=True).eval()
+    online = streaming_network(backbone, offline.state_dict()).eval()
     clip = torch.randn(4, 3, 64, 64)
 
     with torch.no_grad():
@@ -628,12 +655,13 @@ def test_a_stream_reproduces_the_causal_clip_frame_for_frame():
         whole = offline(clip)
         streamed = torch.cat([online(clip[index : index + 1]) for index in range(4)])
 
-    assert torch.allclose(whole, streamed, atol=1e-5)
+    assert same(whole, streamed)
 
 
-def test_a_stream_reads_the_past_and_not_only_the_present():
+@pytest.mark.parametrize("backbone", sorted(TORCHVISION_BACKBONES))
+def test_a_stream_reads_the_past_and_not_only_the_present(backbone):
     """Without the kept slice the second frame would score as if it came first."""
-    online = streaming_resnet().eval()
+    online = streaming_network(backbone).eval()
     first, second = torch.randn(1, 3, 64, 64), torch.randn(1, 3, 64, 64)
 
     with torch.no_grad():
@@ -642,11 +670,11 @@ def test_a_stream_reads_the_past_and_not_only_the_present():
         online(first)
         after_first = online(second)
 
-    assert not torch.allclose(alone, after_first, atol=1e-5)
+    assert not same(alone, after_first)
 
 
 def test_a_reset_stream_starts_over():
-    online = streaming_resnet().eval()
+    online = streaming_network().eval()
     frame = torch.randn(1, 3, 64, 64)
 
     with torch.no_grad():
@@ -659,14 +687,14 @@ def test_a_reset_stream_starts_over():
 
 
 def test_a_stream_refuses_several_frames_at_once():
-    online = streaming_resnet().eval()
+    online = streaming_network().eval()
 
     with torch.no_grad(), pytest.raises(RuntimeError, match="one frame per call"):
         online(torch.randn(2, 3, 64, 64))
 
 
 def test_a_batch_that_is_not_whole_clips_is_refused():
-    shifted = shifted_resnet(segments=8).eval()
+    shifted = shifted_network(segments=8).eval()
 
     set_segments(shifted, 8)
     with pytest.raises(RuntimeError, match="do not divide into clips"):
@@ -687,11 +715,10 @@ def test_a_fold_that_rounds_down_to_nothing_is_refused():
         shift(nn.Identity(), (torch.randn(2, 8, 4, 4),))
 
 
-@pytest.mark.parametrize("backbone", ["mobilenet_v3_small", "efficientnet_b0"])
-def test_a_backbone_with_no_residual_branch_is_refused(backbone):
-    """The shift has to leave the identity path carrying the frame's own features."""
+def test_a_backbone_this_project_does_not_build_is_refused():
+    """Where its residual branches begin is not something the shift can guess."""
     with pytest.raises(ValueError, match="cannot shift inside"):
-        insert_temporal_shift(resnet18(weights=None), backbone, segments=8)
+        insert_temporal_shift(resnet18(weights=None), "vgg11", segments=8)
 
 
 def test_the_causal_shift_takes_from_the_past_and_nothing_from_ahead():
@@ -719,9 +746,10 @@ def test_one_direction_moves_the_share_of_one_direction():
         assert int((moved[1, :, 0, 0] == 1.0).sum()) == int(64 * share)
 
 
-def test_a_causal_frame_does_not_depend_on_any_frame_after_it():
+@pytest.mark.parametrize("backbone", sorted(TORCHVISION_BACKBONES))
+def test_a_causal_frame_does_not_depend_on_any_frame_after_it(backbone):
     """The property the arm exists for: it is what restores the latency claim."""
-    model = shifted_resnet(segments=4, causal=True).eval()
+    model = shifted_network(backbone, segments=4, causal=True).eval()
     clip = torch.randn(4, 3, 64, 64)
     altered = clip.clone()
     altered[3] = torch.randn(3, 64, 64)
@@ -733,7 +761,7 @@ def test_a_causal_frame_does_not_depend_on_any_frame_after_it():
         after = model(altered)
 
     for frame in range(3):
-        assert torch.allclose(before[frame], after[frame], atol=1e-6)
+        assert same(before[frame], after[frame])
 
 
 def test_the_two_directional_shift_reaches_back_through_every_depth():
@@ -743,7 +771,7 @@ def test_the_two_directional_shift_reaches_back_through_every_depth():
     it can be decided. That is the cost the causal arm removes, and it is larger
     than one frame of lookahead.
     """
-    model = shifted_resnet(segments=4).eval()
+    model = shifted_network(segments=4).eval()
     clip = torch.randn(4, 3, 64, 64)
     altered = clip.clone()
     altered[3] = torch.randn(3, 64, 64)
@@ -758,15 +786,15 @@ def test_the_two_directional_shift_reaches_back_through_every_depth():
 
 
 def test_a_checkpoint_says_whether_it_can_run_online():
-    assert shift_causal(shifted_resnet(segments=8, causal=True).state_dict()) is True
-    assert shift_causal(shifted_resnet(segments=8).state_dict()) is False
+    assert shift_causal(shifted_network(segments=8, causal=True).state_dict()) is True
+    assert shift_causal(shifted_network(segments=8).state_dict()) is False
     assert shift_causal(resnet18(weights=None).state_dict()) is False
-    assert CAUSAL_KEY in shifted_resnet(segments=8).state_dict()
+    assert CAUSAL_KEY in shifted_network(segments=8).state_dict()
 
 
 def test_the_causal_shift_costs_no_parameter_either():
     plain = resnet18(weights=None)
-    causal = shifted_resnet(segments=8, causal=True)
+    causal = shifted_network(segments=8, causal=True)
 
     assert sum(p.numel() for p in plain.parameters()) == sum(
         p.numel() for p in causal.parameters()
@@ -775,7 +803,7 @@ def test_the_causal_shift_costs_no_parameter_either():
 
 def test_a_checkpoint_written_before_a_marker_existed_still_loads():
     """The markers grew over time; a run that predates one is not wrong."""
-    model = shifted_resnet(segments=8)
+    model = shifted_network(segments=8)
     weights = {
         key: value
         for key, value in model.state_dict().items()
@@ -791,7 +819,7 @@ def test_a_checkpoint_written_before_a_marker_existed_still_loads():
 
 def test_a_real_mismatch_still_fails_loudly():
     """Filling a marker is not permission to absorb a wrong architecture."""
-    model = shifted_resnet(segments=8)
+    model = shifted_network(segments=8)
     weights = dict(model.state_dict())
     weights["fc.weight"] = torch.randn(3, 512)
     weights["fc.bias"] = torch.randn(3)
