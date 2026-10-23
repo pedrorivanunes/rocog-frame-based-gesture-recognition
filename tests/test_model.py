@@ -299,6 +299,47 @@ def test_the_head_width_comes_from_the_file_rather_than_a_default(offline_backbo
     assert (head_width(seven), head_width(eight)) == (7, 8)
 
 
+@pytest.fixture
+def requested_weights(monkeypatch):
+    """Record which weights each torchvision builder is asked for, fetching none."""
+    requested = []
+
+    def recording(builder):
+        def build(weights):
+            requested.append(weights)
+            return builder(weights=None)
+
+        return build
+
+    monkeypatch.setattr(
+        model_module,
+        "TORCHVISION_BACKBONES",
+        {
+            name: (recording(builder), published)
+            for name, (builder, published) in TORCHVISION_BACKBONES.items()
+        },
+    )
+    return requested
+
+
+@pytest.mark.parametrize("backbone", sorted(TORCHVISION_BACKBONES))
+def test_a_network_about_to_be_overwritten_asks_for_no_weights(
+    requested_weights, backbone
+):
+    """Loading a checkpoint replaces every weight, so fetching first is a download."""
+    build_model(8, backbone, pretrained=False)
+
+    assert requested_weights == [None]
+
+
+@pytest.mark.parametrize("backbone", sorted(TORCHVISION_BACKBONES))
+def test_training_still_starts_from_the_published_weights(requested_weights, backbone):
+    """The default has to reproduce every run trained before the option existed."""
+    build_model(8, backbone)
+
+    assert requested_weights == [TORCHVISION_BACKBONES[backbone][1]]
+
+
 def test_a_checkpoint_naming_no_head_this_project_builds_is_refused():
     """Silence here would build the wrong network and score it anyway."""
     with pytest.raises(ValueError, match="names no head"):

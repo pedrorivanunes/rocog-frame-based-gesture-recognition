@@ -124,6 +124,7 @@ def build_model(
     num_classes: int = NUM_CLASSES,
     backbone: str = DEFAULT_BACKBONE,
     in_channels: int = 3,
+    pretrained: bool = True,
 ) -> nn.Module:
     """Build a ResNet18 with ImageNet weights and a fresh classification head.
 
@@ -144,6 +145,12 @@ def build_model(
             as published; more is a run that hands the network something
             alongside it, and the extra weights start at zero so that the model
             begins as the unmodified one. See ``widen_stem``.
+        pretrained: Start from ImageNet's weights. Training needs them. A
+            network about to be overwritten by a checkpoint does not, and
+            asking for them anyway reaches the network on any machine that has
+            not cached them, which a program meant to score models offline
+            cannot afford. Every weight is replaced on loading either way, so
+            the two builds score identically.
 
     Returns:
         The network, on the CPU. Moving it to a device is the caller's job.
@@ -156,13 +163,13 @@ def build_model(
 
     if backbone in TORCHVISION_BACKBONES:
         builder, published = TORCHVISION_BACKBONES[backbone]
-        model = builder(weights=published)
+        model = builder(weights=published if pretrained else None)
     else:
         with _weights_landing_on_the_cpu():
             model = torch.hub.load(
                 IBN_HUB_REPOSITORY,
                 backbone,
-                pretrained=True,
+                pretrained=pretrained,
                 trust_repo=True,
                 verbose=False,
             )
