@@ -8,6 +8,8 @@ from model import (
     BACKBONES,
     CAUSAL_KEY,
     DEFAULT_BACKBONE,
+    FOLD_DIVISOR,
+    FOLD_KEY,
     FROZEN_STAGES,
     HEAD_PATHS,
     NORMALISATION_LAYERS,
@@ -26,6 +28,7 @@ from model import (
     reset_stream,
     set_segments,
     shift_causal,
+    shift_fold_divisor,
     shift_segments,
     shift_shuffled,
     stem_width,
@@ -541,13 +544,15 @@ def test_the_shift_costs_no_parameter_and_renames_no_weight(backbone):
     assert sum(p.numel() for p in plain.parameters()) == sum(
         p.numel() for p in shifted.parameters()
     )
-    # The three recorded markers, and nothing else: how long a clip was, whether
-    # the order was destroyed, and whether it read only the past. Each is read
-    # back by scoring, which is why they travel in the file at all.
+    # The four recorded markers, and nothing else: how long a clip was, whether
+    # the order was destroyed, whether it read only the past, and what share of
+    # the channels moved. Each is read back by scoring, which is why they travel
+    # in the file at all.
     assert set(shifted.state_dict()) - set(plain.state_dict()) == {
         SEGMENTS_KEY,
         SHUFFLE_KEY,
         CAUSAL_KEY,
+        FOLD_KEY,
     }
     assert not set(plain.state_dict()) - set(shifted.state_dict())
 
@@ -561,6 +566,25 @@ def test_a_checkpoint_says_how_it_was_shifted():
     assert shift_shuffled(ordered) is False
     assert shift_segments(control) == 4
     assert shift_shuffled(control) is True
+
+
+def test_a_checkpoint_says_what_share_of_its_channels_moved():
+    wide = shifted_network(segments=8, fold_divisor=4, causal=True).state_dict()
+
+    assert shift_fold_divisor(wide) == 4
+    assert shift_fold_divisor(shifted_network(segments=8).state_dict()) == 8
+
+
+def test_a_checkpoint_written_before_the_share_was_recorded_reads_the_default():
+    """Right for every such run but one that changed it, hence the marker."""
+    model = shifted_network(segments=8)
+    weights = {
+        key: value for key, value in model.state_dict().items() if key != FOLD_KEY
+    }
+
+    assert shift_fold_divisor(weights) == FOLD_DIVISOR
+    load_shifted(model, weights)
+    assert shift_fold_divisor(model.state_dict()) == FOLD_DIVISOR
 
 
 def test_a_checkpoint_written_before_the_shift_says_so_rather_than_failing():

@@ -366,6 +366,8 @@ class Scorer(NamedTuple):
         recorded_segments: The clip length it was trained at, or ``None``.
         arm: Which shift it carries, ``"ordered"``, ``"shuffled"`` or
             ``"causal"``, or ``None`` without one.
+        fold_divisor: The share of channels each shift moves, as the divisor
+            the run trained with, or ``None`` without a shift.
     """
 
     model: nn.Module
@@ -375,6 +377,7 @@ class Scorer(NamedTuple):
     segments: int | None
     recorded_segments: int | None
     arm: str | None
+    fold_divisor: int | None
 
 
 def load_scorer(
@@ -414,6 +417,7 @@ def load_scorer(
         insert_temporal_shift,
         load_shifted,
         shift_causal,
+        shift_fold_divisor,
         shift_segments,
         shift_shuffled,
         stem_width,
@@ -430,12 +434,14 @@ def load_scorer(
     segments = None if recorded is None else (clips or recorded)
     if segments is None:
         model.load_state_dict(weights)
-        return Scorer(model, num_classes, backbone, in_channels, None, None, None)
+        return Scorer(model, num_classes, backbone, in_channels, None, None, None, None)
 
+    fold_divisor = shift_fold_divisor(weights)
     insert_temporal_shift(
         model,
         backbone,
         segments=segments,
+        fold_divisor=fold_divisor,
         shuffle=shift_shuffled(weights),
         causal=shift_causal(weights),
     )
@@ -450,7 +456,9 @@ def load_scorer(
     else:
         arm = "ordered"
 
-    return Scorer(model, num_classes, backbone, in_channels, segments, recorded, arm)
+    return Scorer(
+        model, num_classes, backbone, in_channels, segments, recorded, arm, fold_divisor
+    )
 
 
 def with_neighbour_frames(
@@ -691,8 +699,10 @@ if __name__ == "__main__":
         print(f"backbone: {scorer.backbone}")
     if segments is not None:
         recorded = scorer.recorded_segments
+        direction = "from the past" if scorer.arm == "causal" else "each way"
         print(
-            f"temporal shift: {scorer.arm}, clips of {segments}"
+            f"temporal shift: {scorer.arm}, clips of {segments}, "
+            f"1/{scorer.fold_divisor} of the channels {direction}"
             + (f"  (trained at {recorded})" if recorded != segments else "")
         )
         # Only an overridden length goes into the name, and the asymmetry is the

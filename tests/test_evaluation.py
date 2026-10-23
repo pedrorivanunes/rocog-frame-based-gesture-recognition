@@ -18,7 +18,7 @@ from evaluation import (
     score_frames,
     with_neighbour_frames,
 )
-from model import build_model, insert_temporal_shift
+from model import build_model, insert_temporal_shift, load_shifted, set_segments
 
 
 def test_parse_args_leaves_the_optional_settings_alone():
@@ -259,6 +259,27 @@ def test_a_shifted_checkpoint_says_which_arm_and_clip_it_was_trained_with(tmp_pa
     assert (as_trained.segments, as_trained.recorded_segments) == (8, 8)
     assert as_trained.arm == "causal"
     assert (shorter.segments, shorter.recorded_segments) == (4, 8)
+
+
+def test_a_shifted_checkpoint_is_rebuilt_moving_the_share_it_trained_with(tmp_path):
+    """A network that learned to read a quarter answers differently given an eighth."""
+    trained = build_model(7, "resnet18", pretrained=False).eval()
+    insert_temporal_shift(trained, "resnet18", segments=8, fold_divisor=4, causal=True)
+    path = saved(trained, tmp_path / "wide.pt")
+    narrow = build_model(7, "resnet18", pretrained=False).eval()
+    insert_temporal_shift(narrow, "resnet18", segments=8, causal=True)
+    load_shifted(narrow, trained.state_dict())
+
+    scorer = load_scorer(path, torch.device("cpu"))
+
+    clip = torch.randn(8, 3, 64, 64)
+    for network in (trained, narrow, scorer.model.eval()):
+        set_segments(network, 8)
+    with torch.no_grad():
+        expected, rebuilt, misread = trained(clip), scorer.model(clip), narrow(clip)
+    assert scorer.fold_divisor == 4
+    assert torch.allclose(rebuilt, expected, rtol=1e-5, atol=1e-6)
+    assert not torch.allclose(misread, expected, rtol=1e-3, atol=1e-4)
 
 
 def test_a_clip_length_means_nothing_to_a_network_without_a_shift(tmp_path):

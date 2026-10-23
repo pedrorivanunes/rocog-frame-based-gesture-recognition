@@ -391,6 +391,10 @@ FOLD_DIVISOR = 8
 SEGMENTS_KEY = "shift_segments"
 SHUFFLE_KEY = "shift_shuffled"
 CAUSAL_KEY = "shift_causal"
+# The share of channels moved joined them late. It could be changed from the
+# first shifted run, and until it was recorded a run that changed it was
+# rebuilt with the default.
+FOLD_KEY = "shift_fold_divisor"
 
 # Draws the control's permutations. Fixed rather than tied to the run's seed,
 # and reset before every scoring pass, because successive epochs have to be
@@ -590,7 +594,9 @@ def insert_temporal_shift(
             same reason every other edit here takes it.
         segments: Frames per clip the run trains on. Recorded, not enforced:
             the shift reads the length of the batch in front of it.
-        fold_divisor: Passed to each shift.
+        fold_divisor: Passed to each shift, and recorded with the rest: a
+            network that learned to read a quarter of its channels from its
+            neighbours answers differently when it is handed an eighth.
         shuffle: Destroys which frames are adjacent, leaving everything else
             in place. This is the control that isolates order.
         causal: Takes channels from the past only, so that no decision waits on
@@ -612,6 +618,7 @@ def insert_temporal_shift(
     model.register_buffer(SEGMENTS_KEY, torch.tensor(segments))
     model.register_buffer(SHUFFLE_KEY, torch.tensor(shuffle))
     model.register_buffer(CAUSAL_KEY, torch.tensor(causal))
+    model.register_buffer(FOLD_KEY, torch.tensor(fold_divisor))
     model.temporal_shifts = shifts
     model.shift_generator = torch.Generator().manual_seed(SHUFFLE_SEED)
     return shifts
@@ -795,7 +802,7 @@ def shift_segments(weights: Mapping[str, object]) -> int | None:
 
 # The markers, as one list. Named once because two things read it: what gets
 # registered on a model, and what a load is allowed to fill in.
-MARKER_KEYS = (SEGMENTS_KEY, SHUFFLE_KEY, CAUSAL_KEY)
+MARKER_KEYS = (SEGMENTS_KEY, SHUFFLE_KEY, CAUSAL_KEY, FOLD_KEY)
 
 
 def load_shifted(model: nn.Module, weights: Mapping[str, object]) -> None:
@@ -803,17 +810,24 @@ def load_shifted(model: nn.Module, weights: Mapping[str, object]) -> None:
 
     The markers are the one part of a shifted network's state that this project
     adds to over time: the clip length came first, then whether the order was
-    destroyed, then whether only the past was read. A checkpoint written before
-    one of them existed is not wrong — it is a run that did not have the choice
-    — but a strict load refuses it for a missing key, and that refusal arrives
-    after the manifest and the model are already in memory.
+    destroyed, then whether only the past was read, then what share of the
+    channels moved. A checkpoint written before one of them existed is not
+    wrong — it is a run that did not have the choice — but a strict load
+    refuses it for a missing key, and that refusal arrives after the manifest
+    and the model are already in memory.
 
     Filling a missing marker from the network's own buffer is correct rather
     than permissive, because the network was built from this same file: the
-    readers return the default for a marker that is absent, and the default is
-    what the run actually did. Everything that is not a marker stays strict, so
-    a real mismatch — a head of the wrong width, a stem of the wrong depth —
-    still fails as loudly as before.
+    readers return the default for a marker that is absent, and for the three
+    that describe the arrangement the default is what the run actually did,
+    since each was recorded from the day its option existed. The share of
+    channels is the exception. It could be changed before it was recorded, so
+    a file without it reads as the default, and a run that changed it is
+    misread unless the marker is written into its file.
+
+    Everything that is not a marker stays strict, so a real mismatch — a head
+    of the wrong width, a stem of the wrong depth — still fails as loudly as
+    before.
 
     Args:
         model: The network to load into, with its shift already inserted.
@@ -853,6 +867,21 @@ def shift_shuffled(weights: Mapping[str, object]) -> bool:
     """
     recorded = weights.get(SHUFFLE_KEY)
     return False if recorded is None else bool(recorded)
+
+
+def shift_fold_divisor(weights: Mapping[str, object]) -> int:
+    """What share of its channels a checkpoint's shift moved, as the divisor.
+
+    Args:
+        weights: A state dictionary, as ``torch.load`` returns it.
+
+    Returns:
+        The divisor the run recorded, or the default for a file written before
+        it was recorded. The default is right for every such file except one
+        whose run changed it, which is why the marker now travels with the rest.
+    """
+    recorded = weights.get(FOLD_KEY)
+    return FOLD_DIVISOR if recorded is None else int(recorded)
 
 
 # How far into the network a run holds the pretrained weights. Named in stages
