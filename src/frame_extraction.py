@@ -307,6 +307,45 @@ def extract_frames(
     return frames
 
 
+def extract_frames_at(video_path: Path, frame_numbers: list[int]) -> list[SampledFrame]:
+    """Read frames already chosen, placed in the gesture window as sampled ones are.
+
+    The counterpart to ``extract_frames`` for a video whose frames were chosen
+    before. The dataset's manifests record the frames every reported figure was
+    computed on, and repeating the draw does not land on them: the generator
+    was seeded differently when the first manifests were written. So the record,
+    not the sampler, says which frames those were, and reading them back is
+    what lets a model be scored on exactly the images it was measured on.
+
+    Unlike ``read_frames_at``, which serves companion videos that have no
+    window of their own, each frame comes back with its position in the
+    gesture, computed as extraction computes it.
+
+    Args:
+        video_path: Path to the ``.mp4`` to read.
+        frame_numbers: Indices to read, in the order wanted. Duplicates are
+            returned once each, as short clips round two segments onto one frame.
+
+    Returns:
+        One ``SampledFrame`` per number, in the order given.
+
+    Raises:
+        RuntimeError: If the video cannot be opened, its gesture has no length,
+            or a frame cannot be read.
+    """
+    video, gesture_start_frame, gesture_end_frame = _open_at_gesture(video_path)
+    try:
+        return _read_at(
+            video,
+            video_path,
+            np.asarray(frame_numbers),
+            gesture_start_frame,
+            gesture_end_frame,
+        )
+    finally:
+        video.release()
+
+
 def _read_range(
     video: cv2.VideoCapture,
     video_path: Path,

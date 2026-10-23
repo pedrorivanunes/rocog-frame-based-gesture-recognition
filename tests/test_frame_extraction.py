@@ -8,6 +8,7 @@ from frame_extraction import (
     extract_all_frames,
     extract_all_idle_frames,
     extract_frames,
+    extract_frames_at,
     extract_idle_frames,
     gesture_window,
     read_frames_at,
@@ -236,6 +237,30 @@ def test_a_window_of_no_length_is_rejected(tmp_path):
 def test_extract_frames_rejects_a_missing_video(tmp_path):
     with pytest.raises(RuntimeError, match="could not open"):
         extract_frames(tmp_path / "absent.avi", 6, np.random.default_rng(0))
+
+
+def test_frames_already_chosen_come_back_as_the_ones_named(annotated):
+    """A record whose image came from elsewhere is wrong past any later check."""
+    frames = extract_frames_at(annotated, [9, 30, 52])
+
+    assert [frame.frame_number for frame in frames] == [9, 30, 52]
+    assert [int(frame.frame[0, 0, 0]) for frame in frames] == [36, 120, 208]
+
+
+def test_frames_already_chosen_are_placed_in_the_window_as_sampled_ones_are(annotated):
+    """Same formula as extraction, so a re-read row matches its recorded one."""
+    drawn = extract_frames(annotated, 6, np.random.default_rng(0))
+
+    again = extract_frames_at(annotated, [frame.frame_number for frame in drawn])
+
+    assert [frame.position for frame in again] == [frame.position for frame in drawn]
+
+
+def test_a_frame_named_twice_is_returned_twice(annotated):
+    """Short clips round two segments onto one frame, and the record keeps both."""
+    frames = extract_frames_at(annotated, [20, 20])
+
+    assert [frame.frame_number for frame in frames] == [20, 20]
 
 
 def test_the_frames_a_seed_draws_are_pinned(annotated):
