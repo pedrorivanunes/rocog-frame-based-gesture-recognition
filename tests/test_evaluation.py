@@ -1,12 +1,24 @@
 from pathlib import Path
 
+import cv2
+import numpy as np
 import pandas as pd
 import pytest
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from evaluation import frame_metrics, parse_args, predict, probability_table
+from evaluation import (
+    frame_metrics,
+    load_scorer,
+    manifest_places,
+    parse_args,
+    predict,
+    probability_table,
+    score_frames,
+    with_neighbour_frames,
+)
+from model import build_model, insert_temporal_shift
 
 
 def test_parse_args_leaves_the_optional_settings_alone():
@@ -211,3 +223,154 @@ def test_predict_does_not_hold_on_to_the_batches_it_was_served():
     predict(_Flat(), loader(), torch.device("cpu"))
 
     assert still_held and not any(still_held)
+
+
+def saved(model: nn.Module, path: Path) -> Path:
+    """Write a network's state as training does, and hand back where."""
+    torch.save(model.state_dict(), path)
+    return path
+
+
+def test_a_checkpoint_rebuilds_into_the_network_that_wrote_it(tmp_path):
+    """Head, backbone and stem are read off the file, then every weight."""
+    trained = build_model(8, "mobilenet_v3_small", 6, pretrained=False).eval()
+    path = saved(trained, tmp_path / "trained.pt")
+
+    scorer = load_scorer(path, torch.device("cpu"))
+
+    frames = torch.randn(2, 6, 224, 224)
+    assert (scorer.num_classes, scorer.backbone, scorer.in_channels) == (
+        8,
+        "mobilenet_v3_small",
+        6,
+    )
+    assert (scorer.segments, scorer.recorded_segments, scorer.arm) == (None,) * 3
+    assert torch.equal(scorer.model.eval()(frames), trained(frames))
+
+
+def test_a_shifted_checkpoint_says_which_arm_and_clip_it_was_trained_with(tmp_path):
+    trained = build_model(7, "resnet18", pretrained=False)
+    insert_temporal_shift(trained, "resnet18", segments=8, shuffle=False, causal=True)
+    path = saved(trained, tmp_path / "causal.pt")
+
+    as_trained = load_scorer(path, torch.device("cpu"))
+    shorter = load_scorer(path, torch.device("cpu"), clips=4)
+
+    assert (as_trained.segments, as_trained.recorded_segments) == (8, 8)
+    assert as_trained.arm == "causal"
+    assert (shorter.segments, shorter.recorded_segments) == (4, 8)
+
+
+def test_a_clip_length_means_nothing_to_a_network_without_a_shift(tmp_path):
+    """Its prediction for a frame does not depend on what arrived beside it."""
+    plain = build_model(7, "mobilenet_v3_small", pretrained=False)
+    path = saved(plain, tmp_path / "plain.pt")
+
+    assert load_scorer(path, torch.device("cpu"), clips=4).segments is None
+
+
+def scored_and_dense():
+    """Two scored frames of one video, and the dense window they sit in."""
+    dense = pd.DataFrame(
+        {
+            "video_id": ["v"] * 6,
+            "frame_number": [10, 11, 12, 13, 14, 15],
+            "path": [f"v_f{number}.jpg" for number in range(10, 16)],
+        }
+    )
+    scored = dense[dense["frame_number"].isin([12, 15])].reset_index(drop=True)
+    return scored, dense
+
+
+def test_a_checkpoint_reading_only_the_frame_is_scored_on_the_rows_as_they_are():
+    scored, dense = scored_and_dense()
+
+    assert with_neighbour_frames(scored, 3, [5], dense=dense) is scored
+
+
+def test_each_spacing_names_the_frame_that_far_back_within_the_window():
+    """Frame 12 has no frame three back inside the window, so it takes the first."""
+    scored, dense = scored_and_dense()
+
+    named = with_neighbour_frames(scored, 9, [1, 3], dense=dense)
+
+    assert named["neighbour_path"].tolist() == ["v_f11.jpg", "v_f14.jpg"]
+    assert named["neighbour_path_1"].tolist() == ["v_f10.jpg", "v_f12.jpg"]
+
+
+def test_the_anchor_differences_each_frame_against_the_one_scored_before_it():
+    scored, _ = scored_and_dense()
+
+    named = with_neighbour_frames(scored, 6, anchor=True)
+
+    assert named["neighbour_path"].tolist() == ["v_f12.jpg", "v_f12.jpg"]
+
+
+def test_a_checkpoint_reading_differences_has_to_be_told_where_they_came_from():
+    scored, dense = scored_and_dense()
+
+    with pytest.raises(ValueError, match="as spacings or as the anchor"):
+        with_neighbour_frames(scored, 6, None, dense=dense)
+
+
+def test_spacings_the_stem_was_not_widened_for_are_refused():
+    """Left to the network, this would be a shape error after every frame loaded."""
+    scored, dense = scored_and_dense()
+
+    with pytest.raises(ValueError, match="trained on 1 spacing"):
+        with_neighbour_frames(scored, 6, [2, 5], dense=dense)
+
+
+def test_a_pass_served_in_order_has_nothing_to_put_back():
+    scored, _ = scored_and_dense()
+
+    assert manifest_places(scored, None) is None
+
+
+def test_a_pass_served_in_clips_is_put_back_by_a_permutation():
+    """Every frame is served once, so undoing the order loses none of them."""
+    rows = pd.DataFrame(
+        {"video_id": ["a"] * 8 + ["b"] * 8, "frame_number": list(range(8)) * 2}
+    )
+
+    places = manifest_places(rows, 4)
+
+    assert sorted(places) == list(range(16))
+
+
+class MeanBrightness(nn.Module):
+    """Scores every class by how bright the frame is, so order can be read back."""
+
+    def forward(self, frames):
+        return frames.mean(dim=(1, 2, 3)).unsqueeze(1).repeat(1, 7)
+
+
+def test_scores_come_back_in_the_order_the_manifest_lists_its_frames(tmp_path):
+    """Brightness rises down the manifest, so the scores must rise with it."""
+    rows = []
+    for video, label in (("a", 0), ("b", 1)):
+        for index in range(3):
+            path = Path("frames") / f"{video}_{index}.jpg"
+            (tmp_path / path).parent.mkdir(exist_ok=True)
+            shade = 40 * index + (120 if video == "b" else 0)
+            cv2.imwrite(str(tmp_path / path), np.full((256, 256, 3), shade, np.uint8))
+            rows.append(
+                {
+                    "video_id": video,
+                    "frame_number": index,
+                    "label": label,
+                    "path": str(path),
+                }
+            )
+
+    logits, labels, video_ids = score_frames(
+        MeanBrightness(),
+        pd.DataFrame(rows),
+        torch.device("cpu"),
+        root=tmp_path,
+        num_workers=0,
+    )
+
+    assert video_ids == ["a"] * 3 + ["b"] * 3
+    assert labels.tolist() == [0, 0, 0, 1, 1, 1]
+    assert logits[:, 0].tolist() == sorted(logits[:, 0].tolist())

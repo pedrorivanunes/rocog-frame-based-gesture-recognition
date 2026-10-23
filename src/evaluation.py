@@ -9,7 +9,9 @@ figure is what lets the expensive half run once and the cheap half run often.
 """
 
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -349,13 +351,63 @@ def probability_table(
     return table
 
 
-if __name__ == "__main__":
-    from dataset import FrameDataset, clip_batches, eval_transform, restore_order
-    from device import describe, pick_device
-    from manifest import dense_name_for, load_class_names, with_idle_class
+class Scorer(NamedTuple):
+    """A trained network rebuilt from its checkpoint, and what the file said of it.
+
+    Attributes:
+        model: The network, on the device it will score on, weights loaded.
+        num_classes: Width of its head. A run trained with the idle class has
+            one output more than the dataset has gesture names.
+        backbone: Which architecture wrote the file.
+        in_channels: Channels its first convolution reads. More than three is a
+            run that was handed differences beside each frame.
+        segments: Frames per clip it scores at, for a network carrying a
+            temporal shift; ``None`` for one that reads each frame alone.
+        recorded_segments: The clip length it was trained at, or ``None``.
+        arm: Which shift it carries, ``"ordered"``, ``"shuffled"`` or
+            ``"causal"``, or ``None`` without one.
+    """
+
+    model: nn.Module
+    num_classes: int
+    backbone: str
+    in_channels: int
+    segments: int | None
+    recorded_segments: int | None
+    arm: str | None
+
+
+def load_scorer(
+    checkpoint: Path, device: torch.device, clips: int | None = None
+) -> Scorer:
+    """Rebuild a trained network from its checkpoint, ready to score frames.
+
+    Everything the file can say about the network is read off it rather than
+    asked for: how wide the head is, which backbone wrote it, how many channels
+    the first convolution reads, and whether a temporal shift sits inside. A
+    caller asked to remember any of these would eventually pair the wrong two,
+    and the failure is a shape mismatch at best. A model whose features were
+    learned with neighbours visible predicts differently without them, so
+    scoring one as though it had no shift would report a number for a network
+    that never existed.
+
+    The network is built without ImageNet's weights. Loading replaces every one
+    of them, and fetching them first would only make scoring depend on a
+    network connection.
+
+    Args:
+        checkpoint: The trained weights.
+        device: Where scoring will run. The weights are loaded straight onto it.
+        clips: Clip length to score a shifted network at instead of the one it
+            trained at, which is what an accuracy-against-K curve needs. Ignored
+            for a network without a shift: its prediction for a frame does not
+            depend on what arrived beside it, and inserting a shift a run never
+            trained with would score a network that never existed.
+
+    Returns:
+        The network with what the file said about it.
+    """
     from model import (
-        DEFAULT_BACKBONE,
-        adapt_batchnorm,
         backbone_of,
         build_model,
         head_width,
@@ -366,12 +418,212 @@ if __name__ == "__main__":
         shift_shuffled,
         stem_width,
     )
-    from splits import (
-        keep_views,
-        split_by_scene,
-        with_neighbours,
-        with_previous_anchor,
+
+    weights = torch.load(checkpoint, map_location=device)
+    num_classes = head_width(weights)
+    backbone = backbone_of(weights)
+    in_channels = stem_width(weights)
+    model = build_model(num_classes, backbone, in_channels, pretrained=False)
+    model = model.to(device)
+
+    recorded = shift_segments(weights)
+    segments = None if recorded is None else (clips or recorded)
+    if segments is None:
+        model.load_state_dict(weights)
+        return Scorer(model, num_classes, backbone, in_channels, None, None, None)
+
+    insert_temporal_shift(
+        model,
+        backbone,
+        segments=segments,
+        shuffle=shift_shuffled(weights),
+        causal=shift_causal(weights),
     )
+    # Tolerant only about the markers, and only because this network was built
+    # from this file: a checkpoint written before a marker existed would
+    # otherwise be refused for lacking it.
+    load_shifted(model, weights)
+    if shift_shuffled(weights):
+        arm = "shuffled"
+    elif shift_causal(weights):
+        arm = "causal"
+    else:
+        arm = "ordered"
+
+    return Scorer(model, num_classes, backbone, in_channels, segments, recorded, arm)
+
+
+def with_neighbour_frames(
+    manifest: pd.DataFrame,
+    in_channels: int,
+    strides: Sequence[int] | None = None,
+    anchor: bool = False,
+    dense: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Name the frames a checkpoint that reads differences takes them against.
+
+    A plain state dict records how many channels its first convolution reads
+    and nothing about where the extra ones came from, so the caller has to say.
+    Saying something the file contradicts is refused here rather than left to
+    the shape error, which arrives after the manifest, the dense pass and the
+    model are all loaded.
+
+    Args:
+        manifest: The rows to score.
+        in_channels: Channels the checkpoint's first convolution reads.
+        strides: How many frames back each neighbour sits, one per spacing the
+            checkpoint was trained on.
+        anchor: Difference each frame against the one scored before it rather
+            than against one a fixed distance back. Must match how the
+            checkpoint was trained.
+        dense: Every frame of each window, where the neighbours a fixed
+            distance back are looked up.
+
+    Returns:
+        The manifest itself for a checkpoint reading three channels, and the
+        manifest with its neighbour columns otherwise.
+
+    Raises:
+        ValueError: If a checkpoint reading differences is given no source for
+            them, or a number of spacings its stem was not widened for.
+    """
+    from splits import with_neighbours, with_previous_anchor
+
+    if in_channels <= 3:
+        return manifest
+    if anchor:
+        return with_previous_anchor(manifest)
+    if not strides:
+        raise ValueError(
+            f"it reads {in_channels} channels; say which frames the extra ones "
+            "came from, as spacings or as the anchor"
+        )
+    # The count has to match what the stem was widened to, or the batch and the
+    # network disagree on how many channels a frame has.
+    if 3 * (1 + len(strides)) != in_channels:
+        raise ValueError(
+            f"it reads {in_channels} channels, so it was trained on "
+            f"{in_channels // 3 - 1} spacing(s); {len(strides)} were given"
+        )
+
+    return with_neighbours(manifest, strides, dense)
+
+
+def frame_loader(
+    manifest: pd.DataFrame,
+    root: Path = PROJECT_ROOT,
+    crop_size: int = CROP_SIZE,
+    difference_gain: float = 1.0,
+    segments: int | None = None,
+    num_workers: int = NUM_WORKERS,
+) -> DataLoader:
+    """Serve a manifest's frames exactly as scoring will meet them.
+
+    Used for an adaptation pass as well as for scoring, and that is the point:
+    statistics estimated from augmented frames would describe images the model
+    never sees at evaluation.
+
+    Args:
+        manifest: The rows to serve, with any neighbour columns already named.
+        root: Directory the manifest's paths are relative to.
+        crop_size: Side the central crop takes. Has to be the one the checkpoint
+            was trained with.
+        difference_gain: Multiplies each difference channel, matching what the
+            checkpoint was trained with.
+        segments: Frames per clip, for a network carrying a shift. Its batches
+            are then whole clips taken in order through each window.
+        num_workers: DataLoader subprocesses.
+
+    Returns:
+        A loader that serves frames, labels and video ids.
+    """
+    from dataset import FrameDataset, clip_batches, eval_transform
+
+    dataset = FrameDataset(
+        manifest, root, eval_transform(crop_size), difference_gain=difference_gain
+    )
+    if segments is not None:
+        return DataLoader(
+            dataset,
+            batch_sampler=clip_batches(manifest, segments, BATCH_SIZE),
+            num_workers=num_workers,
+        )
+    return DataLoader(
+        dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=num_workers
+    )
+
+
+def manifest_places(manifest: pd.DataFrame, segments: int | None) -> list[int] | None:
+    """Where each row of a window-spanning pass belongs in the manifest.
+
+    Computed from the sampler's construction rather than read off a loader,
+    because a second loader built only to read its sampler is a second thing
+    that can disagree with the first.
+
+    Args:
+        manifest: The rows being served.
+        segments: Frames per clip, or ``None`` for a pass served in order.
+
+    Returns:
+        The served position of each manifest row, or ``None`` when the pass
+        keeps the manifest's order and there is nothing to undo.
+    """
+    from dataset import clip_batches, restore_order
+
+    if segments is None:
+        return None
+    return restore_order(clip_batches(manifest, segments, BATCH_SIZE))
+
+
+def score_frames(
+    model: nn.Module,
+    manifest: pd.DataFrame,
+    device: torch.device,
+    root: Path = PROJECT_ROOT,
+    crop_size: int = CROP_SIZE,
+    difference_gain: float = 1.0,
+    segments: int | None = None,
+    num_workers: int = NUM_WORKERS,
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    """Score every frame a manifest lists, handing the scores back in its order.
+
+    The one call between a rebuilt network and a probability table. Clips that
+    span a window do not arrive in the manifest's order, and moving the three
+    arrays back by the one permutation is what lets the table be built at all:
+    it refuses scores out of that order, and that refusal is the only thing
+    standing between a permuted pass and every probability attached to the
+    wrong frame.
+
+    Args:
+        model: The network, as ``load_scorer`` rebuilt it.
+        manifest: The rows to score, neighbours named where the network reads
+            differences.
+        device: Where the forward pass runs.
+        root: Directory the manifest's paths are relative to.
+        crop_size: Passed to ``frame_loader``.
+        difference_gain: Passed to ``frame_loader``.
+        segments: Frames per clip for a shifted network, ``None`` otherwise.
+        num_workers: DataLoader subprocesses.
+
+    Returns:
+        The logits, labels and video ids, in the manifest's order.
+    """
+    loader = frame_loader(
+        manifest, root, crop_size, difference_gain, segments, num_workers
+    )
+    logits, labels, video_ids = predict(model, loader, device, segments)
+
+    places = manifest_places(manifest, segments)
+    if places is None:
+        return logits, labels, video_ids
+    return logits[places], labels[places], [video_ids[place] for place in places]
+
+
+if __name__ == "__main__":
+    from device import describe, pick_device
+    from manifest import dense_name_for, load_class_names, with_idle_class
+    from model import DEFAULT_BACKBONE, adapt_batchnorm
+    from splits import keep_views, split_by_scene
 
     args = parse_args()
     print(
@@ -402,86 +654,45 @@ if __name__ == "__main__":
     device = pick_device()
     print(f"device: {describe(device)}")
 
-    # How wide the head is belongs to the checkpoint, not to the run scoring it.
+    scorer = load_scorer(args.checkpoint, device, args.clips)
+    model, segments = scorer.model, scorer.segments
     # One trained with the idle class carries an output the dataset's own
-    # vocabulary has no name for, and building the network at the wrong width
-    # fails on a shape mismatch rather than on a wrong number.
-    weights = torch.load(args.checkpoint, map_location=device)
-    num_classes = head_width(weights)
-    if num_classes > len(class_names):
+    # vocabulary has no name for, so the names follow the head.
+    if scorer.num_classes > len(class_names):
         class_names = with_idle_class(class_names)
-    # Which backbone wrote the file is read off the file for the same reason the
-    # head's width is: a caller asked to remember would eventually pair the
-    # wrong two, and the failure is a shape mismatch at best.
-    backbone = backbone_of(weights)
-    in_channels = stem_width(weights)
-    if in_channels > 3:
-        if args.neighbour_stride is None and not args.neighbour_anchor:
-            raise SystemExit(
-                f"{args.checkpoint.name} reads {in_channels} channels; "
-                "--neighbour-stride or --neighbour-anchor says which frame the "
-                "extra ones came from"
-            )
+
+    dense = None
+    if scorer.in_channels > 3 and args.neighbour_stride:
+        dense_name = dense_name_for(args.manifest)
+        dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
+    try:
+        manifest = with_neighbour_frames(
+            manifest,
+            scorer.in_channels,
+            args.neighbour_stride,
+            args.neighbour_anchor,
+            dense,
+        )
+    except ValueError as error:
+        raise SystemExit(
+            f"{args.checkpoint.name}: {error}; see --neighbour-stride and "
+            "--neighbour-anchor"
+        ) from None
+    if scorer.in_channels > 3:
         if args.neighbour_anchor:
-            manifest = with_previous_anchor(manifest)
             print("differencing against the frame scored before it")
         else:
-            dense_name = dense_name_for(args.manifest)
-            dense = pd.read_csv(PROJECT_ROOT / "data/manifests" / dense_name)
-            # The count has to match what the stem was widened to, or the
-            # batch and the network disagree on how many channels a frame has.
-            # Checked here rather than left to the shape error, which arrives
-            # after the manifest, the dense pass and the model are all loaded.
-            expected = 3 * (1 + len(args.neighbour_stride))
-            if expected != in_channels:
-                raise SystemExit(
-                    f"{args.checkpoint.name} reads {in_channels} channels, so "
-                    f"it was trained on {in_channels // 3 - 1} spacing(s); "
-                    f"{len(args.neighbour_stride)} were given"
-                )
-            manifest = with_neighbours(manifest, args.neighbour_stride, dense)
             spacings = " and ".join(str(s) for s in args.neighbour_stride)
             print(f"differencing against the frames {spacings} back")
 
-    model = build_model(num_classes, backbone, in_channels).to(device)
-    # Read off the file for the same reason the head's width and the backbone
-    # are: a model whose features were learned with neighbours visible predicts
-    # differently without them, so scoring one as though it had no shift would
-    # report a number for a network that never existed. Nothing here is a flag
-    # a caller could forget.
-    # The override only applies to a checkpoint that has a shift. Without one a
-    # frame's prediction does not depend on what arrived beside it, so clip
-    # length changes no number, and inserting a shift a run never trained with
-    # would score a network that never existed.
-    recorded = shift_segments(weights)
-    segments = None if recorded is None else (args.clips or recorded)
-    if recorded is None and args.clips:
+    if scorer.recorded_segments is None and args.clips:
         print(f"--clips ignored: {args.checkpoint.name} carries no shift")
+    if scorer.backbone != DEFAULT_BACKBONE:
+        print(f"backbone: {scorer.backbone}")
     if segments is not None:
-        insert_temporal_shift(
-            model,
-            backbone,
-            segments=segments,
-            shuffle=shift_shuffled(weights),
-            causal=shift_causal(weights),
-        )
-        # Tolerant only about the markers, and only because this network was
-        # built from this file: a checkpoint written before a marker existed
-        # would otherwise be refused for lacking it.
-        load_shifted(model, weights)
-    else:
-        model.load_state_dict(weights)
-    if backbone != DEFAULT_BACKBONE:
-        print(f"backbone: {backbone}")
-    if segments is not None:
-        if shift_shuffled(weights):
-            arm = "shuffled"
-        elif shift_causal(weights):
-            arm = "causal"
-        else:
-            arm = "ordered"
+        recorded = scorer.recorded_segments
         print(
-            f"temporal shift: {arm}, clips of {segments}"
+            f"temporal shift: {scorer.arm}, clips of {segments}"
             + (f"  (trained at {recorded})" if recorded != segments else "")
         )
         # Only an overridden length goes into the name, and the asymmetry is the
@@ -493,45 +704,20 @@ if __name__ == "__main__":
         if segments != recorded:
             split_name = f"{split_name}_clips{segments}"
 
-    def frame_loader(rows: pd.DataFrame) -> DataLoader:
-        """Serve a manifest's frames exactly as scoring will meet them.
-
-        Used for the adaptation pass as well as for scoring, and that is the
-        point: statistics estimated from augmented frames would describe images
-        the model never sees at evaluation.
-        """
-        dataset = FrameDataset(
+    def loader_for(rows: pd.DataFrame) -> DataLoader:
+        """Serve rows the way this run's scoring pass will meet them."""
+        return frame_loader(
             rows,
             PROJECT_ROOT,
-            eval_transform(args.crop_size),
-            difference_gain=args.difference_gain,
+            args.crop_size,
+            args.difference_gain,
+            segments,
+            args.num_workers,
         )
-        if segments is not None:
-            return DataLoader(
-                dataset,
-                batch_sampler=clip_batches(rows, segments, BATCH_SIZE),
-                num_workers=args.num_workers,
-            )
-        return DataLoader(
-            dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=False,
-            num_workers=args.num_workers,
-        )
-
-    # Where each row of a window-spanning pass belongs in the manifest. Computed
-    # once here rather than from the loader, because both passes below need it
-    # and because a second loader built only to read its sampler is a second
-    # thing that can disagree with the first.
-    places = (
-        restore_order(clip_batches(manifest, segments, BATCH_SIZE))
-        if segments is not None
-        else None
-    )
 
     if args.adapt_bn:
         adaptation_rows = pd.read_csv(PROJECT_ROOT / "data/manifests" / args.adapt_bn)
-        seen = adapt_batchnorm(model, frame_loader(adaptation_rows), device)
+        seen = adapt_batchnorm(model, loader_for(adaptation_rows), device)
         transductive = args.adapt_bn == args.manifest and not args.validation_split
         print(
             f"batch norm re-estimated on {seen} frames from {args.adapt_bn}"
@@ -541,10 +727,9 @@ if __name__ == "__main__":
     if args.features:
         from model import strip_head
 
-        width = strip_head(model, backbone)
-        features, _, video_ids = predict(
-            model, frame_loader(manifest), device, segments
-        )
+        width = strip_head(model, scorer.backbone)
+        features, _, video_ids = predict(model, loader_for(manifest), device, segments)
+        places = manifest_places(manifest, segments)
         if places is not None:
             features = features[places]
             video_ids = [video_ids[place] for place in places]
@@ -563,16 +748,16 @@ if __name__ == "__main__":
         print(f"written to {output.relative_to(PROJECT_ROOT)}")
         raise SystemExit(0)
 
-    logits, labels, video_ids = predict(model, frame_loader(manifest), device, segments)
-    if places is not None:
-        # Window-spanning clips do not arrive in the manifest's order. Moving the
-        # three arrays back by the one permutation is what lets the table be
-        # built at all: it refuses scores out of that order, and that refusal is
-        # the only thing standing between a permuted pass and every probability
-        # attached to the wrong frame.
-        logits = logits[places]
-        labels = labels[places]
-        video_ids = [video_ids[place] for place in places]
+    logits, labels, video_ids = score_frames(
+        model,
+        manifest,
+        device,
+        PROJECT_ROOT,
+        args.crop_size,
+        args.difference_gain,
+        segments,
+        args.num_workers,
+    )
     loss, accuracy = frame_metrics(logits, labels, nn.CrossEntropyLoss())
     table = probability_table(logits, video_ids, manifest, class_names)
 
