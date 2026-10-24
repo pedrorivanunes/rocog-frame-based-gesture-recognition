@@ -1,10 +1,13 @@
+from functools import partial
 from pathlib import Path
 
 import pytest
 import torch
 from torch import nn
 
+import benchmark
 from benchmark import (
+    ENTRIES,
     NUM_CLASSES,
     SHIFT_SEGMENTS,
     STORED_SIZE,
@@ -18,8 +21,17 @@ from benchmark import (
     stored_frames,
     time_calls,
 )
+from model import (
+    CAUSAL_KEY,
+    FOLD_DIVISOR,
+    FOLD_KEY,
+    SEGMENTS_KEY,
+    SHUFFLE_KEY,
+    build_model,
+)
 
 CPU = torch.device("cpu")
+NETWORKS = ("resnet18", "efficientnet_b0", "mobilenet_v3_small")
 
 
 class _Counter(nn.Module):
@@ -118,6 +130,16 @@ def test_a_difference_decision_subtracts_after_the_transform():
     assert not torch.allclose(frame, difference)
     # Normalised pixels leave zero; raw uint8 ones could not reach it.
     assert frame.min() < 0
+
+
+def test_a_three_spacing_decision_stacks_a_frame_and_three_differences():
+    """Four frames go through the transform for every frame aggregated."""
+    entry = Entry("stub_multi", _Counter, 224, None, "test", channels=12)
+    model = _Counter()
+
+    decision_call(entry, model, 8, CPU)()
+
+    assert model.seen == [(8, 12, 224, 224)]
 
 
 def test_a_clip_model_receives_time_as_its_own_axis():
@@ -285,3 +307,72 @@ def test_the_default_device_is_the_constrained_one():
 
     assert arguments.device == "cpu"
     assert arguments.threads == 1
+
+
+def _named(name: str) -> Entry:
+    return next(entry for entry in ENTRIES if entry.name == name)
+
+
+@pytest.fixture
+def untrained(monkeypatch):
+    """The rows' own builders, without fetching ImageNet weights.
+
+    Timing does not depend on the values of the weights, and these tests only
+    need the architecture, so they should not need a download to get it.
+    """
+    monkeypatch.setattr(
+        benchmark, "build_model", partial(build_model, pretrained=False)
+    )
+
+
+@pytest.mark.parametrize("network", NETWORKS)
+def test_each_network_is_timed_in_every_temporal_form_it_was_trained_in(network):
+    """A trained configuration is costed on a row of its own architecture.
+
+    Without one, its latency would be borrowed from another network, and so
+    would the cost of the wider stem or of waiting for a clip.
+    """
+    assert _named(f"{network}_diff").channels == 6
+    assert _named(f"{network}_multi").channels == 12
+    assert _named(f"{network}_tsm").shift == "offline"
+
+
+@pytest.mark.parametrize(
+    ("network", "blocks"),
+    [("resnet18", 8), ("efficientnet_b0", 9), ("mobilenet_v3_small", 6)],
+)
+def test_a_shifted_row_is_the_network_that_was_trained(untrained, network, blocks):
+    """Shifts where training put them, both directions, an eighth each way.
+
+    The row is built by the call training makes, so the arrangement it records
+    is the one a trained checkpoint of that arm carries.
+    """
+    model = _named(f"{network}_tsm").build()
+
+    assert len(model.temporal_shifts) == blocks
+    assert all(shift.segments == SHIFT_SEGMENTS for shift in model.temporal_shifts)
+    assert int(model.get_buffer(SEGMENTS_KEY)) == SHIFT_SEGMENTS
+    assert not bool(model.get_buffer(SHUFFLE_KEY))
+    assert not bool(model.get_buffer(CAUSAL_KEY))
+    assert int(model.get_buffer(FOLD_KEY)) == FOLD_DIVISOR
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "efficientnet_b0_multi",
+        "mobilenet_v3_small_multi",
+        "efficientnet_b0_tsm",
+        "mobilenet_v3_small_tsm",
+    ],
+)
+def test_the_rows_of_the_cheaper_networks_run_on_their_own_input(untrained, name):
+    """One forward on what the row's protocol feeds it, an answer per frame."""
+    entry = _named(name)
+    model = entry.build().eval()
+
+    with torch.inference_mode():
+        logits = model(forward_input(entry, CPU))
+
+    frames = SHIFT_SEGMENTS if entry.shift == "offline" else 1
+    assert logits.shape == (frames, NUM_CLASSES)

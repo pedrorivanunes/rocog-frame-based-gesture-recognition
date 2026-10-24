@@ -137,12 +137,22 @@ def _pytorchvideo(factory: str):
     return build
 
 
-def _shifted() -> nn.Module:
-    """The ResNet18 with the two-directional shift, set for a clip of eight."""
-    model = build_model(NUM_CLASSES, "resnet18")
-    insert_temporal_shift(model, "resnet18", SHIFT_SEGMENTS)
-    set_segments(model, SHIFT_SEGMENTS)
-    return model
+def _shifted(backbone: str) -> Callable[[], nn.Module]:
+    """A network with the two-directional shift, set for a clip of eight.
+
+    One factory for every backbone, because where a shift may go — the blocks
+    that add their input back — is decided where the shift is inserted, the
+    same call training makes. A row built any other way could time a network
+    with shifts in places the trained one never had them.
+    """
+
+    def build() -> nn.Module:
+        model = build_model(NUM_CLASSES, backbone)
+        insert_temporal_shift(model, backbone, SHIFT_SEGMENTS)
+        set_segments(model, SHIFT_SEGMENTS)
+        return model
+
+    return build
 
 
 def _streaming() -> nn.Module:
@@ -202,10 +212,11 @@ ENTRIES: tuple[Entry, ...] = (
         "ours",
         channels=6,
     ),
-    # And the same network again reading three spacings instead of one. It pays
-    # the same two costs as the rows above, each larger: the wider stem adds
-    # about a fifth to the arithmetic, and four frames per decision go through
-    # the transform instead of two.
+    # And the same three again reading three spacings instead of one. They pay
+    # the same two costs as the rows above, each larger: the wider stem adds a
+    # fifth to the ResNet18's arithmetic, under a tenth to the EfficientNet's
+    # and three tenths to the MobileNet's, and four frames per decision go
+    # through the transform instead of two.
     Entry(
         "resnet18_multi",
         lambda: build_model(NUM_CLASSES, "resnet18", 12),
@@ -214,13 +225,46 @@ ENTRIES: tuple[Entry, ...] = (
         "ours",
         channels=12,
     ),
-    # The network with channels exchanged between neighbouring frames, in the
-    # two forms that were trained. Offline it reads both directions, so its
-    # decision is a clip of eight that cannot be made before the eighth frame
-    # exists. Online it reads the past only and keeps what the next frame will
-    # need, so it answers on every frame; that row's K is how many recent answers
-    # are averaged, not how many frames are run.
-    Entry("resnet18_tsm", _shifted, 224, None, "ours", shift="offline"),
+    Entry(
+        "efficientnet_b0_multi",
+        lambda: build_model(NUM_CLASSES, "efficientnet_b0", 12),
+        224,
+        None,
+        "ours",
+        channels=12,
+    ),
+    Entry(
+        "mobilenet_v3_small_multi",
+        lambda: build_model(NUM_CLASSES, "mobilenet_v3_small", 12),
+        224,
+        None,
+        "ours",
+        channels=12,
+    ),
+    # The networks with channels exchanged between neighbouring frames, in the
+    # forms that were trained: both directions on all three, and the past only
+    # on the ResNet18. Offline the shift reads both directions, so a decision is
+    # a clip of eight that cannot be made before the eighth frame exists. Online
+    # it reads the past only and keeps what the next frame will need, so it
+    # answers on every frame; that row's K is how many recent answers are
+    # averaged, not how many frames are run.
+    Entry("resnet18_tsm", _shifted("resnet18"), 224, None, "ours", shift="offline"),
+    Entry(
+        "efficientnet_b0_tsm",
+        _shifted("efficientnet_b0"),
+        224,
+        None,
+        "ours",
+        shift="offline",
+    ),
+    Entry(
+        "mobilenet_v3_small_tsm",
+        _shifted("mobilenet_v3_small"),
+        224,
+        None,
+        "ours",
+        shift="offline",
+    ),
     Entry("resnet18_tsm_online", _streaming, 224, None, "ours", shift="online"),
     Entry("i3d_r50", _pytorchvideo("i3d_r50"), 256, 16, "baseline"),
     # X3D-M appears at two sizes because its own and the paper's disagree. The
