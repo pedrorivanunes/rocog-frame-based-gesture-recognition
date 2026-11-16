@@ -67,6 +67,8 @@ NULL_SEED = 3
 # The latency session the program reads, and the three ways each row was timed.
 LATENCY_SESSION = "catalog_"
 SETTINGS = {"cpu_1t": "1 CPU thread", "cpu_0t": "every CPU core", "cuda_1t": "GPU"}
+# Passes further apart than this share of their median make a cost a range.
+UNSTABLE = 0.10
 
 
 def gesture_cube(table: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[str]]:
@@ -589,11 +591,31 @@ def frame_agreement(now: pd.DataFrame, stored: pd.DataFrame) -> tuple[int, int, 
     return same, len(ours), float(np.abs(ours - theirs).max())
 
 
+@dataclass(frozen=True)
+class Cost:
+    """What one decision took at one K, over the passes of a session, in ms.
+
+    Attributes:
+        median: The middle pass, the figure a cost is quoted by.
+        fastest: The fastest pass.
+        slowest: The slowest pass.
+    """
+
+    median: float
+    fastest: float
+    slowest: float
+
+    @property
+    def unstable(self) -> bool:
+        """Whether the passes lie so far apart that the cost is a range."""
+        return (self.slowest - self.fastest) / self.median > UNSTABLE
+
+
 def latency_by_k(
     configuration: Configuration,
     session: str = LATENCY_SESSION,
     root: Path = BENCHMARKS,
-) -> dict[str, dict[int, float]]:
+) -> dict[str, dict[int, Cost]]:
     """How long one decision took at each K, read from an idle-machine session.
 
     Never timed here: a number measured while the program runs would carry
@@ -601,14 +623,20 @@ def latency_by_k(
     cost together, which matters for the pose, whose decision pays the detector
     and then the classifier. A K is reported only where every row has it.
 
+    The session timed each row in several passes, a process of its own each
+    time, and on a CPU the passes do not always agree. So the fastest and
+    slowest pass come back beside the median. Rows paid together add their
+    fastest passes and their slowest ones, which holds every way their passes
+    could have combined.
+
     Args:
         configuration: The one being costed.
         session: Prefix of the session's canonical files.
         root: Where those files are.
 
     Returns:
-        Milliseconds per decision, by setting and then by K. A setting the
-        session has no file for, or no row for, is left out.
+        The cost of a decision, by setting and then by K. A setting the session
+        has no file for, or no row for, is left out.
     """
     table = {}
     for setting in SETTINGS:
@@ -620,7 +648,11 @@ def latency_by_k(
         per_row = []
         for name in configuration.latency_rows:
             found = {
-                int(row["frames"]): float(row["median_ms"])
+                int(row["frames"]): Cost(
+                    float(row["median_ms"]),
+                    float(row["fastest_pass_ms"]),
+                    float(row["slowest_pass_ms"]),
+                )
                 for row in rows
                 if row["model"] == name
             }
@@ -628,6 +660,11 @@ def latency_by_k(
         common = set.intersection(*(set(found) for found in per_row))
         if common:
             table[setting] = {
-                k: sum(found[k] for found in per_row) for k in sorted(common)
+                k: Cost(
+                    sum(found[k].median for found in per_row),
+                    sum(found[k].fastest for found in per_row),
+                    sum(found[k].slowest for found in per_row),
+                )
+                for k in sorted(common)
             }
     return table

@@ -45,6 +45,7 @@ from readings import (  # noqa: E402
     GESTURES,
     PREDICTIONS,
     SETTINGS,
+    Cost,
     Summary,
     clip_curve,
     frame_agreement,
@@ -175,7 +176,7 @@ class Outcome:
         curve_now: For a shifted network, its decision accuracy at each clip
             length, mean over the runs, in percent.
         curve_thesis: The same from the stored tables.
-        latency: Milliseconds per decision, by setting and K.
+        latency: What one decision cost, by setting and K.
         seconds: How long the scoring took.
     """
 
@@ -189,7 +190,7 @@ class Outcome:
     agreement: tuple[int, int, float] | None = None
     curve_now: dict[int, float] = field(default_factory=dict)
     curve_thesis: dict[int, float] = field(default_factory=dict)
-    latency: dict[str, dict[int, float]] = field(default_factory=dict)
+    latency: dict[str, dict[int, Cost]] = field(default_factory=dict)
     seconds: float = 0.0
 
 
@@ -313,13 +314,47 @@ def figures_rows(outcome: Outcome) -> list[tuple[str, str, str]]:
     return rows
 
 
-def k_rows(outcome: Outcome) -> tuple[list[str], list[list[str]]]:
-    """Accuracy and the cost of one decision at each K, as a header and its rows.
+RANGE_NOTE = (
+    "in parentheses: the fastest and slowest timing pass, where they lie more"
+    " than 10% of the median apart; that cost is a range, not a value"
+)
+# Three spacings prepare four frames for every frame a decision reads, and from
+# this K that passes the 32 MiB above which the memory allocator takes memory
+# fresh from the system on every call and hands it back after. On the GPU,
+# where the network is fast, paying for that memory is most of the decision.
+ALLOCATOR_K = 16
+ALLOCATOR_NOTE = (
+    f"GPU from K = {ALLOCATOR_K}: most of this time is memory, not the network;"
+    " three spacings prepare four frames for every frame decided, and past 32 MiB"
+    " that memory comes fresh from the system on each decision"
+)
+
+
+def _cost(cost: Cost | None) -> str:
+    """A cost's median, with its fastest and slowest pass when they spread."""
+    if cost is None:
+        return "—"
+    shown = f"{cost.median:.1f}"
+    if cost.unstable:
+        shown += f" ({cost.fastest:.1f}–{cost.slowest:.1f})"
+    return shown
+
+
+def k_rows(outcome: Outcome) -> tuple[list[str], list[list[str]], list[str]]:
+    """Accuracy and the cost of one decision at each K, as a table and its notes.
 
     A shifted network's K is its clip length, each scored on its own; every
     other configuration's K is how many of the stored frames a decision
     averages, spread over the gesture. Videos without labels have no accuracy,
     and get the costs alone.
+
+    A cost is the median of its timing passes, with the fastest and slowest
+    beside it where they spread so far that the median alone would read as more
+    exact than it is. The notes are what the costs shown need to be read right:
+    what those ranges are, and where a GPU time is mostly memory.
+
+    Returns:
+        The header, one row per K, and the notes to print under the table.
     """
     settings = [setting for setting in SETTINGS if setting in outcome.latency]
     costs = [f"{SETTINGS[setting]} (ms)" for setting in settings]
@@ -342,7 +377,7 @@ def k_rows(outcome: Outcome) -> tuple[list[str], list[list[str]]]:
         ks = sorted(accuracy)
         header = ["K", "accuracy now (%)", "in the thesis (%)", *costs]
 
-    rows = []
+    rows, shown = [], []
     for k in ks:
         line = [str(k)]
         if accuracy is not None:
@@ -350,9 +385,19 @@ def k_rows(outcome: Outcome) -> tuple[list[str], list[list[str]]]:
             line.append(f"{reported_k[k]:.2f}" if k in reported_k else "—")
         for setting in settings:
             cost = outcome.latency[setting].get(k)
-            line.append("—" if cost is None else f"{cost:.1f}")
+            line.append(_cost(cost))
+            if cost is not None:
+                shown.append((setting, k, cost))
         rows.append(line)
-    return header, rows
+
+    notes = []
+    if any(cost.unstable for _, _, cost in shown):
+        notes.append(RANGE_NOTE)
+    if len(configuration.spacings) == 3 and any(
+        setting == "cuda_1t" and k >= ALLOCATOR_K for setting, k, _ in shown
+    ):
+        notes.append(ALLOCATOR_NOTE)
+    return header, rows, notes
 
 
 def gesture_rows(outcome: Outcome, names: list[str]) -> list[tuple[str, str, str]]:
@@ -420,7 +465,7 @@ def report(console, outcome: Outcome, names: list[str]) -> None:
                 "the thesis's tables for these videos are not on this computer"
             )
 
-    header, rows = k_rows(outcome)
+    header, rows, notes = k_rows(outcome)
     if rows:
         title = "Accuracy and cost by K" if outcome.now else "Cost by K"
         table = Table(title=title, title_justify="left")
@@ -429,6 +474,8 @@ def report(console, outcome: Outcome, names: list[str]) -> None:
         for row in rows:
             table.add_row(*row)
         console.print(table)
+        for note in notes:
+            console.print(note)
     if not outcome.latency:
         console.print("latency: not measured yet for this configuration")
 

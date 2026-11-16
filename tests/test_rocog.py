@@ -12,6 +12,8 @@ from catalog import find
 from frame_cache import EXTERNAL, VideoSource
 from readings import GESTURES, stored_table
 from rocog import (
+    ALLOCATOR_NOTE,
+    RANGE_NOTE,
     Selection,
     all_tested,
     ask_configuration,
@@ -185,7 +187,7 @@ def test_a_shifted_network_is_shown_per_decision_and_by_clip_length(tmp_path):
 
     labels = [row[0] for row in figures_rows(outcome)]
     assert "per decision on 8 frames (%)" in labels
-    header, rows = k_rows(outcome)
+    header, rows, _ = k_rows(outcome)
     assert header[:3] == ["K", "accuracy now (%)", "in the thesis (%)"]
     assert [row[:2] for row in rows] == [
         ["1", "0.00"],
@@ -212,26 +214,107 @@ def test_a_corrected_configuration_shows_the_figure_before_the_correction(tmp_pa
     ]
 
 
+def write_session(folder: Path, setting: str, rows) -> None:
+    """A latency session's file: (model, K, median, fastest pass, slowest pass)."""
+    pd.DataFrame(
+        [
+            {
+                "model": model,
+                "level": "decision",
+                "frames": k,
+                "median_ms": median,
+                "fastest_pass_ms": fastest,
+                "slowest_pass_ms": slowest,
+            }
+            for model, k, median, fastest, slowest in rows
+        ]
+    ).to_csv(folder / f"latency_catalog_{setting}_isolated.csv", index=False)
+
+
+def unlabelled_outcome(key: str, folder: Path):
+    """A configuration's outcome on a video of its own, costed from ``folder``."""
+    clip = folder / "mine.mp4"
+    clip.touch()
+    tables = {0: table(["mine"], [-1], [4])}
+    return evaluate(
+        find(key), from_file(clip), tables, predictions=folder, benchmarks=folder
+    )
+
+
 def test_the_cost_by_k_comes_from_the_session_and_says_when_it_is_missing(tmp_path):
     entry = find("resnet18-frames")
     chosen = Selection("one", "slug", [source("S04", 0, 1)])
     now = table([chosen.sources[0].path.stem], [0], [0])
-    pd.DataFrame(
-        [
-            {"model": "resnet18", "level": "decision", "frames": 1, "median_ms": 30.0},
-            {"model": "resnet18", "level": "decision", "frames": 4, "median_ms": 120.0},
-        ]
-    ).to_csv(tmp_path / "latency_catalog_cpu_1t_isolated.csv", index=False)
+    write_session(
+        tmp_path,
+        "cpu_1t",
+        [("resnet18", 1, 30.0, 29.5, 30.5), ("resnet18", 4, 120.0, 118.0, 121.0)],
+    )
 
     outcome = evaluate(
         entry, chosen, {0: now}, predictions=tmp_path, benchmarks=tmp_path
     )
 
-    header, rows = k_rows(outcome)
+    header, rows, notes = k_rows(outcome)
     assert header[-1] == "1 CPU thread (ms)"
     assert rows[0][-1] == "30.0"
     assert rows[1][-1] == "—"  # K = 2 was never timed
     assert rows[2][-1] == "120.0"
+    assert notes == []
+
+
+def test_a_cost_whose_passes_spread_shows_them_and_says_what_they_are(tmp_path):
+    write_session(
+        tmp_path,
+        "cpu_1t",
+        [
+            ("mobilenet_v3_small", 1, 3.6, 3.5, 3.7),
+            ("mobilenet_v3_small", 8, 21.6, 21.4, 29.3),
+        ],
+    )
+
+    header, rows, notes = k_rows(
+        unlabelled_outcome("mobilenet-v3-small-frames", tmp_path)
+    )
+
+    assert header == ["K", "1 CPU thread (ms)"]
+    assert rows == [["1", "3.6"], ["8", "21.6 (21.4–29.3)"]]
+    assert notes == [RANGE_NOTE]
+
+
+def test_three_spacings_on_the_gpu_from_k_16_are_said_to_be_mostly_memory(tmp_path):
+    timed = [(8, 4.2), (16, 35.9)]
+    write_session(
+        tmp_path,
+        "cuda_1t",
+        [
+            (name, k, ms, ms, ms)
+            for name in ("resnet18_multi", "resnet18_diff")
+            for k, ms in timed
+        ],
+    )
+
+    def notes_of(key: str) -> list[str]:
+        return k_rows(unlabelled_outcome(key, tmp_path))[2]
+
+    assert notes_of("resnet18-spacings") == [ALLOCATOR_NOTE]
+    assert notes_of("resnet18-prior") == [ALLOCATOR_NOTE]
+    assert notes_of("resnet18-difference") == []
+
+    write_session(tmp_path, "cuda_1t", [("resnet18_multi", 8, 4.2, 4.2, 4.2)])
+    assert notes_of("resnet18-spacings") == []  # nothing shown past K = 8
+
+
+def test_the_report_prints_the_notes_under_the_table_by_k(tmp_path):
+    write_session(tmp_path, "cuda_1t", [("resnet18_multi", 16, 35.9, 30.0, 40.0)])
+    console = Console(record=True, width=200)
+
+    report(console, unlabelled_outcome("resnet18-spacings", tmp_path), ORDERED)
+
+    text = console.export_text()
+    assert "35.9 (30.0–40.0)" in text
+    assert RANGE_NOTE in text
+    assert ALLOCATOR_NOTE in text
 
 
 def test_an_unlabelled_video_gets_each_run_s_decision_and_how_sure_it_was(tmp_path):

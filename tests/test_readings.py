@@ -8,6 +8,7 @@ from catalog import find
 from dataset import clip_batches
 from readings import (
     GESTURES,
+    Cost,
     accuracy_by_k,
     by_gesture,
     clip_curve,
@@ -321,21 +322,30 @@ def test_frames_the_stored_table_does_not_have_are_refused():
 
 
 def write_latency(path, rows):
-    pd.DataFrame(
-        [
-            {"model": model, "level": level, "frames": frames, "median_ms": ms}
-            for model, level, frames, ms in rows
-        ]
-    ).to_csv(path, index=False)
+    """A session's file; a row given without its fastest and slowest pass is steady."""
+    records = []
+    for model, level, frames, ms, *passes in rows:
+        fastest, slowest = passes or (ms, ms)
+        records.append(
+            {
+                "model": model,
+                "level": level,
+                "frames": frames,
+                "median_ms": ms,
+                "fastest_pass_ms": fastest,
+                "slowest_pass_ms": slowest,
+            }
+        )
+    pd.DataFrame(records).to_csv(path, index=False)
 
 
 def test_a_decision_costs_its_rows_together_at_the_k_every_row_has(tmp_path):
     write_latency(
         tmp_path / "latency_catalog_cpu_1t_isolated.csv",
         [
-            ("pose_detector", "decision", 1, 20.0),
+            ("pose_detector", "decision", 1, 20.0, 18.0, 26.0),
             ("pose_detector", "decision", 8, 160.0),
-            ("pose_classifier", "decision", 1, 0.5),
+            ("pose_classifier", "decision", 1, 0.5, 0.25, 0.75),
             ("pose_classifier", "decision", 4, 0.6),
             ("pose_classifier", "decision", 8, 0.7),
             ("pose_classifier", "forward", 1, 9.0),
@@ -344,7 +354,9 @@ def test_a_decision_costs_its_rows_together_at_the_k_every_row_has(tmp_path):
 
     table = latency_by_k(find("pose"), root=tmp_path)
 
-    assert table == {"cpu_1t": {1: 20.5, 8: 160.7}}
+    assert table == {
+        "cpu_1t": {1: Cost(20.5, 18.25, 26.75), 8: Cost(160.7, 160.7, 160.7)}
+    }
 
 
 def test_a_session_without_the_row_or_the_file_reports_nothing(tmp_path):
@@ -354,4 +366,12 @@ def test_a_session_without_the_row_or_the_file_reports_nothing(tmp_path):
     )
 
     assert latency_by_k(find("resnet18-shift"), root=tmp_path) == {}
-    assert latency_by_k(find("resnet18-frames"), root=tmp_path) == {"cuda_1t": {1: 2.0}}
+    assert latency_by_k(find("resnet18-frames"), root=tmp_path) == {
+        "cuda_1t": {1: Cost(2.0, 2.0, 2.0)}
+    }
+
+
+def test_a_cost_is_a_range_once_its_passes_spread_past_a_tenth_of_the_median():
+    assert not Cost(100.0, 95.0, 105.0).unstable  # a tenth exactly
+    assert Cost(100.0, 95.0, 105.5).unstable
+    assert Cost(164.6, 147.1, 165.3).unstable  # one pass far from the other two
