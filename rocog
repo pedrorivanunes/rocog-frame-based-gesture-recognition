@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Opens the menu that runs a trained configuration on videos and reports how it
+# did. It uses the project's own environment, so nothing has to be activated
+# first, and it runs from wherever it is called.
+cd "$(dirname "$0")" || exit 1
+exec .venv/bin/python src/rocog.py "$@"
